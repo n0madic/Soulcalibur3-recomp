@@ -1,0 +1,50 @@
+From d0f09a8c149f051c3076a1a52bef55f3056f9fc7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Sat, 24 Oct 2026 10:10:33 +0300
+Subject: [PATCH] IOP: service SPU2 DMA while executing and idling
+
+Advance SPU2 during long import and RPC calls as their IOP instructions run. Limit idle jumps to a 256-sample boundary so AutoDMA completion wakes the feeder before its final block drains.
+
+In the manual intro capture, missing core-1 input samples fell from 65947 to zero over the same 36-second active interval. Host output underflow was zero in both runs.
+---
+ ps2xIOP/src/emulator/iop_emulator.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 9ce3747..a5ee504 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -413,6 +413,10 @@ namespace ps2x::iop::detail
+             {
+                 if (!step(cpu))
+                     break;
++                // Imports and RPC callbacks can execute far beyond a scheduler slice.
++                // Keep SPU2/DMA running while their IOP instructions execute as well.
++                if (spuCycle + IopSpu2::IopCyclesPerSample <= totalCycles && advanceSpu())
++                    idleUntil = 0u;
+                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
+                     servicePendingDmaInterrupts();
+                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
+@@ -609,7 +613,8 @@ namespace ps2x::iop::detail
+                     // one IOP cycle per guest call, so skip the thread scans.
+                     if (totalCycles < idleUntil)
+                     {
+-                        totalCycles = std::min(target, idleUntil);
++                        const uint64_t nextSpu = spuCycle + 256u * IopSpu2::IopCyclesPerSample;
++                        totalCycles = std::min({target, idleUntil, nextSpu});
+                         continue;
+                     }
+                     servicePendingDmaInterrupts();
+@@ -624,6 +629,9 @@ namespace ps2x::iop::detail
+                         if (!pendingGuestCallbacks.empty())
+                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                         nextWake = timrman.nextEventCycle(nextWake);
++                        // AutoDMA completion can wake the driver even with no IOP
++                        // thread, timer or queued interrupt currently runnable.
++                        nextWake = std::min(nextWake, spuCycle + 256u * IopSpu2::IopCyclesPerSample);
+                         idleUntil = nextWake;
+                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                         continue;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,206 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..7a2bc8a 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -22,7 +22,7 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        static constexpr uint32_t HeapBase = 0x00090000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..9f9dc50 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,5 @@
++#include <map>
++#include <cstdio>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -356,6 +358,15 @@ void EeScheduler::postEvent(EeEvent event)
+ 
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
++    { // TEMP-DEBUG EE thread dump
++        static uint64_t dbgN = 0;
++        if ((++dbgN % 8000000ull) == 0ull && dbgN <= 24000000ull)
++        {
++            std::fprintf(stderr, "[EETHR] ---- cycle=%llu vsync=%llu cur=%d\n", (unsigned long long)m_eeCycle, (unsigned long long)m_vsyncTick, m_currentThreadId);
++            for (auto &[id, t] : m_threads)
++                std::fprintf(stderr, "[EETHR] thr=%d status=%d entry=0x%x pc=0x%x prio=%d waitReason=%d\n", id, (int)t.status, t.entry, t.activeContext().pc, t.currentPriority, (int)t.wait.reason);
++        }
++    }
+     accountCycles(cycles);
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+@@ -423,7 +434,9 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
+ int EeScheduler::createThread(const EeThreadCreateParams &params)
+ {
+     assertExecutor();
+-    if (params.priority < 1 || params.priority >= kPriorityCount)
++    // Priority 0 is valid: SDK libraries (e.g. ADXPS2) create worker threads with the main
++    // thread's priority, which is 0, and lower it with ChangeThreadPriority afterwards.
++    if (params.priority < 0 || params.priority >= kPriorityCount)
+     {
+         return KE_ILLEGAL_PRIORITY;
+     }
+@@ -1271,6 +1284,17 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+             matching.push_back(handler);
+         }
+     }
++    { // TEMP-DEBUG
++        static std::map<uint32_t, int> dbgCnt;
++        int &c = dbgCnt[(dmac ? 100u : 0u) + cause];
++        if (false)
++        {
++            std::fprintf(stderr, "[IRQDBG] dispatchIrq dmac=%d cause=%u mask=0x%x matching=%zu (count=%d) handlers:", (int)dmac, cause, mask, matching.size(), c);
++            for (const auto &[hid, h] : handlers)
++                std::fprintf(stderr, " {id=%d cause=%u en=%d fn=0x%x}", hid, h.cause, (int)h.enabled, h.handler);
++            std::fprintf(stderr, "\n");
++        }
++    }
+     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
+               { return left.order < right.order; });
+     for (const EeIrqHandler &handler : matching)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..ea43969 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "Common.h"
+ #include "CD.h"
+ #include "MPEG.h"
+@@ -206,6 +207,7 @@ namespace ps2_stubs
+ 
+     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 40) std::fprintf(stderr, "[CDDBG] sceCdRead a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC); } // TEMP-DEBUG
+         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
+         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
+         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
+@@ -467,6 +469,7 @@ namespace ps2_stubs
+ 
+     void sceCdReadChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 40) std::fprintf(stderr, "[CDDBG] sceCdReadChain a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC); } // TEMP-DEBUG
+         uint32_t chainAddr = getRegU32(ctx, 4);
+         bool ok = true;
+ 
+@@ -544,6 +547,7 @@ namespace ps2_stubs
+ 
+     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 40) std::fprintf(stderr, "[CDDBG] sceCdSearchFile a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC); } // TEMP-DEBUG
+         uint32_t fileAddr = getRegU32(ctx, 4);
+         uint32_t pathAddr = getRegU32(ctx, 5);
+         const std::string path = readPs2CStringBounded(rdram, pathAddr, 260);
+@@ -852,6 +856,7 @@ namespace ps2_stubs
+ 
+     void sceCdStRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 40) std::fprintf(stderr, "[CDDBG] sceCdStRead a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC); } // TEMP-DEBUG
+         const uint32_t requestedSectors = getRegU32(ctx, 4);
+         const uint32_t buffer = getRegU32(ctx, 5);
+         const uint32_t mode = getRegU32(ctx, 6);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..abe32c5 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "Common.h"
+ #include "Thread.h"
+ #include "runtime/ee_scheduler.h"
+@@ -112,7 +113,9 @@ namespace ps2_syscalls
+             const int priority = static_cast<int>(getRegU32(ctx, 5));
+             int oldPriority = 0;
+             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+-            setReturnS32(ctx, result);
++            // The EE kernel returns the previous priority on success; SDK libraries (ADXPS2) use it
++            // to restore the priority after a critical section.
++            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
+@@ -199,6 +202,8 @@ namespace ps2_syscalls
+             setReturnS32(ctx, KE_ERROR);
+             return;
+         }
++        { const uint32_t *w = reinterpret_cast<const uint32_t *>(param); std::fprintf(stderr, "[THRDBG] raw: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]); } // TEMP-DEBUG
++        std::fprintf(stderr, "[THRDBG] CreateThread param=0x%x func=0x%x stack=0x%x stack_size=0x%x gp=0x%x prio=%d attr=0x%x ra=0x%x\n", address, param->func, param->stack, (unsigned)param->stack_size, param->gp_reg, (int)param->initial_priority, param->attr, getRegU32(ctx, 31)); // TEMP-DEBUG
+ 
+         if (param->stack_size < 0)
+         {
+@@ -230,7 +235,7 @@ namespace ps2_syscalls
+             param->initial_priority,
+             param->option,
+         };
+-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
++        { const int dbgR = scheduler(rdram, ctx, runtime).createThread(decoded); std::fprintf(stderr, "[THRDBG]   -> id=%d\n", dbgR); setReturnS32(ctx, dbgR); } // TEMP-DEBUG
+     }
+ 
+     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -266,6 +271,7 @@ namespace ps2_syscalls
+             setReturnS32(ctx, KE_NOT_DORMANT);
+             return;
+         }
++        std::fprintf(stderr, "[THRDBG] StartThread id=%d entry=0x%x arg=0x%x hasFn=%d\n", id, target->entry, arg, (int)runtime->hasFunction(target->entry)); // TEMP-DEBUG
+         if (!runtime->hasFunction(target->entry))
+         {
+             setReturnS32(ctx, KE_ERROR);
+@@ -364,6 +370,7 @@ namespace ps2_syscalls
+         status->waitType = rawWaitType(thread->wait.reason);
+         status->waitId = waitId(*thread);
+         status->wakeupCount = thread->wakeupCount;
++        { static int dbgR = 0; if (++dbgR <= 12) std::fprintf(stderr, "[THRDBG] ReferThreadStatus id=%d out=0x%x -> status=%d prio(init=%d cur=%d) ra=0x%x\n", id, getRegU32(ctx, 5), status->status, status->initial_priority, status->current_priority, getRegU32(ctx, 31)); } // TEMP-DEBUG
+         setReturnS32(ctx, KE_OK);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..c4259c3 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -402,6 +402,8 @@ bool PS2Memory::initialize(size_t ramSize)
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
++    // The BIOS leaves Timer 3 free-running (CUE, BUSCLK/256); some games busy-wait on its count.
++    m_eeTimers[3].mode = kEeTimerModeCue | 2u;
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..6e5460c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,5 @@
++#include <map>
++#include <cstdio>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -1351,6 +1353,19 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      const char *debugName)
+ {
+     ctx->pc = targetPc;
++    { // TEMP-DEBUG indirect call statistics
++        static std::map<std::pair<uint32_t, uint32_t>, uint64_t> dbgInd;
++        static uint64_t dbgTotal = 0;
++        if (kind == GuestBranchKind::IndirectCall)
++            ++dbgInd[{sourcePc, targetPc}];
++        if (++dbgTotal % 1500000ull == 0ull && dbgTotal <= 4500000ull)
++        {
++            std::fprintf(stderr, "[INDDBG] total=%llu pairs=%zu:", (unsigned long long)dbgTotal, dbgInd.size());
++            for (auto &[k, c] : dbgInd)
++                std::fprintf(stderr, " 0x%x->0x%x=%llu", k.first, k.second, (unsigned long long)c);
++            std::fprintf(stderr, "\n");
++        }
++    }
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.

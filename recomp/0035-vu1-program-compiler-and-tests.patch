@@ -1,0 +1,1729 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index fb44782..a38501b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -398,6 +398,52 @@ add_library(ps2_runtime STATIC
+     src/lib/games_database.cpp
+ )
+ 
++# Whole VU1 routines, compiled from PS2_VU_PROGRAM_PROFILE recordings.
++set(PS2X_VU_PROGRAM_PROFILES "" CACHE STRING "Local VU1 program profile directories to compile; never distributed")
++set(PS2X_VU_PROGRAM_SHARDS "8" CACHE STRING "Number of compilation units for compiled VU1 routines")
++set(PS2X_VU_PROGRAM_MAX_PAIRS "256" CACHE STRING
++    "Pairs of a compiled VU1 routine built as one function; longer routines are split, as optimizers slow down sharply on long functions")
++if(PS2X_VU_PROGRAM_PROFILES)
++    find_package(Python3 COMPONENTS Interpreter REQUIRED)
++    if(NOT PS2X_VU_PROGRAM_SHARDS MATCHES "^[1-9][0-9]*$")
++        message(FATAL_ERROR "PS2X_VU_PROGRAM_SHARDS must be a positive integer")
++    endif()
++    if(NOT PS2X_VU_PROGRAM_MAX_PAIRS MATCHES "^[0-9]+$" OR PS2X_VU_PROGRAM_MAX_PAIRS LESS 128)
++        message(FATAL_ERROR "PS2X_VU_PROGRAM_MAX_PAIRS must be at least 128, the longest block")
++    endif()
++    set(PS2X_VU_PROGRAM_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/vu_programs.inc")
++    set(PS2X_VU_PROGRAM_EXTERN_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/vu_programs_extern.inc")
++    set(PS2X_VU_PROGRAM_SOURCES)
++    math(EXPR PS2X_VU_PROGRAM_LAST_SHARD "${PS2X_VU_PROGRAM_SHARDS} - 1")
++    foreach(SHARD RANGE ${PS2X_VU_PROGRAM_LAST_SHARD})
++        list(APPEND PS2X_VU_PROGRAM_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/generated/vu_programs_${SHARD}.cpp")
++    endforeach()
++    set(PS2X_VU_PROGRAM_LISTS)
++    foreach(PROFILE ${PS2X_VU_PROGRAM_PROFILES})
++        list(APPEND PS2X_VU_PROGRAM_LISTS "${PROFILE}/entries.txt")
++    endforeach()
++    add_custom_command(
++        OUTPUT "${PS2X_VU_PROGRAM_INCLUDE}" "${PS2X_VU_PROGRAM_EXTERN_INCLUDE}" ${PS2X_VU_PROGRAM_SOURCES}
++        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/compile_vu_programs.py"
++                --output "${PS2X_VU_PROGRAM_INCLUDE}" --shards ${PS2X_VU_PROGRAM_SHARDS}
++                --max-routine-pairs ${PS2X_VU_PROGRAM_MAX_PAIRS}
++                ${PS2X_VU_PROGRAM_PROFILES}
++        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/compile_vu_programs.py" ${PS2X_VU_PROGRAM_LISTS}
++        VERBATIM)
++    add_custom_target(ps2_vu_programs DEPENDS "${PS2X_VU_PROGRAM_INCLUDE}"
++                      "${PS2X_VU_PROGRAM_EXTERN_INCLUDE}" ${PS2X_VU_PROGRAM_SOURCES})
++    add_dependencies(ps2_runtime ps2_vu_programs)
++    target_sources(ps2_runtime PRIVATE ${PS2X_VU_PROGRAM_SOURCES})
++    set_source_files_properties(src/lib/vu/ps2_vu1_program.cpp PROPERTIES COMPILE_DEFINITIONS
++        "PS2X_VU_PROGRAM_INCLUDE=\"${PS2X_VU_PROGRAM_INCLUDE}\";PS2X_VU_PROGRAM_EXTERN_INCLUDE=\"${PS2X_VU_PROGRAM_EXTERN_INCLUDE}\"")
++    set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON
++        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
++    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
++        set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES COMPILE_OPTIONS "-g0")
++    endif()
++endif()
++
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         PS2_RUNTIME_LOGS=1
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 27f3058..b6f3ca3 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -30,6 +30,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
+     src/ps2_vu1_tests.cpp
++    src/ps2_vu1_program_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
+     src/ps2_iop_tests.cpp
+diff --git a/ps2xTest/data/vu_programs.py b/ps2xTest/data/vu_programs.py
+new file mode 100644
+index 0000000..b768b2d
+--- /dev/null
++++ b/ps2xTest/data/vu_programs.py
+@@ -0,0 +1,429 @@
++#!/usr/bin/env python3
++"""Write synthetic VU1 programs as a program profile, to test compiled routines.
++
++usage: vu_programs.py DIRECTORY
++
++DIRECTORY gets the layout a run with PS2_VU_PROGRAM_PROFILE records: 16 KiB
++vu1-<hash>.code images and an entries.txt. Build the runtime with
++PS2X_VU_PROGRAM_PROFILES=DIRECTORY to compile the programs, then run the VU
++tests with PS2_VU_PROGRAM_FIXTURES=DIRECTORY: ps2_vu1_program_tests.cpp runs
++every entry both compiled and interpreted and compares the two.
++
++A few programs are written out to reach particular paths: blocks split for
++length, an E bit on a branch, a program the compiler hands back part-way. The
++rest come from a seeded generator that mixes the instructions the compiler
++accepts inside counted loops, forward branches, calls and register jumps.
++They rely on what the test sets up: VI registers start at zero, data memory
++holds floats, and qword 0x3F0 holds a GIF packet for XGKICK.
++"""
++
++import random
++import struct
++import sys
++from pathlib import Path
++
++CODE_SIZE = 16384
++PAIRS = CODE_SIZE // 8
++LOWER_NOP = 0x8000033C
++UPPER_NOP = 0x000002FF
++E_BIT = 1 << 30
++I_BIT = 1 << 31
++XYZ = 0b1110
++
++# Registers with fixed jobs, so that loops end and addresses stay in range.
++# Generated integer code writes only VI2-VI7, and FCAND and friends VI1.
++SCRATCH = (2, 3, 4, 5, 6, 7)
++COUNTERS = (8, 9)  # loop counters, by nesting depth
++POINTER = 10       # LQI/SQI/LQD/SQD base, reset before each loop
++KICK = 11          # XGKICK address
++BASE = 12          # LQ/SQ/ILW/ISW base
++TARGET = 13        # JALR target
++FIXED = 14         # set once by a hand-written program
++LINK = 15
++
++KICK_QWORD = 0x3F0  # the test's GIF packet
++BASE_QWORD = 0x40
++POINTER_QWORD = 0x100
++
++# Upper opcodes 0x00-0x2F: ADD, SUB, MADD, MSUB, MAX, MINI and MUL in their
++# broadcast, Q and I forms, then the three-register ones. OPMSUB is left to
++# outer_product(), which pairs it with OPMULA.
++VECTOR_OPS = [op for op in range(0x30) if op != 0x2E]
++# Special upper opcodes that write ACC: the A forms of the above.
++ACC_OPS = [*range(0x10), *range(0x18, 0x1D), 0x1E, *range(0x20, 0x2B), 0x2C, 0x2D]
++# EFU operations on a vector, with the fields each one reads, and on one field.
++EFU_VECTOR = ((0x70, XYZ), (0x71, XYZ), (0x72, XYZ), (0x73, XYZ), (0x74, 0b1100), (0x75, 0b1010), (0x76, 0b1111))
++EFU_SCALAR = (0x78, 0x79, 0x7A, 0x7C, 0x7D, 0x7E)
++
++FLOATS = (0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 3.0, 1000.0, 1e-30, 1e30, 3.4e38, -3.4e38)
++# Bit patterns without a PS2 float meaning: infinities, NaN, a denormal.
++RAW_FLOATS = (0x7F800000, 0xFF800000, 0x7FC00000, 0x00000001, 0x7FFFFFFF)
++
++
++def upper(op, dest, ft, fs, fd):
++    return (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | op
++
++
++def upper_special(op, dest, ft, fs):
++    return (dest << 21) | (ft << 16) | (fs << 11) | ((op & 0x7C) << 4) | (op & 3) | 0x3C
++
++
++def lower_special(op, is_=0, it=0, dest=0):
++    return (0x40 << 25) | (dest << 21) | (it << 16) | (is_ << 11) | ((op & 0x7C) << 4) | (op & 3) | 0x3C
++
++
++def lower_direct(funct, is_, it, id_):
++    return (0x40 << 25) | (it << 16) | (is_ << 11) | (id_ << 6) | funct
++
++
++def immediate15(op, it, is_, value):
++    """IADDIU and ISUBIU, whose 15-bit immediate is split around the dest field."""
++    return (op << 25) | (((value >> 11) & 15) << 21) | (it << 16) | (is_ << 11) | (value & 0x7FF)
++
++
++def memory(op, dest, t, s, offset):
++    return (op << 25) | (dest << 21) | (t << 16) | (s << 11) | (offset & 0x7FF)
++
++
++def branch(op, it=0, is_=0, offset=0):
++    return (op << 25) | (it << 16) | (is_ << 11) | (offset & 0x7FF)
++
++
++def flag_immediate(op, it, value):
++    return (op << 25) | (((value >> 11) & 1) << 21) | (it << 16) | (value & 0x7FF)
++
++
++def flag_register(op, it, is_=0):
++    return (op << 25) | (it << 16) | (is_ << 11)
++
++
++class Program:
++    """Pairs laid out from an entry. Branch offsets are patched in once the
++    target is known."""
++
++    def __init__(self, entry):
++        self.entry = entry
++        self.pairs = []
++
++    @property
++    def next(self):
++        return self.entry + len(self.pairs)
++
++    def add(self, lower=LOWER_NOP, upper_word=UPPER_NOP):
++        self.pairs.append([lower, upper_word])
++        return self.next - 1
++
++    def patch_branch(self, index, target):
++        pair = self.pairs[index - self.entry]
++        pair[0] = (pair[0] & ~0x7FF) | ((target - index - 1) & 0x7FF)
++
++    def patch_immediate(self, index, value):
++        pair = self.pairs[index - self.entry]
++        pair[0] = immediate15(pair[0] >> 25, (pair[0] >> 16) & 15, (pair[0] >> 11) & 15, value)
++
++
++class Subroutine:
++    def __init__(self):
++        self.calls = []  # BAL pairs to point at it
++        self.loads = []  # IADDIU pairs that load its address for JALR
++
++
++class Generator:
++    def __init__(self, seed, outer_iterations=8):
++        self.random = random.Random(seed)
++        # Long programs outlast the compiled path's minimum budget many times
++        # over, so the test can stop them at many points.
++        self.outer_iterations = outer_iterations
++
++    def vf(self):
++        return self.random.randrange(32)
++
++    def written_vf(self):
++        return self.random.randrange(1, 32)
++
++    def vi(self):
++        return self.random.choice((0, 1) + SCRATCH)
++
++    def dest(self):
++        return self.random.choice((15, 15, 15, 14, 12, 8, 4, 2, 1, 3, 7, 11, 13))
++
++    def lane(self):
++        return self.random.randrange(4)
++
++    def float_bits(self):
++        if self.random.random() < 0.15:
++            return self.random.choice(RAW_FLOATS)
++        value = self.random.choice(FLOATS) if self.random.random() < 0.4 else self.random.uniform(-200.0, 200.0)
++        return struct.unpack("<I", struct.pack("<f", value))[0]
++
++    def upper(self):
++        """A random upper instruction and the VF register it writes, if any."""
++        kind = self.random.choices(("nop", "vector", "acc", "convert", "abs", "clip"), (12, 50, 16, 8, 3, 6))[0]
++        dest = self.dest()
++        if kind == "vector":
++            fd = self.written_vf()
++            return upper(self.random.choice(VECTOR_OPS), dest, self.vf(), self.vf(), fd), fd
++        if kind == "acc":
++            return upper_special(self.random.choice(ACC_OPS), dest, self.vf(), self.vf()), None
++        if kind in ("convert", "abs"):
++            ft = self.written_vf()
++            op = self.random.randrange(0x10, 0x18) if kind == "convert" else 0x1D
++            return upper_special(op, dest, ft, self.vf()), ft
++        if kind == "clip":
++            return upper_special(0x1F, XYZ, self.vf(), self.vf()), None
++        return UPPER_NOP, None
++
++    def lower(self, avoid=None):
++        """A random lower instruction that neither branches nor writes VF avoid."""
++        while True:
++            word, writes = self.any_lower()
++            if writes is None or writes != avoid:
++                return word
++
++    def any_lower(self):
++        r = self.random
++        kind = r.choices(
++            ("nop", "integer", "load", "store", "stream", "integer memory", "move", "transfer",
++             "fdiv", "waitq", "efu", "waitp", "mfp", "status", "mac", "clip", "xtop", "kick"),
++            (14, 14, 7, 5, 5, 4, 5, 4, 4, 1, 4, 1, 2, 3, 3, 3, 1, 1))[0]
++        dest = self.dest()
++        if kind == "integer":
++            target = r.choice(SCRATCH)
++            form = r.randrange(4)
++            if form == 0:
++                return lower_direct(r.choice((0x30, 0x31, 0x34, 0x35)), self.vi(), self.vi(), target), None
++            if form == 1:
++                return lower_direct(0x32, self.vi(), target, r.randrange(32)), None  # IADDI
++            return immediate15(r.choice((0x08, 0x09)), target, self.vi(), r.randrange(2048)), None
++        if kind == "load":
++            ft = self.written_vf()
++            return memory(0x00, dest, ft, BASE, r.randrange(64)), ft
++        if kind == "store":
++            return memory(0x01, dest, BASE, self.vf(), r.randrange(64)), None
++        if kind == "stream":
++            op = r.choice((0x34, 0x35, 0x36, 0x37))  # LQI, SQI, LQD, SQD
++            if op in (0x34, 0x36):
++                ft = self.written_vf()
++                return lower_special(op, POINTER, ft, dest), ft
++            return lower_special(op, self.vf(), POINTER, dest), None
++        if kind == "integer memory":
++            one = 8 >> self.lane()
++            form = r.randrange(4)
++            if form == 0:
++                return memory(0x04, one, r.choice(SCRATCH), BASE, r.randrange(64)), None  # ILW
++            if form == 1:
++                return memory(0x05, dest, self.vi(), BASE, r.randrange(64)), None     # ISW
++            if form == 2:
++                return lower_special(0x3E, BASE, r.choice(SCRATCH), one), None       # ILWR
++            return lower_special(0x3F, BASE, self.vi(), dest), None                  # ISWR
++        if kind == "move":
++            ft = self.written_vf()
++            return lower_special(r.choice((0x30, 0x31)), self.vf(), ft, dest), ft  # MOVE, MR32
++        if kind == "transfer":
++            if r.random() < 0.5:
++                return lower_special(0x3C, self.vf(), r.choice(SCRATCH), self.lane()), None  # MTIR
++            ft = self.written_vf()
++            return lower_special(0x3D, self.vi(), ft, dest), ft  # MFIR
++        if kind == "fdiv":
++            op = r.choice((0x38, 0x39, 0x3A))  # DIV, SQRT, RSQRT
++            fields = (self.lane() << 2) | (self.lane() if op != 0x39 else 0)
++            return lower_special(op, self.vf() if op != 0x39 else 0, self.vf(), fields), None
++        if kind == "waitq":
++            return lower_special(0x3B), None
++        if kind == "efu":
++            if r.random() < 0.5:
++                op, fields = r.choice(EFU_VECTOR)
++                return lower_special(op, self.vf(), 0, fields), None
++            return lower_special(r.choice(EFU_SCALAR), self.vf(), 0, self.lane()), None
++        if kind == "waitp":
++            return lower_special(0x7B), None
++        if kind == "mfp":
++            ft = self.written_vf()
++            return lower_special(0x64, 0, ft, dest), ft
++        if kind == "status":
++            op = r.choice((0x14, 0x15, 0x16, 0x17))  # FSEQ, FSSET, FSAND, FSOR
++            return flag_immediate(op, r.choice(SCRATCH) if op != 0x15 else 0, r.randrange(4096)), None
++        if kind == "mac":
++            return flag_register(r.choice((0x18, 0x1A, 0x1B)), r.choice(SCRATCH), self.vi()), None
++        if kind == "clip":
++            if r.random() < 0.25:
++                return flag_register(0x1C, r.choice(SCRATCH)), None  # FCGET
++            return (r.choice((0x10, 0x11, 0x12, 0x13)) << 25) | r.randrange(1 << 24), None
++        if kind == "xtop":
++            return lower_special(r.choice((0x68, 0x69)), 0, r.choice(SCRATCH)), None
++        if kind == "kick":
++            return lower_special(0x6C, KICK), None
++        return LOWER_NOP, None
++
++    def pair(self, program):
++        word, writes = self.upper()
++        if self.random.random() < 0.06:
++            return program.add(self.float_bits(), word | I_BIT)
++        return program.add(self.lower(writes), word)
++
++    def outer_product(self, program):
++        fs, ft, fd = self.vf(), self.vf(), self.written_vf()
++        program.add(self.lower(), upper_special(0x2E, XYZ, ft, fs))
++        program.add(self.lower(fd), upper(0x2E, XYZ, fs, ft, fd))
++
++    def straight(self, program, count):
++        for _ in range(count):
++            if self.random.random() < 0.04:
++                self.outer_product(program)
++            else:
++                self.pair(program)
++
++    def body(self, program, items, depth, subroutines=()):
++        for _ in range(items):
++            roll = self.random.random()
++            if roll < 0.08 and depth < len(COUNTERS):
++                self.loop(program, depth, subroutines)
++            elif roll < 0.16:
++                self.skip(program, depth, subroutines)
++            elif roll < 0.20 and subroutines:
++                self.call(program, self.random.choice(subroutines))
++            else:
++                self.straight(program, self.random.randint(1, 4))
++
++    def loop(self, program, depth, subroutines):
++        counter = COUNTERS[depth]
++        limit = self.outer_iterations if depth == 0 else 4
++        program.add(immediate15(0x08, counter, 0, self.random.randint(max(1, limit // 3), limit)), self.upper()[0])
++        program.add(immediate15(0x08, POINTER, 0, POINTER_QWORD), self.upper()[0])
++        head = program.next
++        self.body(program, self.random.randint(3, 12), depth + 1, subroutines)
++        program.add(immediate15(0x09, counter, counter, 1), self.upper()[0])
++        # Sometimes the branch reads the counter straight after the decrement.
++        if self.random.random() < 0.5:
++            self.pair(program)
++        at = program.add(branch(0x29, 0, counter), self.upper()[0])  # IBNE
++        program.patch_branch(at, head)
++        self.pair(program)
++
++    def skip(self, program, depth, subroutines):
++        op = self.random.choice((0x20, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F))
++        at = program.add(branch(op, self.vi(), self.vi()), self.upper()[0])
++        self.pair(program)
++        self.body(program, self.random.randint(1, 4), depth, subroutines)
++        program.patch_branch(at, program.next)
++
++    def call(self, program, subroutine):
++        if self.random.random() < 0.5:
++            subroutine.calls.append(program.add(branch(0x21, LINK), self.upper()[0]))  # BAL
++        else:
++            subroutine.loads.append(program.add(immediate15(0x08, TARGET, 0, 0), self.upper()[0]))
++            self.straight(program, self.random.randint(0, 2))
++            program.add(branch(0x25, LINK, TARGET), self.upper()[0])  # JALR
++        self.pair(program)
++
++    def end(self, program):
++        word, writes = self.upper()
++        program.add(self.lower(writes), word | E_BIT)
++        self.pair(program)
++
++    def start(self, entry):
++        """A program that has set up the registers generated code addresses through."""
++        program = Program(entry)
++        program.add(immediate15(0x08, KICK, 0, KICK_QWORD), self.upper()[0])
++        program.add(immediate15(0x08, BASE, 0, BASE_QWORD), self.upper()[0])
++        program.add(immediate15(0x08, POINTER, 0, POINTER_QWORD), self.upper()[0])
++        return program
++
++    def program(self, entry):
++        program = self.start(entry)
++        subroutines = [Subroutine() for _ in range(self.random.randint(0, 2))]
++        self.body(program, self.random.randint(12, 40), 0, subroutines)
++        self.end(program)
++        for subroutine in subroutines:
++            start = program.next
++            self.body(program, self.random.randint(2, 6), len(COUNTERS))
++            program.add(branch(0x24, 0, LINK), self.upper()[0])  # JR
++            self.pair(program)
++            for at in subroutine.calls:
++                program.patch_branch(at, start)
++            for at in subroutine.loads:
++                program.patch_immediate(at, start)
++        return program
++
++
++def long_straight(generator):
++    """Past the compiler's block size, so the run is cut into several blocks."""
++    program = generator.start(0)
++    generator.straight(program, 300)
++    generator.end(program)
++    return program
++
++
++def branch_with_e_bit(generator, taken):
++    """The E bit on a conditional branch ends the program after the delay slot."""
++    program = generator.start(40)
++    generator.straight(program, 8)
++    program.add(immediate15(0x08, FIXED, 0, 1 if taken else 0))
++    generator.straight(program, 3)
++    at = program.add(branch(0x29, 0, FIXED), UPPER_NOP | E_BIT)  # IBNE
++    generator.pair(program)
++    generator.straight(program, 4)
++    program.patch_branch(at, program.next)
++    generator.end(program)
++    return program
++
++
++def handed_back(generator):
++    """RINIT is not compiled, so the program returns to the interpreter there."""
++    program = generator.start(100)
++    program.add(immediate15(0x08, 8, 0, 5))
++    head = program.next
++    generator.straight(program, 12)
++    program.add(lower_special(0x42, 1, 0, 0), UPPER_NOP)  # RINIT R, VF1x
++    generator.straight(program, 12)
++    program.add(immediate15(0x09, 8, 8, 1))
++    at = program.add(branch(0x29, 0, 8))
++    program.patch_branch(at, head)
++    generator.pair(program)
++    generator.end(program)
++    return program
++
++
++def image(programs):
++    words = [(LOWER_NOP, UPPER_NOP)] * PAIRS
++    for program in programs:
++        if program.entry + len(program.pairs) > PAIRS:
++            raise ValueError(f"program at {program.entry * 8:#x} runs past the end of VU1 code memory")
++        for index, pair in enumerate(program.pairs, program.entry):
++            words[index] = tuple(pair)
++    return b"".join(struct.pack("<II", lower, upper_word) for lower, upper_word in words)
++
++
++def fnv(data):
++    value = 14695981039346656037
++    for byte in data:
++        value = ((value ^ byte) * 1099511628211) & (2**64 - 1)
++    return value
++
++
++def main():
++    if len(sys.argv) != 2:
++        sys.exit(__doc__)
++    output = Path(sys.argv[1])
++    output.mkdir(parents=True, exist_ok=True)
++    images = [[long_straight(Generator(1))],
++              [branch_with_e_bit(Generator(2), True), handed_back(Generator(3))],
++              [branch_with_e_bit(Generator(4), False)]]
++    # Two generated programs per image, at entries the layout leaves free.
++    for seed in range(100, 124, 2):
++        first = Generator(seed).program(0)
++        second = Generator(seed + 1).program(first.next + 16)
++        images.append([first, second])
++    for seed in range(200, 206):
++        images.append([Generator(seed, outer_iterations=60).program(0)])
++    lines = []
++    for programs in images:
++        code = image(programs)
++        name = f"{fnv(code):016x}"
++        (output / f"vu1-{name}.code").write_bytes(code)
++        lines += [f"{name} {program.entry * 8:x}" for program in programs]
++    (output / "entries.txt").write_text("\n".join(lines) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 4d3b6de..9cd574a 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -11,6 +11,7 @@ void register_ps2_runtime_kernel_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
++void register_ps2_vu1_program_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
+ void register_ps2_iop_tests();
+@@ -42,6 +43,7 @@ int main()
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_memory_tests();
+     register_ps2_vu1_tests();
++    register_ps2_vu1_program_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
+     register_ps2_iop_tests();
+diff --git a/ps2xTest/src/ps2_vu1_program_tests.cpp b/ps2xTest/src/ps2_vu1_program_tests.cpp
+new file mode 100644
+index 0000000..8c01ec0
+--- /dev/null
++++ b/ps2xTest/src/ps2_vu1_program_tests.cpp
+@@ -0,0 +1,391 @@
++#include "MiniTest.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/gs_types.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/ps2_vu1.h"
++#include "../../ps2xRuntime/src/lib/vu/ps2_vu1_program.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <tuple>
++#include <vector>
++
++// Compiled VU1 routines against the interpreter, on the vu_programs.py programs
++// the runtime was built with, named by PS2_VU_PROGRAM_FIXTURES. With
++// PS2_VU_REQUIRE_PROGRAMS, an entry without a routine fails.
++
++namespace
++{
++    constexpr uint32_t kWideBudget = 65536u;
++    constexpr uint32_t kKickQword = 0x3F0u;
++
++    struct ProgramEntry
++    {
++        std::string name;
++        uint32_t pc = 0u;
++        std::vector<uint8_t> code;
++    };
++
++    std::vector<ProgramEntry> loadEntries(std::string &error)
++    {
++        std::vector<ProgramEntry> entries;
++        const char *list = std::getenv("PS2_VU_PROGRAM_FIXTURES");
++        std::stringstream directories(list ? list : "");
++        std::string directory;
++        while (std::getline(directories, directory, ';'))
++        {
++            if (directory.empty())
++                continue;
++            std::ifstream listing(directory + "/entries.txt");
++            if (!listing)
++            {
++                error = "cannot read " + directory + "/entries.txt";
++                return {};
++            }
++            ProgramEntry entry;
++            while (listing >> entry.name >> std::hex >> entry.pc)
++            {
++                std::ifstream image(directory + "/vu1-" + entry.name + ".code", std::ios::binary);
++                entry.code.assign(PS2_VU1_CODE_SIZE, 0u);
++                if (!image.read(reinterpret_cast<char *>(entry.code.data()), PS2_VU1_CODE_SIZE))
++                {
++                    error = "cannot read the code image " + entry.name;
++                    return {};
++                }
++                entries.push_back(entry);
++            }
++        }
++        return entries;
++    }
++
++    // Ordinary values, with zeros, a host denormal and a huge value mixed in.
++    float pattern(uint32_t n)
++    {
++        switch (n % 16u)
++        {
++        case 3u:
++            return 0.0f;
++        case 7u:
++            return -0.0f;
++        case 10u:
++            return 1e-39f;
++        case 13u:
++            return 3.0e38f;
++        default:
++            return (static_cast<float>(n % 29u) - 14.0f) * 0.625f + static_cast<float>(n / 16u);
++        }
++    }
++
++    VU1State initialState()
++    {
++        VU1State state{};
++        for (uint32_t reg = 1u; reg < 32u; ++reg)
++            for (uint32_t lane = 0u; lane < 4u; ++lane)
++                state.vf[reg][lane] = pattern(reg * 4u + lane);
++        state.vf[0][3] = 1.0f;
++        // Only FMAC results reach ACC, so it never holds a denormal, an
++        // infinity or a NaN, and the compiled product sums rely on that.
++        const float acc[4] = {-7.25f, 0.0f, 3.0e38f, -0.0f};
++        std::memcpy(state.acc, acc, sizeof(acc));
++        state.q = 1.5f;
++        state.p = 0.75f;
++        state.i = 2.0f;
++        state.r = 0x3F812345u;
++        return state;
++    }
++
++    // Floats everywhere but the GIF packet the programs kick.
++    std::vector<uint8_t> initialData()
++    {
++        std::vector<uint8_t> data(PS2_VU1_DATA_SIZE, 0u);
++        for (uint32_t qword = 0u; qword < kKickQword; ++qword)
++            for (uint32_t lane = 0u; lane < 4u; ++lane)
++            {
++                const float value = pattern(1000u + qword * 4u + lane);
++                std::memcpy(&data[qword * 16u + lane * 4u], &value, sizeof(value));
++            }
++        const uint64_t tag = 2u | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
++        std::memcpy(&data[kKickQword * 16u], &tag, sizeof(tag));
++        for (uint32_t byte = 0u; byte < 32u; ++byte)
++            data[(kKickQword + 1u) * 16u + byte] = static_cast<uint8_t>(0xA0u + byte);
++        return data;
++    }
++
++    struct Side
++    {
++        PS2Memory mem;
++        GS gs;
++        VU1Interpreter vu;
++        std::vector<std::vector<uint8_t>> packets;
++
++        bool initialize(const std::vector<uint8_t> &code, bool compiled)
++        {
++            if (!mem.initialize())
++                return false;
++            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
++            std::memcpy(mem.getVU1Code(), code.data(), PS2_VU1_CODE_SIZE);
++            mem.markVU1CodeModified();
++            mem.setGifPacketCallback([this](const uint8_t *data, uint32_t size)
++                                     { packets.emplace_back(data, data + size); });
++            vu.setCompiledExecutionEnabled(compiled);
++            return true;
++        }
++
++        void reset(const VU1State &initial, const std::vector<uint8_t> &data)
++        {
++            vu.reset();
++            vu.state() = initial;
++            std::memcpy(mem.getVU1Data(), data.data(), PS2_VU1_DATA_SIZE);
++            packets.clear();
++        }
++
++        void start(uint32_t pc, uint32_t cycles)
++        {
++            vu.execute(mem.getVU1Code(), PS2_VU1_CODE_SIZE, mem.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &mem,
++                       pc, 0u, 0u, cycles);
++        }
++
++        void resume(uint32_t cycles)
++        {
++            vu.resume(mem.getVU1Code(), PS2_VU1_CODE_SIZE, mem.getVU1Data(), PS2_VU1_DATA_SIZE, gs, &mem,
++                      0u, 0u, cycles);
++        }
++
++        uint64_t cycles() const { return vu.state().cycles; }
++    };
++
++    bool same(Side &native, Side &oracle)
++    {
++        return std::memcmp(&native.vu.state(), &oracle.vu.state(), sizeof(VU1State)) == 0 &&
++               std::memcmp(native.mem.getVU1Data(), oracle.mem.getVU1Data(), PS2_VU1_DATA_SIZE) == 0 &&
++               native.packets == oracle.packets;
++    }
++
++    std::string describe(const ProgramEntry &entry, uint64_t budget, const Side &oracle)
++    {
++        std::ostringstream text;
++        text << entry.name << " entry 0x" << std::hex << entry.pc << std::dec << ", budget " << budget
++             << ", cycle " << oracle.cycles();
++        return text.str();
++    }
++
++    // What differs, compiled first, so that a failure says where to look.
++    std::string difference(Side &native, Side &oracle)
++    {
++        const VU1State &a = native.vu.state(), &b = oracle.vu.state();
++        std::ostringstream text;
++        const auto differs = [](const void *x, const void *y, size_t size) { return std::memcmp(x, y, size) != 0; };
++        const auto both = [&](const char *name, uint64_t x, uint64_t y) {
++            if (x != y)
++                text << ' ' << name << " 0x" << std::hex << x << "/0x" << y << std::dec;
++        };
++        both("pc", a.pc, b.pc);
++        both("cycles", a.cycles, b.cycles);
++        both("mac", a.mac, b.mac);
++        both("status", a.status, b.status);
++        both("clip", a.clip, b.clip);
++        both("ebit", a.ebit, b.ebit);
++        both("branch", a.branchPending, b.branchPending);
++        both("target", a.branchTarget, b.branchTarget);
++        both("delay", a.branchDelay, b.branchDelay);
++        bool shown = false;
++        for (uint32_t reg = 0u; reg < 32u; ++reg)
++            if (differs(a.vf[reg], b.vf[reg], sizeof(a.vf[reg])))
++            {
++                text << " vf" << reg;
++                // The first one in full, as bit patterns.
++                for (const VU1State *state : {shown ? nullptr : &a, shown ? nullptr : &b})
++                    if (state)
++                    {
++                        uint32_t bits[4];
++                        std::memcpy(bits, state->vf[reg], sizeof(bits));
++                        text << (state == &a ? " (" : " / ") << std::hex << bits[0] << ' ' << bits[1] << ' '
++                             << bits[2] << ' ' << bits[3] << std::dec << (state == &a ? "" : ")");
++                    }
++                shown = true;
++            }
++        for (uint32_t reg = 0u; reg < 16u; ++reg)
++            both(("vi" + std::to_string(reg)).c_str(), static_cast<uint32_t>(a.vi[reg]), static_cast<uint32_t>(b.vi[reg]));
++        if (differs(a.acc, b.acc, sizeof(a.acc)))
++            text << " acc";
++        for (const auto &[name, x, y] : {std::tuple{"q", &a.q, &b.q}, {"p", &a.p, &b.p}, {"i", &a.i, &b.i}})
++            if (differs(x, y, sizeof(float)))
++                text << ' ' << name;
++        for (uint32_t qword = 0u; qword < PS2_VU1_DATA_SIZE / 16u; ++qword)
++            if (differs(native.mem.getVU1Data() + qword * 16u, oracle.mem.getVU1Data() + qword * 16u, 16u))
++            {
++                text << " data qword 0x" << std::hex << qword << std::dec;
++                break;
++            }
++        both("packets", native.packets.size(), oracle.packets.size());
++        return text.str();
++    }
++
++    // Record a failure like IsTrue, and say whether to go on: after the first
++    // difference the rest of an entry only repeats it.
++    bool check(TestCase &t, bool condition, const std::string &message)
++    {
++        t.IsTrue(condition, message);
++        return condition;
++    }
++
++    bool matches(TestCase &t, Side &native, Side &oracle, const std::string &message)
++    {
++        if (same(native, oracle))
++            return true;
++        t.Fail(message + " (compiled/interpreted:" + difference(native, oracle) + ")");
++        return false;
++    }
++
++    void checkEntry(TestCase &t, const ProgramEntry &entry, bool require)
++    {
++        Side native, oracle;
++        if (!native.initialize(entry.code, true) || !oracle.initialize(entry.code, false))
++        {
++            t.Fail("VU1 fixtures should initialize");
++            return;
++        }
++        if (require)
++            t.IsTrue(ps2_vu_program::find(native.mem.getVU1Code(), PS2_VU1_CODE_SIZE, entry.pc,
++                                          native.mem.getVU1CodeGeneration()) != nullptr,
++                     describe(entry, 0u, oracle) + ": the entry has a compiled routine");
++        const VU1State initial = initialState();
++        const std::vector<uint8_t> data = initialData();
++
++        // One uninterrupted run gives the cycle the program ends on.
++        oracle.reset(initial, data);
++        native.reset(initial, data);
++        oracle.start(entry.pc, kWideBudget);
++        native.start(entry.pc, kWideBudget);
++        const uint64_t end = oracle.cycles();
++        if (!check(t, end < kWideBudget, describe(entry, kWideBudget, oracle) + ": the program ends") ||
++            !matches(t, native, oracle, describe(entry, kWideBudget, oracle) + ": uninterrupted run"))
++            return;
++        if (require)
++            t.IsTrue(native.vu.compiledPairsExecuted() != 0u, describe(entry, kWideBudget, oracle) + ": ran compiled");
++        const VU1State finalState = oracle.vu.state();
++        const std::vector<uint8_t> finalData(oracle.mem.getVU1Data(), oracle.mem.getVU1Data() + PS2_VU1_DATA_SIZE);
++        const auto finalPackets = oracle.packets;
++
++        // A budget the program outlasts stops it at a block boundary and the
++        // interpreter takes over; then the rest in uneven slices.
++        std::vector<uint64_t> budgets;
++        if (end > ps2_vu_program::kMinimumBudget)
++        {
++            const uint64_t span = end - ps2_vu_program::kMinimumBudget;
++            budgets = {ps2_vu_program::kMinimumBudget, ps2_vu_program::kMinimumBudget + span / 3u,
++                       ps2_vu_program::kMinimumBudget + span * 2u / 3u, end - 1u};
++            budgets.erase(std::unique(budgets.begin(), budgets.end()), budgets.end());
++        }
++        for (const uint64_t budget : budgets)
++        {
++            oracle.reset(initial, data);
++            native.reset(initial, data);
++            oracle.start(entry.pc, static_cast<uint32_t>(budget));
++            native.start(entry.pc, static_cast<uint32_t>(budget));
++            if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": stopped by the budget"))
++                return;
++            for (uint32_t slice : {1u, 2u, 3u, 5u, 8u, 13u, kWideBudget})
++            {
++                while (oracle.cycles() < end)
++                {
++                    const uint32_t cycles = static_cast<uint32_t>(std::min<uint64_t>(slice, end - oracle.cycles()));
++                    oracle.resume(cycles);
++                    native.resume(cycles);
++                    if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": resumed"))
++                        return;
++                    if (slice != kWideBudget)
++                        break;
++                }
++            }
++            t.IsTrue(std::memcmp(&oracle.vu.state(), &finalState, sizeof(VU1State)) == 0 &&
++                         std::memcmp(oracle.mem.getVU1Data(), finalData.data(), PS2_VU1_DATA_SIZE) == 0 &&
++                         oracle.packets == finalPackets,
++                     describe(entry, budget, oracle) + ": sliced run ends like the uninterrupted one");
++        }
++
++        // Budgets the program outlasts, every one at first and then every
++        // seventh: a routine hands back at the last block boundary that fits,
++        // possibly only a few cycles before the budget, with results in flight.
++        for (uint64_t budget = ps2_vu_program::kMinimumBudget; budget < end;
++             budget += budget < ps2_vu_program::kMinimumBudget + 2048u ? 1u : 7u)
++        {
++            oracle.reset(initial, data);
++            native.reset(initial, data);
++            oracle.start(entry.pc, static_cast<uint32_t>(budget));
++            native.start(entry.pc, static_cast<uint32_t>(budget));
++            if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": stopped by every budget"))
++                return;
++            oracle.resume(kWideBudget);
++            native.resume(kWideBudget);
++            if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": finished after every budget"))
++                return;
++        }
++    }
++}
++
++void register_ps2_vu1_program_tests()
++{
++    MiniTest::Case("PS2VU1Programs", [](TestCase &tc)
++    {
++        tc.Run("compiled routines match the interpreter on authored programs", [](TestCase &t)
++        {
++            std::string error;
++            const auto entries = loadEntries(error);
++            t.IsTrue(error.empty(), error);
++            const bool require = std::getenv("PS2_VU_REQUIRE_PROGRAMS") != nullptr;
++            if (require)
++                t.IsTrue(!entries.empty(), "PS2_VU_PROGRAM_FIXTURES names the compiled programs");
++            for (const auto &entry : entries)
++                checkEntry(t, entry, require);
++        });
++
++        tc.Run("a recording notes where register jumps land", [](TestCase &t)
++        {
++            // The target comes from VU memory, so only running the code finds it.
++            constexpr uint32_t kLowerNop = 0x8000033Cu;
++            constexpr uint32_t kUpperNop = 0x000002FFu;
++            constexpr uint32_t kEBit = 0x40000000u;
++            std::vector<uint8_t> code(PS2_VU1_CODE_SIZE, 0u);
++            const auto pair = [&code](uint32_t pc, uint32_t lower, uint32_t upper)
++            {
++                std::memcpy(&code[pc], &lower, sizeof(lower));
++                std::memcpy(&code[pc + 4u], &upper, sizeof(upper));
++            };
++            for (uint32_t pc = 0u; pc < 0x210u; pc += 8u)
++                pair(pc, kLowerNop, kUpperNop);
++            pair(0x000u, 0x09010010u, kUpperNop); // ILW.x vi1, 0x10(vi0)
++            pair(0x028u, 0x48000800u, kUpperNop); // JR vi1
++            pair(0x200u, kLowerNop, kUpperNop | kEBit);
++            std::vector<uint8_t> data = initialData();
++            const uint32_t target = 0x200u / 8u;
++            std::memcpy(&data[0x10u * 16u], &target, sizeof(target));
++
++            const std::filesystem::path directory =
++                std::filesystem::temp_directory_path() / "ps2x-vu-jump-recording";
++            std::filesystem::remove_all(directory);
++            ps2_vu_program::setProfileDirectory(directory.string());
++            Side side;
++            t.IsTrue(side.initialize(code, true), "memory initializes");
++            side.reset(initialState(), data);
++            side.start(0u, kWideBudget);
++            ps2_vu_program::setProfileDirectory({});
++
++            std::ifstream entries(directory / "entries.txt");
++            std::string hash;
++            std::string pc;
++            bool recorded = false;
++            while (entries >> hash >> pc)
++                recorded = recorded || pc == "200";
++            t.IsTrue(recorded, "the jump target 0x200 is saved as an entry");
++            entries.close(); // Windows will not delete a file that is still open
++            std::filesystem::remove_all(directory);
++        });
++    });
++}
+diff --git a/tools/compile_vu_programs.py b/tools/compile_vu_programs.py
+new file mode 100644
+index 0000000..cf4ec3c
+--- /dev/null
++++ b/tools/compile_vu_programs.py
+@@ -0,0 +1,586 @@
++#!/usr/bin/env python3
++"""Compile VU1 microprogram routines to C++ from locally recorded microcode.
++
++Inputs are directories written by a run with PS2_VU_PROGRAM_PROFILE set: 16 KiB
++VU1 code images named vu1-<hash>.code and an entries.txt of "<hash> <pc>"
++lines. A routine is the code reachable from one entry through branches; calls
++and register jumps end it, and their targets become routines of their own.
++The output is generated from game microcode and must stay local.
++"""
++
++import argparse
++import struct
++from pathlib import Path
++
++CODE_SIZE = 16384
++PAIRS = CODE_SIZE // 8
++# Run::kMaxBlockPairs: each block reserves flag queue room for its pairs.
++MAX_BLOCK_PAIRS = 128
++# Pairs compiled as one function; longer routines are compiled in chunks.
++# Optimizers slow down sharply on long functions: MSVC 14.51 spent an hour
++# on one 498-pair routine, most of it in a single SSA pass, and 18 seconds
++# on 127 pairs.
++MAX_ROUTINE_PAIRS = 256
++BRANCHES = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
++CONDITIONAL = {0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
++CALLS = {0x21, 0x25}
++REGISTER_JUMPS = {0x24, 0x25}
++LOWER_OPS = {0x00, 0x01, 0x04, 0x05, 0x08, 0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
++             0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C} | BRANCHES
++LOWER_DIRECT = {0x30, 0x31, 0x32, 0x34, 0x35}
++# The EFU operations and WAITP; 0x77 and 0x7F are unassigned.
++EFU_SPECIAL = set(range(0x70, 0x77)) | set(range(0x78, 0x7F))
++LOWER_SPECIAL = {0x30, 0x31, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
++                 0x3E, 0x3F, 0x64, 0x68, 0x69, 0x6C} | EFU_SPECIAL
++FDIV_SPECIAL = {0x38, 0x39, 0x3A, 0x3B}
++
++
++def upper_supported(upper):
++    op = upper & 0x3F
++    if op <= 0x2F:
++        return True
++    if op < 0x3C:
++        return False
++    special = (upper & 3) | ((upper >> 4) & 0x7C)
++    return special <= 0x2A or special in (0x2C, 0x2D, 0x2E, 0x2F, 0x30)
++
++
++def lower_special(lower):
++    return (lower & 3) | ((lower >> 4) & 0x7C)
++
++
++def lower_supported(lower):
++    if lower in (0, 0x8000033C):
++        return True
++    op = lower >> 25
++    if op in LOWER_OPS:
++        return True
++    if op != 0x40:
++        return False
++    direct = lower & 0x3F
++    if direct in LOWER_DIRECT:
++        return True
++    return direct >= 0x3C and lower_special(lower) in LOWER_SPECIAL
++
++
++class Pair:
++    __slots__ = ("lower", "upper")
++
++    def __init__(self, lower, upper):
++        self.lower = lower
++        self.upper = upper
++
++    @property
++    def immediate(self):
++        return bool(self.upper & 0x80000000)
++
++    @property
++    def ebit(self):
++        return bool(self.upper & 0x40000000)
++
++    @property
++    def op(self):
++        return None if self.immediate else self.lower >> 25
++
++    @property
++    def branch(self):
++        return self.op in BRANCHES
++
++    @property
++    def supported(self):
++        return upper_supported(self.upper) and (self.immediate or lower_supported(self.lower))
++
++    @property
++    def word(self):
++        return self.lower | (self.upper << 32)
++
++    def branch_target(self, index):
++        offset = self.lower & 0x7FF
++        if offset & 0x400:
++            offset -= 0x800
++        return (index + 1 + offset) & (PAIRS - 1)
++
++    def stall_bound(self):
++        """Cycles the pair can take, stalls included, ignoring PATH1 waits."""
++        bound = 5
++        if self.immediate or self.lower >> 25 != 0x40 or (self.lower & 0x3F) < 0x3C:
++            return bound
++        special = lower_special(self.lower)
++        if special in FDIV_SPECIAL:
++            bound += 13
++        if special in EFU_SPECIAL:
++            bound += 54
++        if special == 0x6C:
++            bound += 8192
++        return bound
++
++
++def load_images(directories, parser):
++    images = {}
++    entries = []
++    for directory in directories:
++        listing = directory / "entries.txt"
++        if not listing.is_file():
++            parser.error(f"{directory}: no entries.txt; record with PS2_VU_PROGRAM_PROFILE")
++        for number, line in enumerate(listing.read_text().splitlines(), 1):
++            fields = line.split()
++            if not fields:
++                continue
++            try:
++                name, pc = fields[0], int(fields[1], 16)
++            except (IndexError, ValueError):
++                parser.error(f"{listing}:{number}: expected '<hash> <pc>'")
++            if name not in images:
++                data = (directory / f"vu1-{name}.code").read_bytes()
++                if len(data) != CODE_SIZE:
++                    parser.error(f"{directory}/vu1-{name}.code: expected a 16 KiB VU1 code image")
++                images[name] = [Pair(*struct.unpack_from("<II", data, i)) for i in range(0, CODE_SIZE, 8)]
++            if pc % 8 or pc >= CODE_SIZE:
++                parser.error(f"{listing}:{number}: invalid entry {pc:#x}")
++            entries.append((name, pc // 8))
++    return images, entries
++
++
++def constant_target(pairs, block_start, jump_index):
++    """Resolve a register jump set by IADDIU from VI0 earlier in its block."""
++    reg = (pairs[jump_index].lower >> 11) & 15
++    if reg == 0:
++        return 0
++    for index in range(jump_index - 1, block_start - 1, -1):
++        pair = pairs[index]
++        if pair.immediate:
++            continue
++        lower = pair.lower
++        op = lower >> 25
++        writes = None
++        if op in (0x04, 0x08, 0x09):
++            writes = (lower >> 16) & 15
++        elif op in (0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C):
++            writes = (lower >> 16) & 15
++        elif op in (0x10, 0x12, 0x13):
++            writes = 1
++        elif op == 0x40:
++            direct = lower & 0x3F
++            if direct in (0x30, 0x31, 0x34, 0x35):
++                writes = (lower >> 6) & 15
++            elif direct == 0x32:
++                writes = (lower >> 16) & 15
++            elif direct >= 0x3C:
++                special = lower_special(lower)
++                if special in (0x34, 0x36):
++                    writes = (lower >> 11) & 15
++                elif special in (0x35, 0x37, 0x3C, 0x3E, 0x68, 0x69):
++                    writes = (lower >> 16) & 15
++        if writes != reg:
++            continue
++        if op == 0x08 and (lower >> 11) & 15 == 0:
++            return ((lower & 0x7FF) | ((lower >> 10) & 0x7800)) & (PAIRS - 1)
++        return None
++    return None
++
++
++class Routine:
++    def __init__(self, pairs, entry):
++        self.pairs = pairs
++        self.entry = entry
++        self.blocks = {}   # start -> (pair indices, terminator)
++        self.calls = set() # further routine entries this one can reach
++        self.build()
++
++    def terminates(self, index):
++        """Why the straight line from index cannot simply continue, if at all."""
++        pair = self.pairs[index]
++        if not pair.supported or index + 1 >= PAIRS:
++            return ("leave",)
++        if pair.branch or pair.ebit:
++            delay = self.pairs[index + 1]
++            if not delay.supported or delay.branch or delay.ebit or index + 2 > PAIRS:
++                return ("leave",)
++        return None
++
++    def build(self):
++        leaders = {self.entry}
++        work = [self.entry]
++        visited = set()
++        while work:
++            index = work.pop()
++            while index not in visited:
++                visited.add(index)
++                if self.terminates(index):
++                    break
++                pair = self.pairs[index]
++                if pair.branch:
++                    op = pair.op
++                    targets = []
++                    if op in (0x20,) + tuple(CONDITIONAL):
++                        targets.append(pair.branch_target(index))
++                    if op in CONDITIONAL:
++                        targets.append(index + 2)
++                    if not pair.ebit:
++                        for target in targets:
++                            if target not in leaders:
++                                leaders.add(target)
++                                work.append(target)
++                    break
++                if pair.ebit:
++                    break
++                index += 1
++                if index >= PAIRS:
++                    break
++        pending = sorted(leaders)
++        while pending:
++            start = pending.pop()
++            if start in self.blocks:
++                continue
++            self.blocks[start] = body, terminator = self.walk(start, leaders)
++            # A long straight run was cut; the rest becomes a block of its own.
++            if terminator[0] == "fall" and terminator[1] not in leaders:
++                leaders.add(terminator[1])
++                pending.append(terminator[1])
++
++    def walk(self, start, leaders):
++        body = []
++        index = start
++        while True:
++            # Room for a branch and its delay slot must remain.
++            if len(body) >= MAX_BLOCK_PAIRS - 1:
++                return body, ("fall", index)
++            reason = self.terminates(index)
++            if reason:
++                return body, ("leave", index)
++            pair = self.pairs[index]
++            if pair.branch:
++                body += [index, index + 1]
++                op = pair.op
++                after = index + 2
++                if op in REGISTER_JUMPS:
++                    target = constant_target(self.pairs, start, index)
++                    if op in CALLS:
++                        self.calls.add(after)
++                    if target is not None:
++                        self.calls.add(target)
++                    kind = "call" if op in CALLS else "jump"
++                    return body, (kind, target, pair.ebit)
++                target = pair.branch_target(index)
++                if op == 0x21:
++                    self.calls.update((target, after))
++                    return body, ("call", target, pair.ebit)
++                if pair.ebit:
++                    return body, ("end-branch", target, op in CONDITIONAL, after)
++                if op == 0x20:
++                    return body, ("goto", target)
++                return body, ("cond", target, after)
++            if pair.ebit:
++                body += [index, index + 1]
++                return body, ("end", index + 2)
++            body.append(index)
++            index += 1
++            if index in leaders:
++                return body, ("fall", index)
++
++    def footprint(self):
++        indices = set()
++        for body, terminator in self.blocks.values():
++            indices.update(body)
++            if terminator[0] == "leave":
++                indices.add(terminator[1])
++        return sorted(indices)
++
++    def key(self):
++        return (self.entry, tuple((i, self.pairs[i].word) for i in self.footprint()))
++
++
++def fnv(values):
++    value = 14695981039346656037
++    for item in values:
++        for byte in struct.pack("<Q", item):
++            value = ((value ^ byte) * 1099511628211) & (2**64 - 1)
++    return value
++
++
++def pc(index):
++    return f"0x{(index * 8) & (CODE_SIZE - 1):04X}u"
++
++
++def successors(terminator):
++    """The blocks a block continues at within its routine, straight line first."""
++    kind = terminator[0]
++    if kind in ("fall", "goto"):
++        return [terminator[1]]
++    if kind == "cond":
++        return [terminator[2], terminator[1]]
++    return []
++
++
++def loops(routine):
++    """Each block's strongly connected component, as a frozenset of block starts."""
++    # Tarjan's algorithm without recursion: a routine can chain over a
++    # thousand blocks, deeper than Python's recursion limit.
++    index, low, stack, on_stack, component = {}, {}, [], set(), {}
++    path = []
++
++    def enter(start):
++        index[start] = low[start] = len(index)
++        stack.append(start)
++        on_stack.add(start)
++        path.append((start, iter(successors(routine.blocks[start][1]))))
++
++    for root in sorted(routine.blocks):
++        if root in index:
++            continue
++        enter(root)
++        while path:
++            start, targets = path[-1]
++            target = next(targets, None)
++            if target is not None:
++                if target not in index:
++                    enter(target)
++                elif target in on_stack:
++                    low[start] = min(low[start], index[target])
++                continue
++            path.pop()
++            if path:
++                parent = path[-1][0]
++                low[parent] = min(low[parent], low[start])
++            if low[start] == index[start]:
++                members = []
++                while True:
++                    member = stack.pop()
++                    on_stack.discard(member)
++                    members.append(member)
++                    if member == start:
++                        break
++                for member in members:
++                    component[member] = frozenset(members)
++    return component
++
++
++def partition(routine, max_pairs):
++    """Cut a routine's blocks, in depth-first order, into runs of at most max_pairs pairs.
++
++    A loop that fits in one run stays in one, so that no iteration changes chunks.
++    """
++    order, seen, work = [], set(), [routine.entry]
++    while work:
++        start = work.pop()
++        if start in seen:
++            continue
++        seen.add(start)
++        order.append(start)
++        work.extend(reversed(successors(routine.blocks[start][1])))
++    component = loops(routine)
++    size_of = lambda starts: sum(len(routine.blocks[start][0]) for start in starts)
++    chunks, size, placed = [[]], 0, set()
++    for start in order:
++        if start in placed:
++            continue
++        unit = [start]
++        if len(component[start]) > 1 and size_of(component[start]) <= max_pairs:
++            unit = [member for member in order if member in component[start]]
++        pairs = size_of(unit)
++        if chunks[-1] and size + pairs > max_pairs:
++            chunks.append([])
++            size = 0
++        chunks[-1].extend(unit)
++        placed.update(unit)
++        size += pairs
++    return chunks
++
++
++def emit_routine(routine, name, max_pairs):
++    pairs = routine.pairs
++    # The entry block comes first; every other block is reached by goto.
++    blocks = sorted(routine.blocks, key=lambda start: start != routine.entry)
++    chunks = [blocks]
++    if sum(len(body) for body, _ in routine.blocks.values()) > max_pairs:
++        chunks = partition(routine, max_pairs)
++    chunk_of = {start: index for index, chunk in enumerate(chunks) for start in chunk}
++    # Where each chunk can be entered: its first block, then blocks other chunks branch to.
++    entries = [[chunk[0]] for chunk in chunks]
++    for start, (_, terminator) in sorted(routine.blocks.items()):
++        for target in successors(terminator):
++            chunk = chunk_of[target]
++            if chunk != chunk_of[start] and target not in entries[chunk]:
++                entries[chunk].append(target)
++    targets = {start for entry in entries for start in entry[1:]}
++    for start, (_, terminator) in routine.blocks.items():
++        targets.update(target for target in successors(terminator) if chunk_of[target] == chunk_of[start])
++    assert len(chunks) < 256 and all(len(entry) < 256 for entry in entries)
++
++    def jump(source, target):
++        chunk = chunk_of[target]
++        if chunk == chunk_of[source]:
++            return f"goto b_{target:04x};"
++        # The routine's own function continues with the chunk holding the target.
++        return f"return p.exit(0x{0x10000 | chunk << 8 | entries[chunk].index(target):05X}u);"
++
++    # Pairs are named by block and position, which lets each one see the pairs
++    # issued before it in the block.
++    tables = []
++    lines = []
++
++    def emit_block(start):
++        body, terminator = routine.blocks[start]
++        table = f"{name}_{start:04x}"
++        if body:
++            words = ", ".join(f"0x{pairs[i].word:016x}ull" for i in body)
++            tables.append(f"constexpr Block<{len(body)}> {table}{{{pc(start)}, {{{words}}}}};")
++
++        def emit_pair(index, next_pc, checked=True):
++            call = f"p.pair<{table}, {index - start}>({next_pc})"
++            # A GIF callback that rewrote microcode sends the rest to the interpreter.
++            return f"    if (!{call}) return p.leaveStale();" if checked else f"    {call};"
++
++        margin = sum(pairs[i].stall_bound() for i in body) + 1
++        if start in targets:
++            lines.append(f"b_{start:04x}:")
++        lines.append(f"    if (!p.fits<{margin}u, {len(body)}u>()) return p.leave({pc(start)});")
++        kind = terminator[0]
++        tail = [] if kind in ("fall", "leave") else body[-2:]
++        for index in body[:len(body) - len(tail)]:
++            lines.append(emit_pair(index, pc(index + 1)))
++        if kind == "leave":
++            lines.append(f"    return p.leave({pc(terminator[1])});")
++            return
++        if kind == "fall":
++            lines.append(f"    {jump(start, terminator[1])}")
++            return
++
++        first, delay = tail
++        if kind == "end":
++            # Once the delay slot has issued the program is over either way.
++            lines.append(emit_pair(first, pc(delay)))
++            lines.append(emit_pair(delay, pc(terminator[1]), checked=False))
++            lines.append(f"    return p.end({pc(terminator[1])});")
++            return
++
++        # A branch and its delay slot. The E bit on the branch ends the program
++        # once the delay slot has issued.
++        if kind in ("call", "jump"):
++            target = pc(terminator[1]) if terminator[1] is not None else "p.jumpTarget()"
++            ending = terminator[2]
++        else:
++            target = pc(terminator[1])
++            ending = kind == "end-branch"
++        conditional = kind == "cond" or (kind == "end-branch" and terminator[2])
++        after = f"(p.taken() ? {target} : {pc(delay + 1)})" if conditional else target
++        lines.append(emit_pair(first, pc(delay)))
++        lines.append(emit_pair(delay, after, checked=not ending))
++        if ending:
++            lines.append(f"    return p.end({after});")
++        elif kind in ("call", "jump"):
++            lines.append(f"    return p.exit({after});")
++        elif kind == "goto":
++            lines.append(f"    {jump(start, terminator[1])}")
++        else:
++            lines.append(f"    if (p.taken()) {jump(start, terminator[1])}")
++            lines.append(f"    {jump(start, terminator[2])}")
++
++    if len(chunks) == 1:
++        lines += [f"uint32_t {name}(Run &run, uint64_t budgetEnd)", "{", "    Frame p(run, budgetEnd);"]
++        for start in blocks:
++            emit_block(start)
++        lines.append("}")
++        return tables + lines
++
++    # Optimizers take far longer than linear time on long functions, so a
++    # long routine is compiled as chunks of at most max_pairs pairs. A chunk
++    # hands over by returning 0x1CCEE, chunk CC entered at EE, which no PC is.
++    for index, chunk in enumerate(chunks):
++        lines += [f"static PS2_VU_CHUNK uint32_t {name}_c{index}(Run &run, uint64_t budgetEnd, uint32_t entry)",
++                  "{", "    Frame p(run, budgetEnd);"]
++        if len(entries[index]) > 1:
++            lines += ["    switch (entry)", "    {"]
++            lines += [f"    case {number}u: goto b_{start:04x};" for number, start in enumerate(entries[index]) if number]
++            lines += ["    default: break;", "    }"]
++        for start in chunk:
++            emit_block(start)
++        lines += ["}", ""]
++    lines += [f"uint32_t {name}(Run &run, uint64_t budgetEnd)", "{",
++              f"    uint32_t next = {name}_c0(run, budgetEnd, 0u);",
++              "    while (next >= 0x10000u)", "    {",
++              "        const uint32_t entry = next & 0xFFu;",
++              "        switch ((next >> 8u) & 0xFFu)", "        {"]
++    lines += [f"        case {index}u: next = {name}_c{index}(run, budgetEnd, entry); break;" for index in range(1, len(chunks))]
++    lines += [f"        default: next = {name}_c0(run, budgetEnd, entry); break;", "        }", "    }", "    return next;", "}"]
++    return tables + lines
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=Path, required=True,
++                        help="registry include; declarations and shards are written beside it")
++    parser.add_argument("--shards", type=int, default=4)
++    parser.add_argument("--max-routine-pairs", type=int, default=MAX_ROUTINE_PAIRS,
++                        help="pairs compiled as one function; longer routines are cut into chunks")
++    parser.add_argument("profiles", type=Path, nargs="*")
++    args = parser.parse_args()
++    if args.shards < 1:
++        parser.error("--shards must be positive")
++    if args.max_routine_pairs < MAX_BLOCK_PAIRS:
++        parser.error(f"--max-routine-pairs must be at least {MAX_BLOCK_PAIRS}")
++
++    images, entries = load_images(args.profiles, parser)
++    routines = {}
++    for name, entry in entries:
++        pairs = images[name]
++        work, seen = [entry], set()
++        while work:
++            start = work.pop()
++            if start in seen or start >= PAIRS:
++                continue
++            seen.add(start)
++            routine = Routine(pairs, start)
++            routines.setdefault(routine.key(), routine)
++            work.extend(routine.calls)
++
++    output = args.output
++    output.parent.mkdir(parents=True, exist_ok=True)
++    header = "// Generated from local VU1 microcode; do not distribute game data.\n"
++    ordered = sorted(routines.items(), key=lambda item: (item[0][0], fnv(w for _, w in item[0][1])))
++    names = [f"r_{fnv(w for _, w in key[1]):016x}_{i}" for i, (key, _) in enumerate(ordered)]
++
++    registry = [header]
++    externs = [header, "namespace ps2_vu_program::generated\n{\n"]
++    shards = [[header, '#include "ps2_vu1_program.h"\n\n', "namespace ps2_vu_program::generated\n{\n"]
++              for _ in range(args.shards)]
++    # Compile time follows pair count, so fill the lightest shard first,
++    # biggest routines first.
++    load = [0] * args.shards
++    assigned = {}
++    for (key, routine), name in sorted(zip(ordered, names), key=lambda item: (-len(item[0][1].footprint()), item[1])):
++        lightest = load.index(min(load))
++        assigned[name] = lightest
++        load[lightest] += len(routine.footprint())
++    for (key, routine), name in zip(ordered, names):
++        footprint = routine.footprint()
++        externs.append(f"extern const uint16_t {name}_pairs[];\n")
++        externs.append(f"extern const uint64_t {name}_words[];\n")
++        externs.append(f"uint32_t {name}(Run &, uint64_t);\n")
++        registry.append(f"{{{pc(routine.entry)}, {len(footprint)}u, generated::{name}_pairs, "
++                        f"generated::{name}_words, &generated::{name}}},\n")
++        shard = shards[assigned[name]]
++        shard.append(f"extern const uint16_t {name}_pairs[] = {{"
++                     + ", ".join(str(i) for i in footprint) + "};\n")
++        shard.append(f"extern const uint64_t {name}_words[] = {{"
++                     + ", ".join(f"0x{routine.pairs[i].word:016x}ull" for i in footprint) + "};\n")
++        shard.append("\n".join(emit_routine(routine, name, args.max_routine_pairs)) + "\n\n")
++    externs.append("}\n")
++    for shard in shards:
++        shard.append("}\n")
++        if any("PS2_VU_CHUNK" in part for part in shard):
++            # A chunk inlined into its routine would make the long function again.
++            shard.insert(2, "#if defined(_MSC_VER)\n#define PS2_VU_CHUNK __declspec(noinline)\n#else\n"
++                            "#define PS2_VU_CHUNK __attribute__((noinline))\n#endif\n\n")
++
++    output.write_text("".join(registry))
++    output.with_name(output.stem + "_extern.inc").write_text("".join(externs))
++    for index, shard in enumerate(shards):
++        output.with_name(f"{output.stem}_{index}.cpp").write_text("".join(shard))
++    pair_total = sum(len(r.footprint()) for r in routines.values())
++    print(f"compile_vu_programs: {len(routines)} routines, {pair_total} pairs from "
++          f"{len(entries)} entries in {len(images)} images")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/tests/test_compile_vu_programs.py b/tools/tests/test_compile_vu_programs.py
+new file mode 100644
+index 0000000..e306dad
+--- /dev/null
++++ b/tools/tests/test_compile_vu_programs.py
+@@ -0,0 +1,210 @@
++"""Check how compile_vu_programs.py cuts VU1 microcode into routines and blocks."""
++
++import importlib.util
++import re
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / "tools" / "compile_vu_programs.py"
++FIXTURES = ROOT / "ps2xTest" / "data" / "vu_programs.py"
++
++spec = importlib.util.spec_from_file_location("vu_programs", FIXTURES)
++vu = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(vu)
++
++
++def profile(directory, pairs, entries):
++    """Write one code image holding pairs from index 0, with the given entry indices."""
++    words = [(vu.LOWER_NOP, vu.UPPER_NOP)] * vu.PAIRS
++    for index, pair in enumerate(pairs):
++        words[index] = pair
++    (directory / "vu1-test.code").write_bytes(b"".join(struct.pack("<II", *pair) for pair in words))
++    (directory / "entries.txt").write_text("".join(f"test {index * 8:x}\n" for index in entries))
++
++
++def compile_profile(directory, shards=1, options=()):
++    output = directory / "out" / "vu_programs.inc"
++    result = subprocess.run([sys.executable, str(SCRIPT), "--output", str(output), "--shards", str(shards),
++                             *options, str(directory)], capture_output=True, text=True)
++    return result, output
++
++
++def registered_pcs(output):
++    return {int(pc, 16) for pc in re.findall(r"^\{0x([0-9A-F]+)u,", output.read_text(), re.M)}
++
++
++def routines(output):
++    text = "".join(path.read_text() for path in sorted(output.parent.glob("vu_programs_*.cpp")))
++    return text, [int(pairs) for pairs in re.findall(r"p\.fits<\d+u, (\d+)u>", text)]
++
++
++class CompileVuProgramsTests(unittest.TestCase):
++    def test_fixture_programs_all_get_routines_and_the_output_is_stable(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            subprocess.run([sys.executable, str(FIXTURES), str(root / "fixtures")], check=True)
++            outputs = []
++            for name in ("a", "b"):
++                output = root / name / "vu_programs.inc"
++                subprocess.run([sys.executable, str(SCRIPT), "--output", str(output), "--shards", "3",
++                                str(root / "fixtures")], check=True, capture_output=True, text=True)
++                outputs.append([path.read_text() for path in sorted(output.parent.iterdir())])
++            self.assertEqual(outputs[0], outputs[1])
++            entries = {int(line.split()[1], 16)
++                       for line in (root / "fixtures" / "entries.txt").read_text().splitlines()}
++            self.assertLessEqual(entries, registered_pcs(root / "a" / "vu_programs.inc"))
++
++    def test_long_straight_runs_are_cut_into_blocks_that_fit_the_flag_queue(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)] * 300
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(sum(blocks), len(pairs))
++            self.assertEqual(max(blocks), 127)
++            self.assertIn("goto b_007f;", text)
++
++    def test_calls_and_constant_register_jumps_start_routines_of_their_own(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            pairs = [nop] * 24
++            pairs[0] = (vu.branch(0x21, vu.LINK, 0, 10 - 1), vu.UPPER_NOP)  # BAL to 10
++            pairs[2] = (vu.immediate15(0x08, vu.TARGET, 0, 20), vu.UPPER_NOP)
++            pairs[3] = (vu.branch(0x25, vu.LINK, vu.TARGET), vu.UPPER_NOP)  # JALR to 20
++            pairs[5] = (vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT)
++            pairs[10] = (vu.branch(0x24, 0, vu.LINK), vu.UPPER_NOP)  # JR
++            pairs[20] = (vu.branch(0x24, 0, vu.LINK), vu.UPPER_NOP)
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            # The entry, both callees, and the two places the calls return to.
++            self.assertEqual(registered_pcs(output), {0, 10 * 8, 2 * 8, 20 * 8, 5 * 8})
++            text, _ = routines(output)
++            self.assertEqual(text.count("return p.exit(p.jumpTarget());"), 2)
++
++    def test_an_unsupported_pair_hands_the_program_back_where_it_stands(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            rinit = (vu.lower_special(0x42, 1), vu.UPPER_NOP)
++            pairs = [nop, nop, nop, rinit, nop, (vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(blocks, [3])
++            self.assertIn("return p.leave(0x0018u);", text)
++
++    def test_every_assigned_efu_opcode_compiles_and_the_unassigned_ones_hand_back(self):
++        nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++        end = [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++        assigned = [op for op in range(0x70, 0x80) if op not in (0x77, 0x7F)]
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.lower_special(op, 1), vu.UPPER_NOP) for op in assigned] + end
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            _, blocks = routines(output)
++            self.assertEqual(blocks, [len(pairs)])
++        for op in (0x77, 0x7F):
++            with tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                profile(root, [nop, nop, (vu.lower_special(op, 1), vu.UPPER_NOP)] + end, [0])
++                result, output = compile_profile(root)
++                self.assertEqual(result.returncode, 0, result.stderr)
++                text, blocks = routines(output)
++                self.assertEqual(blocks, [2])
++                self.assertIn("return p.leave(0x0010u);", text)
++
++    def test_entries_must_be_pair_aligned_and_inside_code_memory(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            profile(root, [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT)], [0])
++            for line in ("test 4\n", "test 4000\n", "test\n"):
++                (root / "entries.txt").write_text(line)
++                result, _ = compile_profile(root)
++                self.assertNotEqual(result.returncode, 0)
++                self.assertRegex(result.stderr, "invalid entry|expected '<hash> <pc>'")
++
++    def test_long_routines_are_compiled_in_chunks_that_continue_each_other(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)] * 600
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            # Still one routine, entered and checked as a whole.
++            self.assertEqual(registered_pcs(output), {0})
++            text, blocks = routines(output)
++            self.assertEqual(sum(blocks), len(pairs))
++            chunks = re.split(r"^static PS2_VU_CHUNK ", text, flags=re.M)[1:]
++            self.assertEqual(len(chunks), 3)
++            for chunk in chunks:
++                self.assertLessEqual(sum(int(n) for n in re.findall(r"p\.fits<\d+u, (\d+)u>", chunk)), 256)
++            self.assertIn("return p.exit(0x10100u);", text)
++            self.assertIn("return p.exit(0x10200u);", text)
++
++    def test_a_loop_that_fits_in_a_chunk_is_not_cut(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            work = (vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            pairs = [work] * 119 + [(vu.immediate15(0x08, 8, 0, 3), vu.UPPER_NOP)]
++            head = len(pairs)
++            # 150 pairs, which the compiler cuts into blocks of 127 and 23.
++            pairs += [work] * 147 + [(vu.immediate15(0x09, 8, 8, 1), vu.UPPER_NOP)]
++            pairs += [(vu.branch(0x29, 0, 8, head - (len(pairs) + 1)), vu.UPPER_NOP), nop]
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(sorted(blocks), [2, 23, 120, 127])
++            # Filling the first chunk would have cut the loop after its first block.
++            self.assertEqual(text.count("static PS2_VU_CHUNK"), 2)
++            self.assertIn(f"goto b_{head + 127:04x};", text)
++            self.assertIn(f"if (p.taken()) goto b_{head:04x};", text)
++
++    def test_routines_under_the_limit_compile_as_before(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)] * 600
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root, options=("--max-routine-pairs", "1000"))
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, _ = routines(output)
++            self.assertNotIn("PS2_VU_CHUNK", text)
++            for limit in ("127", "x"):
++                result, _ = compile_profile(root, options=("--max-routine-pairs", limit))
++                self.assertNotEqual(result.returncode, 0)
++
++    def test_a_routine_of_a_thousand_chained_blocks_compiles(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            # Each IBNE continues at the next block either way: all of code
++            # memory as one chain of 1,024 blocks.
++            pairs = [(vu.branch(0x29, offset=1), vu.UPPER_NOP), nop] * 1023
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(len(blocks), 1024)
++            self.assertEqual(text.count("static PS2_VU_CHUNK"), 8)
++
++
++if __name__ == "__main__":
++    unittest.main()

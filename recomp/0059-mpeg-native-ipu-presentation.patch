@@ -1,0 +1,33 @@
+From fc985c1528838f8f4d5fbb276f694c8f52e9ce2b Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:04:44 +0300
+Subject: [PATCH] MPEG: let native IPU users schedule presentation
+
+Sofdec already gates display frames on the ADX clock. Throttling low-level GetPicture to two assumed NTSC fields on a PAL 50 Hz scheduler decodes 29.97 fps video at 25 fps, stalls its shared SFD demux and starves the audio mixer. Its filled SPU2 queue contains silent 256-sample PCM blocks, which empty-buffer counters do not detect.
+
+Skip the HLE presentation wait only for the active native toIPU input. Preserve pacing for sceMpegAddBs/PSS input. In a manual capture, 25 silent spans in the affected 2.8-second THX passage disappear and the waveform remains aligned to the source ADX.
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index bfa26f5..2164afe 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -2498,7 +2498,12 @@ namespace ps2_stubs
+                     playback.nextPictureTickQ32 = currentTickQ32;
+                 }
+ 
+-                if (currentTickQ32 < presentationTargetQ32)
++                // Native IPU feeders manage presentation themselves (Sofdec also
++                // synchronizes it to ADX). GetPicture must not throttle decoding
++                // to the host's assumed field rate: on PAL that also starves the
++                // audio packets in their shared multiplexed input stream.
++                const bool nativeIpuInput = !playback.hleInput && g_mpeg_stub_state.ipuInputMpeg == mpegAddr;
++                if (!nativeIpuInput && currentTickQ32 < presentationTargetQ32)
+                 {
+                     const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
+                     lock.unlock();
+-- 
+2.54.0 (Apple Git-157)
+

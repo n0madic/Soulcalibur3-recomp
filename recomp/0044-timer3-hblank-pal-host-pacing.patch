@@ -1,0 +1,371 @@
+From 9f5cfd30f0f1851963fae312ece50fac314dc18c Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 03:11:37 +0300
+Subject: [PATCH] Pace the game by Timer 3 scan lines, PAL rates and host time
+
+The BIOS keeps EE Timer 3 for its alarms, which count scan lines, and
+Soulcalibur III paces its main loop on it: after each VSync it busy-waits
+until Timer 3 has advanced 311 lines past the VSync stamp. Timer 3 started
+at BUSCLK/256, so the wait ended almost at once and the game ran unpaced.
+
+- Timer 3 starts counting H-blanks (CLKS=3), at 15625 Hz once SMODE1
+  selects PAL instead of the NTSC 15734 Hz.
+- VBlank comes every 20 ms in PAL mode instead of a fixed 60 Hz.
+- EE time is an estimate that runs behind real time while the guest spins,
+  so a timer count read lets the EE clock catch up with host time since the
+  last VBlank, up to the next scheduled event.
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h   |  4 ++
+ ps2xRuntime/include/runtime/ps2_memory.h     |  7 +++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp   | 64 ++++++++++++++++++--
+ ps2xRuntime/src/lib/gs/gs_priv_registers.cpp |  5 ++
+ ps2xRuntime/src/lib/ps2_memory.cpp           | 22 +++++--
+ ps2xTest/src/ps2_memory_tests.cpp            | 20 ++++++
+ ps2xTest/src/ps2_runtime_interrupt_tests.cpp | 30 +++++++++
+ 7 files changed, 141 insertions(+), 11 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 68ce69b..eb9fb23 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -384,6 +384,7 @@ private:
+     void applyPendingPreemption();
+     void processPendingEvents();
+     void processDueDeadlines();
++    void catchUpWithHostTime() noexcept;
+     void processEvent(const EeEvent &event);
+     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
+     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
+@@ -427,6 +428,9 @@ private:
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
++    // The last VBlank start, in EE cycles and host time.
++    uint64_t m_vblankCycle = 0;
++    std::chrono::steady_clock::time_point m_vblankHostTime{};
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 9c2328a..bca6aea 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -229,6 +229,8 @@ void gsApplyQueuedSignal(GSRegisters &regs);
+ // The display mode as the BIOS SetGsCrt programs it: SMODE2 (INT, FFMD) and the SMODE1 line clock
+ // and colour mode for videoMode (2 NTSC, 3 PAL, 0x1A-0x3B VESA, 0x50-0x53 HDTV).
+ void gsSetCrt(GSRegisters &regs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode);
++// PAL timing (50 Hz fields, 15625 Hz H-blank) once SMODE1 selects the PAL colour mode.
++bool gsPalTiming(const GSRegisters &regs);
+ // FINISH raises CSR.FINISH; LABEL merges its id into the upper SIGLBLID word under its mask.
+ void gsWriteFinish(GSRegisters &regs);
+ void gsWriteLabel(GSRegisters &regs, uint64_t value);
+@@ -333,6 +335,9 @@ public:
+ 
+     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
+     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
++    // Runs before the guest reads an EE timer count: a guest polling a timer
++    // waits for real time to pass, so the scheduler lets its clock catch up.
++    void setEeTimerReadCallback(std::function<void()> cb) { m_eeTimerReadCallback = std::move(cb); }
+     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+ 
+     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
+@@ -425,6 +430,7 @@ public:
+     std::vector<TLBEntry> m_tlbEntries;
+ 
+     GifPacketCallback m_gifPacketCallback;
++    std::function<void()> m_eeTimerReadCallback;
+     GifArbiter *m_gifArbiter = nullptr;
+     Vu1MscalCallback m_vu1MscalCallback;
+     Vu1MscntCallback m_vu1MscntCallback;
+@@ -486,6 +492,7 @@ public:
+     // GIF_STAT in m_ioRegisters, whose FQC drains as soon as time passes.
+     uint32_t *m_gifStat = nullptr;
+     uint32_t syncEeTimers() noexcept;
++    uint64_t eeTimerClockHz(uint32_t mode) const noexcept;
+     uint64_t eeTimerInterruptDistance() const noexcept;
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 3f648d2..e270af3 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -31,7 +31,6 @@ namespace
+     constexpr uint32_t WEF_OR = 0x01u;
+     constexpr uint32_t WEF_CLEAR = 0x10u;
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+@@ -50,7 +49,28 @@ namespace
+         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
+     }
+ 
+-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
++    constexpr uint64_t hostDurationToEeCycles(std::chrono::steady_clock::duration duration)
++    {
++        const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
++        if (nanoseconds <= 0)
++            return 0u;
++        constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
++        const uint64_t value = static_cast<uint64_t>(nanoseconds);
++        return value / kNanosecondsPerSecond * EeScheduler::kEeClockHz +
++               value % kNanosecondsPerSecond * EeScheduler::kEeClockHz / kNanosecondsPerSecond;
++    }
++
++    // A field lasts 1/60 s in NTSC and 1/50 s in PAL.
++    std::chrono::microseconds vblankPeriod(const GSRegisters &regs)
++    {
++        return std::chrono::microseconds(gsPalTiming(regs) ? 20000 : 16667);
++    }
++
++    uint64_t vblankPeriodCycles(const GSRegisters &regs)
++    {
++        return microsecondsToEeCycles(static_cast<uint64_t>(vblankPeriod(regs).count()));
++    }
++
+     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
+     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+ 
+@@ -80,6 +100,7 @@ EeScheduler::EeScheduler(PS2Runtime &runtime)
+ EeScheduler::~EeScheduler()
+ {
+     requestStop();
++    m_runtime.memory().setEeTimerReadCallback({});
+ }
+ 
+ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+@@ -133,6 +154,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_gsVSyncCallbackSp = 0;
+     m_runtime.memory().gs().vsyncTick.store(0u, std::memory_order_release);
+     m_runtime.memory().resetEeTimers();
++    m_runtime.memory().setEeTimerReadCallback([this]() { catchUpWithHostTime(); });
++    m_vblankCycle = m_eeCycle;
++    m_vblankHostTime = std::chrono::steady_clock::now();
+ 
+     GuestThread main{};
+     main.id = kMainThreadId;
+@@ -147,8 +171,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
+-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
+-                  std::chrono::steady_clock::now() + kVBlankPeriod,
++    const GSRegisters &gs = m_runtime.memory().gs();
++    scheduleEvent(m_eeCycle + vblankPeriodCycles(gs),
++                  m_vblankHostTime + vblankPeriod(gs),
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -401,6 +426,30 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     }
+ }
+ 
++// The emulated EE clock falls behind a real one: generated code charges a few
++// cycles per call or loop, and the host may take longer than the EE would.
++// A guest polling a timer waits for real time to pass, so a timer read brings
++// the clock up to the host time since the last VBlank, though never past the
++// next scheduled event, which the next checkpoint then handles.
++void EeScheduler::catchUpWithHostTime() noexcept
++{
++    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
++    if (nextEventCycle == 0u || m_eeCycle >= nextEventCycle)
++        return;
++    const uint64_t hostCycle =
++        m_vblankCycle + hostDurationToEeCycles(std::chrono::steady_clock::now() - m_vblankHostTime);
++    uint64_t remaining = std::min(hostCycle, nextEventCycle);
++    if (remaining <= m_eeCycle)
++        return;
++    remaining -= m_eeCycle;
++    while (remaining > 0u)
++    {
++        const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
++        accountCycles(step);
++        remaining -= step;
++    }
++}
++
+ bool EeScheduler::isExecutingGuest() const noexcept
+ {
+     return m_guestExecuting.load(std::memory_order_acquire);
+@@ -1875,8 +1924,9 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                const GSRegisters &gs = m_runtime.memory().gs();
++                scheduleEvent(scheduled.deadlineCycle + vblankPeriodCycles(gs),
++                              scheduled.hostDeadline + vblankPeriod(gs),
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+@@ -1892,6 +1942,8 @@ void EeScheduler::processEvent(const EeEvent &event)
+         requestStop();
+         break;
+     case EeEventType::VBlankStart:
++        m_vblankCycle = m_eeCycle;
++        m_vblankHostTime = std::chrono::steady_clock::now();
+         ++m_vsyncTick;
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         if ((m_vsyncTick & 1u) != 0u)
+diff --git a/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp b/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
+index 790d4f8..3a5de79 100644
+--- a/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
+@@ -55,6 +55,11 @@ void gsSetCrt(GSRegisters &regs, uint32_t interlaced, uint32_t videoMode, uint32
+     regs.smode1 = (regs.smode1 & ~kSmode1Fields) | (lineClock << 3) | (colourMode << 13);
+ }
+ 
++bool gsPalTiming(const GSRegisters &regs)
++{
++    return ((regs.smode1 >> 13) & 0x3ull) == 3ull;
++}
++
+ void gsWriteFinish(GSRegisters &regs)
+ {
+     regs.csr.fetch_or(0x2u, std::memory_order_acq_rel);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index b5568a2..6379a73 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -165,8 +165,9 @@ namespace
+         147456000ull,
+         9216000ull,
+         576000ull,
+-        15734ull,
++        15734ull, // H-blank, NTSC; PAL in eeTimerClockHz
+     };
++    constexpr uint64_t kEeTimerHblankPalHz = 15625ull;
+ 
+     inline bool decodeEeTimerRegister(uint32_t address, size_t &timerIndex, uint32_t &offset)
+     {
+@@ -421,8 +422,9 @@ bool PS2Memory::initialize(size_t ramSize)
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
+-    // The BIOS leaves Timer 3 free-running (CUE, BUSCLK/256); some games busy-wait on its count.
+-    m_eeTimers[3].mode = kEeTimerModeCue | 2u;
++    // The BIOS keeps Timer 3 for its alarms, which count scan lines: it runs on
++    // H-blank (CUE, CLKS=3), and games busy-wait on its count in scan lines.
++    m_eeTimers[3].mode = kEeTimerModeCue | 3u;
+     m_eeTimerPendingCycles = 0u;
+     m_eeTimerSyncCycles = 0u;
+ }
+@@ -457,7 +459,7 @@ uint32_t PS2Memory::syncEeTimers() noexcept
+             continue;
+         }
+ 
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t clockHz = eeTimerClockHz(timer.mode);
+         const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+         const uint64_t remainingCycles = eeCycles % kEeClockHz;
+         const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+@@ -520,6 +522,14 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+     return distance > m_eeTimerPendingCycles ? distance - m_eeTimerPendingCycles : 1u;
+ }
+ 
++uint64_t PS2Memory::eeTimerClockHz(uint32_t mode) const noexcept
++{
++    const uint32_t clockSelect = mode & kEeTimerModeClksMask;
++    if (clockSelect == 3u && gsPalTiming(gs_regs))
++        return kEeTimerHblankPalHz;
++    return kEeTimerClockHz[clockSelect];
++}
++
+ // From the counters as of the last sync.
+ uint64_t PS2Memory::eeTimerInterruptDistance() const noexcept
+ {
+@@ -555,7 +565,7 @@ uint64_t PS2Memory::eeTimerInterruptDistance() const noexcept
+             continue;
+         }
+ 
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t clockHz = eeTimerClockHz(timer.mode);
+         const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+@@ -2346,6 +2356,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        if (timerOffset == kEeTimerCountOffset && m_eeTimerReadCallback)
++            m_eeTimerReadCallback();
+         syncEeTimers();
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index e4615fa..cf86ad7 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -310,6 +310,26 @@ void register_ps2_memory_tests()
+             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
+         });
+ 
++        tc.Run("EE Timer 3 counts H-blanks from reset, at the PAL rate once SMODE1 selects PAL", [](TestCase &t)
++        {
++            // The BIOS keeps Timer 3 for its alarms, in scan lines; games wait on it.
++            constexpr uint32_t kTimer3Count = 0x10001800u;
++            constexpr uint64_t kEeClockHz = 294912000ull;
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            t.Equals(mem.readIORegister(0x10001810u), 0x83u, "Timer 3 runs on H-blank after reset");
++
++            // 1000 lines: the NTSC and PAL rates (15734 and 15625 Hz) differ by 7 lines there.
++            mem.writeIORegister(kTimer3Count, 0u);
++            mem.advanceEeTimers((1000u * kEeClockHz + 15733u) / 15734u);
++            t.Equals(mem.readIORegister(kTimer3Count), 1000u, "NTSC: 15734 lines a second");
++
++            gsSetCrt(mem.gs(), 1u, 3u, 0u);
++            mem.writeIORegister(kTimer3Count, 0u);
++            mem.advanceEeTimers((1000u * kEeClockHz + 15624u) / 15625u);
++            t.Equals(mem.readIORegister(kTimer3Count), 1000u, "PAL: 15625 lines a second");
++        });
++
+         tc.Run("EE timers advanced a cycle at a time interrupt on the exact cycle", [](TestCase &t)
+         {
+             // The counters only catch up when an interrupt can be due or a register is
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 7a8ca8f..9b91c82 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -637,6 +637,36 @@ void register_ps2_runtime_interrupt_tests()
+             cleanupRuntime(env);
+         });
+ 
++        tc.Run("a timer read lets the EE clock catch up with host time up to the next VBlank", [](TestCase &t)
++        {
++            // Timer 3 counts scan lines. A first VBlank comes 1/60 s (262 lines) after the
++            // reset in NTSC and 1/50 s (312 lines) in PAL; a timer read never runs past it.
++            constexpr uint32_t kTimer3Count = 0x10001800u;
++            for (const bool pal : {false, true})
++            {
++                TestEnv env;
++                t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++                if (pal)
++                    gsSetCrt(env.runtime.memory().gs(), 1u, 3u, 0u);
++                R5900Context mainContext{};
++                env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++                const std::string mode = pal ? "PAL" : "NTSC";
++
++                t.IsTrue(env.runtime.memory().readIORegister(kTimer3Count) < 30u,
++                         mode + ": right after the reset little time has passed");
++                std::this_thread::sleep_for(std::chrono::milliseconds(5));
++                const uint32_t caughtUp = env.runtime.memory().readIORegister(kTimer3Count);
++                t.IsTrue(caughtUp >= 75u, mode + ": 5 ms of host time are at least 75 scan lines, got " +
++                                              std::to_string(caughtUp));
++                std::this_thread::sleep_for(std::chrono::milliseconds(40));
++                const uint32_t capped = env.runtime.memory().readIORegister(kTimer3Count);
++                const uint32_t field = pal ? 312u : 262u;
++                t.IsTrue(capped >= field - 1u && capped <= field + 1u,
++                         mode + ": the clock stops at the first VBlank, " + std::to_string(field) + " lines, got " +
++                             std::to_string(capped));
++            }
++        });
++
+         tc.Run("VBlank deadline resumes the waiter and publishes flag tick and FIELD atomically", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+

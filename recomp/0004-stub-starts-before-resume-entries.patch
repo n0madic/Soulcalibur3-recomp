@@ -1,0 +1,86 @@
+diff --git a/ps2xRecomp/src/lib/function_table_emitter.cpp b/ps2xRecomp/src/lib/function_table_emitter.cpp
+index b82b259..f512cb0 100644
+--- a/ps2xRecomp/src/lib/function_table_emitter.cpp
++++ b/ps2xRecomp/src/lib/function_table_emitter.cpp
+@@ -105,6 +105,22 @@ namespace ps2recomp
+             addEntry(address, name);
+         }
+ 
++        // Explicit function starts (stubs, syscalls, skipped library code) win over resume entries of an
++        // enclosing function: a Ghidra function whose body spans other functions would otherwise capture
++        // their start addresses and run the guest code instead of the stub.
++        for (const auto &[address, name] : stubFunctions)
++        {
++            addEntry(address, name);
++        }
++        for (const auto &[address, name] : systemCallFunctions)
++        {
++            addEntry(address, name);
++        }
++        for (const auto &[address, name] : libraryFunctions)
++        {
++            addEntry(address, name);
++        }
++
+         for (const auto &[ownerStart, targets] : cg.m_resumeEntryTargetsByOwner)
+         {
+             const std::string ownerName = cg.getFunctionName(ownerStart);
+@@ -119,19 +135,6 @@ namespace ps2recomp
+             }
+         }
+ 
+-        for (const auto &[address, name] : stubFunctions)
+-        {
+-            addEntry(address, name);
+-        }
+-        for (const auto &[address, name] : systemCallFunctions)
+-        {
+-            addEntry(address, name);
+-        }
+-        for (const auto &[address, name] : libraryFunctions)
+-        {
+-            addEntry(address, name);
+-        }
+-
+         std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
+                   { return a.first < b.first; });
+ 
+diff --git a/ps2xTest/src/code_generator_tests.cpp b/ps2xTest/src/code_generator_tests.cpp
+index 463b6cf..bf9bcfd 100644
+--- a/ps2xTest/src/code_generator_tests.cpp
++++ b/ps2xTest/src/code_generator_tests.cpp
+@@ -734,6 +734,34 @@ void register_code_generator_tests()
+                  "multiple resume pcs should register to the same owner wrapper");
+     });
+ 
++    tc.Run("stub start wins over resume entry of an enclosing function", [](TestCase &t) {
++        Function owner;
++        owner.name = "big_owner";
++        owner.start = 0x8000;
++        owner.end = 0x8100;
++        owner.isRecompiled = true;
++        owner.isStub = false;
++
++        Function stub;
++        stub.name = "calloc_r";
++        stub.start = 0x8010;
++        stub.end = 0x8020;
++        stub.isRecompiled = false;
++        stub.isStub = true;
++
++        CodeGenerator gen({}, {});
++        gen.setRenamedFunctions({{0x8000u, "big_owner_0x8000"}, {0x8010u, "calloc_r_0x8010"}});
++        gen.setResumeEntryTargets({{0x8000u, {0x8010u, 0x8014u}}});
++
++        std::string registration = gen.generateFunctionRegistration({owner, stub}, {});
++        printGeneratedCode("stub start wins over resume entry of an enclosing function", registration);
++
++        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[4] = calloc_r_0x8010; // 0x8010") != std::string::npos,
++                 "stub start must not be captured by the enclosing function's resume entry");
++        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable[5] = big_owner_0x8000; // 0x8014") != std::string::npos,
++                 "other resume entries still register to the owner");
++    });
++
+     tc.Run("configured internal guest handlers register to their owner wrapper", [](TestCase &t) {
+         Function owner;
+         owner.name = "sdk_bootstrap_owner";

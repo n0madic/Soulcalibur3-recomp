@@ -1,0 +1,222 @@
+From 15b48c8fd3751f77492e3578b75d85ed14e82f27 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Thu, 22 Oct 2026 16:43:21 +0300
+Subject: [PATCH] Record VU0 register jump targets while profiling
+
+noteJump takes the unit and keeps its seen targets per unit, so a first
+recording also finds where VU0 JR and JALR land.
+---
+ ps2xRuntime/src/lib/vu/ps2_vu1_detail.h    |  4 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp   |  6 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp | 37 ++++++----
+ ps2xTest/src/ps2_vu1_program_tests.cpp     | 86 ++++++++++++----------
+ 4 files changed, 74 insertions(+), 59 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index 757419e..97cda90 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -1,6 +1,8 @@
+ #ifndef PS2_VU1_DETAIL_H
+ #define PS2_VU1_DETAIL_H
+ 
++#include "runtime/ps2_vu1.h"
++
+ #include <cstdint>
+ 
+ class PS2Memory;
+@@ -18,7 +20,7 @@ namespace ps2_vu_program
+     // While a program profile is recorded, saves where a register jump lands:
+     // compiled routines end at register jumps, so a first recording would not
+     // otherwise see the target.
+-    void noteJump(PS2Memory *memory, uint32_t target);
++    void noteJump(VU1Interpreter::Unit unit, PS2Memory *memory, uint32_t target);
+ }
+ 
+ // Instruction field extraction helpers
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index ba44cfb..35c59f3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -293,8 +293,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+         uint8_t is = VIS(instr);
+         // Register jumps do not use conditional branches' delayed VI operand.
+         uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
+-        if (m_unit == Unit::VU1)
+-            ps2_vu_program::noteJump(memory, target);
++        ps2_vu_program::noteJump(m_unit, memory, target);
+         m_state.branchPending = true;
+         m_state.branchTarget = target;
+         m_state.branchDelay = 1;
+@@ -305,8 +304,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+         uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
+-        if (m_unit == Unit::VU1)
+-            ps2_vu_program::noteJump(memory, target);
++        ps2_vu_program::noteJump(m_unit, memory, target);
+         if (it != 0)
+             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+         m_state.branchPending = true;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+index 6dcbe1b..767bddc 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+@@ -135,27 +135,34 @@ void recordMissing(const uint8_t *code, uint32_t codeSize, uint32_t pc)
+     std::ofstream(root / "entries.txt", std::ios::app) << name << ' ' << std::hex << pc << '\n';
+ }
+ 
+-void noteJump(PS2Memory *memory, uint32_t target)
++void noteJump(Unit unit, PS2Memory *memory, uint32_t target)
+ {
+     if (!memory || profileDirectory().empty())
+         return;
+-    // Once per target and microcode generation, as recordMissing hashes the
+-    // whole image.
+-    thread_local uint64_t seenGeneration = ~0ull;
+-    thread_local std::bitset<PS2_VU1_CODE_SIZE / 8u> seen;
+-    const uint64_t generation = memory->getVU1CodeGeneration();
+-    if (generation != seenGeneration)
++    // Once per unit, target and microcode generation, as recordMissing hashes
++    // the whole image.
++    struct Seen
+     {
+-        seen.reset();
+-        seenGeneration = generation;
++        uint64_t generation = ~0ull;
++        std::bitset<PS2_VU1_CODE_SIZE / 8u> pairs;
++    };
++    thread_local std::array<Seen, 2> seenByUnit;
++    const bool vu0 = unit == Unit::VU0;
++    Seen &seen = seenByUnit[vu0 ? 0u : 1u];
++    const uint64_t generation = vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration();
++    if (generation != seen.generation)
++    {
++        seen.pairs.reset();
++        seen.generation = generation;
+     }
+-    const uint32_t pair = (target / 8u) % seen.size();
+-    if (seen.test(pair))
++    const uint32_t codeSize = vu0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
++    const uint32_t pair = (target % codeSize) / 8u;
++    if (seen.pairs.test(pair))
+         return;
+-    seen.set(pair);
+-    const uint8_t *code = memory->getVU1Code();
+-    if (!find(code, PS2_VU1_CODE_SIZE, target, generation))
+-        recordMissing(code, PS2_VU1_CODE_SIZE, target);
++    seen.pairs.set(pair);
++    const uint8_t *code = vu0 ? memory->getVU0Code() : memory->getVU1Code();
++    if (!find(code, codeSize, target, generation))
++        recordMissing(code, codeSize, target);
+ }
+ 
+ namespace
+diff --git a/ps2xTest/src/ps2_vu1_program_tests.cpp b/ps2xTest/src/ps2_vu1_program_tests.cpp
+index 926940d..86f53cc 100644
+--- a/ps2xTest/src/ps2_vu1_program_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_program_tests.cpp
+@@ -354,6 +354,49 @@ namespace
+                 return;
+         }
+     }
++
++    // The target comes from VU memory, so only running the code finds it.
++    void checkJumpRecording(TestCase &t, Unit unit)
++    {
++        constexpr uint32_t kLowerNop = 0x8000033Cu;
++        constexpr uint32_t kUpperNop = 0x000002FFu;
++        constexpr uint32_t kEBit = 0x40000000u;
++        std::vector<uint8_t> code(unit == Unit::VU0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE, 0u);
++        const auto pair = [&code](uint32_t pc, uint32_t lower, uint32_t upper)
++        {
++            std::memcpy(&code[pc], &lower, sizeof(lower));
++            std::memcpy(&code[pc + 4u], &upper, sizeof(upper));
++        };
++        for (uint32_t pc = 0u; pc < 0x210u; pc += 8u)
++            pair(pc, kLowerNop, kUpperNop);
++        pair(0x000u, 0x09010010u, kUpperNop); // ILW.x vi1, 0x10(vi0)
++        pair(0x028u, 0x48000800u, kUpperNop); // JR vi1
++        pair(0x200u, kLowerNop, kUpperNop | kEBit);
++        std::vector<uint8_t> data = initialData(unit);
++        const uint32_t target = 0x200u / 8u;
++        std::memcpy(&data[0x10u * 16u], &target, sizeof(target));
++
++        const std::filesystem::path directory =
++            std::filesystem::temp_directory_path() / "ps2x-vu-jump-recording";
++        std::filesystem::remove_all(directory);
++        ps2_vu_program::setProfileDirectory(directory.string());
++        Side side(unit);
++        t.IsTrue(side.initialize(code, true), "memory initializes");
++        side.reset(initialState(), data);
++        side.start(0u, kWideBudget);
++        ps2_vu_program::setProfileDirectory({});
++
++        std::ifstream entries(directory / "entries.txt");
++        std::string hash;
++        std::string pc;
++        bool recorded = false;
++        while (entries >> hash >> pc)
++            recorded = recorded || pc == "200";
++        t.IsTrue(recorded,
++                 std::string(unit == Unit::VU0 ? "VU0" : "VU1") + ": the jump target 0x200 is saved as an entry");
++        entries.close(); // Windows will not delete a file that is still open
++        std::filesystem::remove_all(directory);
++    }
+ }
+ 
+ void register_ps2_vu1_program_tests()
+@@ -372,46 +415,11 @@ void register_ps2_vu1_program_tests()
+                 checkEntry(t, entry, require);
+         });
+ 
+-        tc.Run("a recording notes where register jumps land", [](TestCase &t)
++        tc.Run("a recording notes where register jumps land, on both units", [](TestCase &t)
+         {
+-            // The target comes from VU memory, so only running the code finds it.
+-            constexpr uint32_t kLowerNop = 0x8000033Cu;
+-            constexpr uint32_t kUpperNop = 0x000002FFu;
+-            constexpr uint32_t kEBit = 0x40000000u;
+-            std::vector<uint8_t> code(PS2_VU1_CODE_SIZE, 0u);
+-            const auto pair = [&code](uint32_t pc, uint32_t lower, uint32_t upper)
+-            {
+-                std::memcpy(&code[pc], &lower, sizeof(lower));
+-                std::memcpy(&code[pc + 4u], &upper, sizeof(upper));
+-            };
+-            for (uint32_t pc = 0u; pc < 0x210u; pc += 8u)
+-                pair(pc, kLowerNop, kUpperNop);
+-            pair(0x000u, 0x09010010u, kUpperNop); // ILW.x vi1, 0x10(vi0)
+-            pair(0x028u, 0x48000800u, kUpperNop); // JR vi1
+-            pair(0x200u, kLowerNop, kUpperNop | kEBit);
+-            std::vector<uint8_t> data = initialData();
+-            const uint32_t target = 0x200u / 8u;
+-            std::memcpy(&data[0x10u * 16u], &target, sizeof(target));
+-
+-            const std::filesystem::path directory =
+-                std::filesystem::temp_directory_path() / "ps2x-vu-jump-recording";
+-            std::filesystem::remove_all(directory);
+-            ps2_vu_program::setProfileDirectory(directory.string());
+-            Side side;
+-            t.IsTrue(side.initialize(code, true), "memory initializes");
+-            side.reset(initialState(), data);
+-            side.start(0u, kWideBudget);
+-            ps2_vu_program::setProfileDirectory({});
+-
+-            std::ifstream entries(directory / "entries.txt");
+-            std::string hash;
+-            std::string pc;
+-            bool recorded = false;
+-            while (entries >> hash >> pc)
+-                recorded = recorded || pc == "200";
+-            t.IsTrue(recorded, "the jump target 0x200 is saved as an entry");
+-            entries.close(); // Windows will not delete a file that is still open
+-            std::filesystem::remove_all(directory);
++            for (const Unit unit : {Unit::VU1, Unit::VU0})
++                checkJumpRecording(t, unit);
+         });
+     });
+ }
++
+-- 
+2.54.0 (Apple Git-157)
+

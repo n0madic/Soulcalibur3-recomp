@@ -1,0 +1,1498 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..024ffcb 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_priv_registers.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+@@ -507,6 +508,23 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++
++# paraLLEl-GS (https://github.com/Arntzen-Software/parallel-gs, LGPL-3.0+): GS emulation in Vulkan
++# compute shaders, used as the default GS renderer when available. Point PS2X_PARALLEL_GS_DIR at a
++# checkout (with the Granite, volk and vulkan-headers submodules); without it only the CPU GS is built.
++set(PS2X_PARALLEL_GS_DIR "" CACHE PATH "paraLLEl-GS source checkout (empty: CPU GS only)")
++if(PS2X_PARALLEL_GS_DIR)
++    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
++    add_subdirectory(${PS2X_PARALLEL_GS_DIR} ${CMAKE_CURRENT_BINARY_DIR}/parallel-gs EXCLUDE_FROM_ALL)
++    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_parallel.cpp)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_PARALLEL_GS=1)
++    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
++    message(STATUS "GS renderer: paraLLEl-GS from ${PS2X_PARALLEL_GS_DIR}")
++else()
++    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_parallel_stub.cpp)
++    message(STATUS "GS renderer: CPU only (PS2X_PARALLEL_GS_DIR not set)")
++endif()
++
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 535150d..05e4c39 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -290,6 +290,7 @@ public:
+ 
+     bool initialize(const char *title = "PS2 Game");
+     bool syncCoreSubsystems();
++    bool selectGsRenderer();
+     bool loadELF(const std::string &elfPath);
+     void run();
+ 
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 4c3f641..98427cf 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -9,6 +9,9 @@
+ #include <vector>
+ 
+ #include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_parallel.h"
++
++#include <string>
+ 
+ struct GSDebugSnapshot
+ {
+@@ -106,7 +109,15 @@ public:
+     void reset();
+     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+ 
+-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
++    // Hands all GS emulation to paraLLEl-GS (GPU): GIF traffic goes to it unparsed, the CPU backend
++    // and the host copy of GS memory are no longer updated. Requires init() with privRegs first.
++    bool enableParallelRenderer(std::string &error);
++    bool usesParallelRenderer() const { return static_cast<bool>(m_parallel); }
++    // Display scanout for this vsync (GPU renderer only; the CPU path scans out on presentation).
++    void onVsync(uint32_t field);
++
++    // path is the GIF path the data arrived on (1: VU1 XGKICK, 2: VIF1 DIRECT, 3: GIF DMA).
++    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path = 3u);
+     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+     void uploadImageNative(uint64_t bitbltbuf,
+                            uint64_t trxpos,
+@@ -242,6 +253,7 @@ private:
+     bool m_debugHistoryPaused = true;
+ 
+     std::unique_ptr<GSRasterBackend> m_backend;
++    std::unique_ptr<GSParallelRenderer> m_parallel;
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+new file mode 100644
+index 0000000..bbd8e49
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++struct GSRegisters;
++
++// Privileged GS registers in the layout of paraLLEl-GS (and of GSdx dumps): register N of the
++// 0x12000000 block at qword 2*N of the first bank, CSR/IMR/BUSDIR/SIGLBLID at qwords 0/2/8/16 of the
++// second bank (0x12001000 block).
++static constexpr size_t kGsPrivStateQwords = 0x400u;
++void gsPackPrivRegisters(const GSRegisters &regs, uint64_t (&out)[kGsPrivStateQwords]);
++
++// The GIF packet a host->local image upload stands for: an A+D tag writing BITBLTBUF, TRXPOS, TRXREG
++// and TRXDIR, then an IMAGE tag carrying the pixels (rounded down to whole qwords).
++std::vector<uint64_t> gsBuildImageUploadPacket(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
++                                               const uint8_t *data, uint32_t sizeBytes);
++
++// GS emulated by paraLLEl-GS (Vulkan compute). It consumes raw GIF traffic and owns the GS local
++// memory; SIGNAL/FINISH/LABEL are reported back into the privileged registers passed to create().
++// Not thread safe: the GS frontend serialises every call.
++class GSParallelRenderer
++{
++public:
++    // Returns nullptr (and the reason in error) when the runtime was built without paraLLEl-GS or no
++    // suitable Vulkan device is available.
++    static std::unique_ptr<GSParallelRenderer> create(GSRegisters &privRegs, std::string &error);
++
++    virtual ~GSParallelRenderer() = default;
++
++    virtual void transfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes) = 0;
++    virtual void writeRegister(uint8_t regAddr, uint64_t value) = 0;
++    // Reads the data of a local->host transfer (TRXDIR=1); returns the bytes written (whole qwords).
++    virtual uint32_t readLocalToHost(uint8_t *dst, uint32_t maxBytes) = 0;
++
++    // Scans the display circuits out for this vsync and starts reading the picture back to the host.
++    virtual void vsync(uint32_t field) = 0;
++    // The most recent picture read back (RGBA8, tightly packed); false before the first one.
++    virtual bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
++    // Waits for all submitted GPU work, publishing the pending picture.
++    virtual void finish() = 0;
++};
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+index 2012083..c17aace 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
+@@ -23,7 +23,7 @@ struct GifArbiterPacket
+ class GifArbiter
+ {
+ public:
+-    using ProcessPacketFn = std::function<void(const uint8_t *, uint32_t)>;
++    using ProcessPacketFn = std::function<void(GifPathId, const uint8_t *, uint32_t)>;
+ 
+     GifArbiter() = default;
+     explicit GifArbiter(ProcessPacketFn processFn);
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 20f97a3..d6a6511 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -226,6 +226,12 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be
+ void gsWriteSignal(GSRegisters &regs, uint64_t value);
+ // Applies the oldest queued SIGNAL once the guest has acknowledged CSR.SIGNAL.
+ void gsApplyQueuedSignal(GSRegisters &regs);
++// The display mode as the BIOS SetGsCrt programs it: SMODE2 (INT, FFMD) and the SMODE1 line clock
++// and colour mode for videoMode (2 NTSC, 3 PAL, 0x1A-0x3B VESA, 0x50-0x53 HDTV).
++void gsSetCrt(GSRegisters &regs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode);
++// FINISH raises CSR.FINISH; LABEL merges its id into the upper SIGLBLID word under its mask.
++void gsWriteFinish(GSRegisters &regs);
++void gsWriteLabel(GSRegisters &regs, uint64_t value);
+ 
+ // PS2 VIF (VPU Interface) registers
+ struct VIFRegisters
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 46634e4..f9b637f 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1891,6 +1891,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+         {
+             m_runtime.memory().gs().csr.fetch_and(~0x2000ull, std::memory_order_acq_rel);
+         }
++        m_runtime.gs().onVsync(static_cast<uint32_t>(m_vsyncTick & 1u));
+         writeGuestU32(m_vsyncFlagAddress, 1u);
+         if (m_vsyncTickAddress != 0u)
+         {
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 9c54919..cc6c54f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -802,51 +802,17 @@ namespace ps2_stubs
+             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
+             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
+             writeGsGParamToScratch(runtime);
+-            uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
+-            uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
+-            uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
+-            uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
+-            uint64_t bgcolor = 0ULL;
+ 
++            // The privileged display registers are written by the EE (0x12000000), not through GIF
++            // packets: SetGsCrt programs the video mode, then default display settings follow.
+             if (runtime)
+             {
+-                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
+-                if (pktAddr != 0u)
+-                {
+-                    uint8_t *pkt = getMemPtr(rdram, pktAddr);
+-                    if (pkt)
+-                    {
+-                        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
+-                        q[0] = makeGiftagAplusD(7u);
+-                        q[1] = 0xEULL;
+-                        q[2] = pmode;
+-                        q[3] = 0x41ULL;
+-                        q[4] = smode2;
+-                        q[5] = 0x42ULL;
+-                        q[6] = dispfb;
+-                        q[7] = 0x59ULL;
+-                        q[8] = display;
+-                        q[9] = 0x5aULL;
+-                        q[10] = dispfb;
+-                        q[11] = 0x5bULL;
+-                        q[12] = display;
+-                        q[13] = 0x5cULL;
+-                        q[14] = bgcolor;
+-                        q[15] = 0x5fULL;
+-                        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+-                        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
+-                        auto &mem = runtime->memory();
+-                        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
+-                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+-                        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+-                        mem.processPendingTransfers();
+-                        runtime->guestFree(pktAddr);
+-                    }
+-                    else
+-                    {
+-                        runtime->guestFree(pktAddr);
+-                    }
+-                }
++                GSRegisters &regs = runtime->memory().gs();
++                gsSetCrt(regs, interlace, omode, ffmode);
++                regs.pmode = makePmode(1, 0, 0, 0, 0, 0x80);
++                regs.dispfb1 = regs.dispfb2 = makeDispFb(0, 10, 0, 0, 0);
++                regs.display1 = regs.display2 = makeDisplay(0, 0, 0, 0, 639, 447);
++                regs.bgcolor = 0u;
+             }
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index a9db7d4..ff97a75 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -6,17 +6,14 @@ namespace ps2_syscalls
+     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
+-        int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
++        int videoMode = getRegU32(ctx, 5);  // $a1 - 2=NTSC, 3=PAL, 0x1A-0x3B=VESA, 0x50-0x53=HDTV
+         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
+ 
+         if (runtime)
+         {
+             auto &gs = runtime->memory().gs();
+-            const uint64_t smode2 =
+-                (static_cast<uint64_t>(interlaced) & 0x1ull) |
+-                ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
+-
+-            gs.smode2 = smode2;
++            gsSetCrt(gs, static_cast<uint32_t>(interlaced), static_cast<uint32_t>(videoMode),
++                     static_cast<uint32_t>(frameMode));
+ 
+             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
+             if ((gs.pmode & 0x3ull) == 0ull)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 1d4ae16..2aa0c92 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -13,6 +13,7 @@
+ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
++    static constexpr uint32_t kHostFrameHeight = 512u;
+ 
+     GSPrimReg decodePrimRegister(uint64_t value)
+     {
+@@ -526,6 +527,32 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+ 
+ void GS::latchHostPresentationFrame()
+ {
++    if (m_parallel)
++    {
++        // The GPU renderer scans out at vsync; take the latest picture it read back, stored with the
++        // same row pitch as the CPU path's frames.
++        std::vector<uint8_t> rgba;
++        uint32_t width = 0u;
++        uint32_t height = 0u;
++        const bool hasFrame = m_parallel->copyLatestFrame(rgba, width, height);
++        const uint32_t keptWidth = std::min(width, kHostFrameWidth);
++        const uint32_t keptHeight = std::min(height, kHostFrameHeight);
++        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
++        m_hostPresentationFrame.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
++        for (uint32_t y = 0; hasFrame && y < keptHeight; ++y)
++        {
++            std::memcpy(m_hostPresentationFrame.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u,
++                        rgba.data() + static_cast<size_t>(y) * width * 4u,
++                        static_cast<size_t>(keptWidth) * 4u);
++        }
++        m_hostPresentationWidth = hasFrame ? keptWidth : 0u;
++        m_hostPresentationHeight = hasFrame ? keptHeight : 0u;
++        m_hostPresentationDisplayFbp = m_hostPresentationSourceFbp = 0u;
++        m_hostPresentationUsedPreferred = false;
++        m_hasHostPresentationFrame = hasFrame;
++        return;
++    }
++
+     GSPresentationRequest request{};
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+@@ -638,12 +665,17 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+     return true;
+ }
+ 
+-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
++void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
++    if (m_parallel)
++    {
++        m_parallel->transfer(path, data, sizeBytes);
++        return;
++    }
+     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+         return;
+ 
+@@ -744,6 +776,12 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+     if (!validatePackedGifPacket(data, sizeBytes))
+         return false;
++    if (m_parallel)
++    {
++        m_parallel->transfer(3u, data, sizeBytes);
++        ++m_nativePackedGIFPacketCount;
++        return true;
++    }
+ 
+     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
+                                                 {
+@@ -784,6 +822,16 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            uint32_t sizeBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++    {
++        if (!data || sizeBytes == 0u)
++            return;
++        const std::vector<uint64_t> packet = gsBuildImageUploadPacket(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
++        m_parallel->transfer(3u, reinterpret_cast<const uint8_t *>(packet.data()),
++                             static_cast<uint32_t>(packet.size() * sizeof(uint64_t)));
++        ++m_nativeImageUploadCount;
++        return;
++    }
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+ 
+@@ -1062,6 +1110,11 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++    {
++        m_parallel->writeRegister(regAddr, value);
++        return;
++    }
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+@@ -1475,19 +1528,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             m_backend->Sync(GSSyncReason::Finish);
+         }
+         if (m_privRegs)
+-            m_privRegs->csr.fetch_or(0x2);
++            gsWriteFinish(*m_privRegs);
+         break;
+     }
+     case GS_REG_LABEL:
+     {
+         if (m_privRegs)
+-        {
+-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
+-            uint32_t mask = static_cast<uint32_t>(value >> 32);
+-            uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
+-            hi = (hi & ~mask) | (id & mask);
+-            m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFF);
+-        }
++            gsWriteLabel(*m_privRegs, value);
+         break;
+     }
+     case 0x59:
+@@ -1607,24 +1654,92 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
+ }
+ 
+ 
++// The CPU backend clears the whole frame buffer of a context directly. The GPU renderer does not track
++// contexts on the host; the clear sprite the HLE callers also send through writeRegister() does the job.
+ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++        return false;
+     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
+ }
+ 
+ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++        return false;
+     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+ }
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++        return m_parallel->readLocalToHost(dst, maxBytes);
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+ 
++bool GS::enableParallelRenderer(std::string &error)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++        return true;
++    if (!m_privRegs)
++    {
++        error = "GS::init() with the privileged registers must run first";
++        return false;
++    }
++    m_parallel = GSParallelRenderer::create(*m_privRegs, error);
++    return static_cast<bool>(m_parallel);
++}
++
++void GS::onVsync(uint32_t field)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    if (m_parallel)
++        m_parallel->vsync(field);
++}
++
++void gsPackPrivRegisters(const GSRegisters &regs, uint64_t (&out)[kGsPrivStateQwords])
++{
++    std::memset(out, 0, sizeof(out));
++    const uint64_t displayRegs[] = {regs.pmode, regs.smode1, regs.smode2, regs.srfsh, regs.synch1,
++                                    regs.synch2, regs.syncv, regs.dispfb1, regs.display1, regs.dispfb2,
++                                    regs.display2, regs.extbuf, regs.extdata, regs.extwrite, regs.bgcolor};
++    for (size_t i = 0; i < sizeof(displayRegs) / sizeof(displayRegs[0]); ++i)
++        out[i * 2u] = displayRegs[i];
++    uint64_t *const control = out + kGsPrivStateQwords / 2u;
++    control[0] = regs.csr.load(std::memory_order_acquire);
++    control[2] = regs.imr;
++    control[8] = regs.busdir;
++    control[16] = regs.siglblid;
++}
++
++std::vector<uint64_t> gsBuildImageUploadPacket(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
++                                               const uint8_t *data, uint32_t sizeBytes)
++{
++    const uint32_t qwords = sizeBytes / 16u;
++    std::vector<uint64_t> packet;
++    packet.reserve(12u + static_cast<size_t>(qwords) * 2u);
++    packet.push_back(4ull | (1ull << 60));                       // PACKED, NLOOP=4, NREG=1
++    packet.push_back(0xEull);                                    // REGS = A+D
++    const uint64_t setup[4][2] = {{bitbltbuf, GS_REG_BITBLTBUF}, {trxpos, GS_REG_TRXPOS},
++                                  {trxreg, GS_REG_TRXREG}, {trxdir, GS_REG_TRXDIR}};
++    for (const auto &reg : setup)
++    {
++        packet.push_back(reg[0]);
++        packet.push_back(reg[1]);
++    }
++    packet.push_back(static_cast<uint64_t>(qwords) | (1ull << 15) | (2ull << 58)); // IMAGE, EOP
++    packet.push_back(0u);
++    const size_t header = packet.size();
++    packet.resize(header + static_cast<size_t>(qwords) * 2u);
++    if (qwords != 0u)
++        std::memcpy(packet.data() + header, data, static_cast<size_t>(qwords) * 16u);
++    return packet;
++}
++
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ {
+     if (!backend)
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+new file mode 100644
+index 0000000..edd6108
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+@@ -0,0 +1,270 @@
++#include "runtime/gs/gs_parallel.h"
++#include "runtime/ps2_memory.h"
++
++#include "context.hpp"
++#include "device.hpp"
++#include "gs_interface.hpp"
++#include "thread_id.hpp"
++
++#include <cstdlib>
++#include <cstring>
++#include <dlfcn.h>
++#include <mutex>
++
++namespace
++{
++    // The Vulkan loader is not on the default dyld path on macOS (Homebrew installs it under
++    // /opt/homebrew/lib), so look in the usual places; PS2_VULKAN_LIBRARY overrides the search.
++    PFN_vkGetInstanceProcAddr loadVulkan(std::string &error)
++    {
++        static void *module = nullptr;
++        if (!module)
++        {
++            std::vector<std::string> candidates;
++            if (const char *path = std::getenv("PS2_VULKAN_LIBRARY"); path && *path)
++                candidates.emplace_back(path);
++#if defined(__APPLE__)
++            candidates.insert(candidates.end(), {"libvulkan.1.dylib", "/opt/homebrew/lib/libvulkan.1.dylib",
++                                                 "/usr/local/lib/libvulkan.1.dylib", "libMoltenVK.dylib",
++                                                 "/opt/homebrew/lib/libMoltenVK.dylib",
++                                                 "/usr/local/lib/libMoltenVK.dylib"});
++#else
++            candidates.insert(candidates.end(), {"libvulkan.so.1", "libvulkan.so"});
++#endif
++            for (const std::string &candidate : candidates)
++            {
++                module = dlopen(candidate.c_str(), RTLD_LOCAL | RTLD_LAZY);
++                if (module)
++                    break;
++            }
++            if (!module)
++            {
++                error = "no Vulkan loader found (install molten-vk and vulkan-loader, or set PS2_VULKAN_LIBRARY)";
++                return nullptr;
++            }
++        }
++        auto addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(module, "vkGetInstanceProcAddr"));
++        if (!addr)
++            error = "the Vulkan library has no vkGetInstanceProcAddr";
++        return addr;
++    }
++
++    // SIGNAL, FINISH and LABEL as the GS reports them to the EE: through CSR and SIGLBLID, from which
++    // the runtime raises the GS interrupt.
++    class SignalSink final : public ParallelGS::SignalInterface
++    {
++    public:
++        explicit SignalSink(GSRegisters &regs) : m_regs(regs) {}
++
++        bool on_signal(uint64_t payload) override
++        {
++            gsWriteSignal(m_regs, payload);
++            return false;
++        }
++        bool on_finish(uint64_t) override
++        {
++            gsWriteFinish(m_regs);
++            return false;
++        }
++        bool on_label(uint64_t payload) override
++        {
++            gsWriteLabel(m_regs, payload);
++            return false;
++        }
++
++    private:
++        GSRegisters &m_regs;
++    };
++
++    // Granite keys per-thread command pools by a registered thread index. The GS frontend serialises
++    // all calls, which come from the game thread and (in tests) the main thread, so all share index 0.
++    void bindGraniteThread()
++    {
++        Util::register_thread_index(0);
++    }
++
++    class ParallelRenderer final : public GSParallelRenderer
++    {
++    public:
++        explicit ParallelRenderer(GSRegisters &privRegs) : m_privRegs(privRegs), m_signals(privRegs) {}
++
++        ~ParallelRenderer() override
++        {
++            bindGraniteThread();
++            if (m_ready)
++                m_device.wait_idle();
++        }
++
++        bool init(std::string &error)
++        {
++            bindGraniteThread();
++            PFN_vkGetInstanceProcAddr addr = loadVulkan(error);
++            if (!addr || !Vulkan::Context::init_loader(addr))
++            {
++                if (error.empty())
++                    error = "cannot initialise the Vulkan loader";
++                return false;
++            }
++            m_context.set_num_thread_indices(1);
++            if (!m_context.init_instance_and_device(nullptr, 0, nullptr, 0,
++                                                    Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
++                                                        Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
++                                                        Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
++            {
++                error = "cannot create a Vulkan device";
++                return false;
++            }
++            m_device.set_context(m_context);
++            m_device.init_frame_contexts(4);
++
++            ParallelGS::GSOptions options = {};
++            if (!m_gs.init(&m_device, options))
++            {
++                error = "the Vulkan device lacks features paraLLEl-GS needs";
++                return false;
++            }
++            m_gs.set_signal_interface(&m_signals);
++            m_ready = true;
++            return true;
++        }
++
++        void transfer(uint32_t path, const uint8_t *data, uint32_t sizeBytes) override
++        {
++            bindGraniteThread();
++            m_gs.gif_transfer(path, data, sizeBytes & ~15u);
++        }
++
++        void writeRegister(uint8_t regAddr, uint64_t value) override
++        {
++            bindGraniteThread();
++            m_gs.write_register(static_cast<ParallelGS::RegisterAddr>(regAddr), value);
++        }
++
++        uint32_t readLocalToHost(uint8_t *dst, uint32_t maxBytes) override
++        {
++            bindGraniteThread();
++            const uint32_t qwords = maxBytes / 16u;
++            m_gs.read_transfer_fifo(dst, qwords);
++            return qwords * 16u;
++        }
++
++        void vsync(uint32_t field) override
++        {
++            bindGraniteThread();
++            static_assert(sizeof(ParallelGS::PrivRegisterState) == kGsPrivStateQwords * sizeof(uint64_t),
++                          "paraLLEl-GS privileged register layout changed");
++            uint64_t priv[kGsPrivStateQwords];
++            gsPackPrivRegisters(m_privRegs, priv);
++            std::memcpy(&m_gs.get_priv_register_state(), priv, sizeof(priv));
++
++            ParallelGS::VSyncInfo info = {};
++            info.phase = field;
++            info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++            info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
++            info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
++            info.force_progressive = true;
++            info.anti_blur = true;
++            info.adapt_to_internal_horizontal_resolution = true;
++
++            m_gs.flush();
++            ParallelGS::ScanoutResult result = m_gs.vsync(info);
++
++            // The previous picture has had a whole vsync to finish; publish it before queueing this one.
++            publishPendingReadback();
++            if (result.image)
++                startReadback(*result.image);
++            m_device.next_frame_context();
++        }
++
++        bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) override
++        {
++            std::lock_guard<std::mutex> lock(m_frameMutex);
++            if (m_frame.empty())
++                return false;
++            rgba = m_frame;
++            width = m_frameWidth;
++            height = m_frameHeight;
++            return true;
++        }
++
++        void finish() override
++        {
++            bindGraniteThread();
++            m_gs.flush();
++            m_device.wait_idle();
++            publishPendingReadback();
++        }
++
++    private:
++        struct Readback
++        {
++            Vulkan::BufferHandle buffer;
++            Vulkan::Fence fence;
++            uint32_t width = 0;
++            uint32_t height = 0;
++        };
++
++        void startReadback(const Vulkan::Image &image)
++        {
++            Readback readback;
++            readback.width = image.get_width();
++            readback.height = image.get_height();
++
++            Vulkan::BufferCreateInfo info = {};
++            info.size = VkDeviceSize(readback.width) * readback.height * 4u;
++            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++            info.domain = Vulkan::BufferDomain::CachedHost;
++            readback.buffer = m_device.create_buffer(info);
++
++            auto cmd = m_device.request_command_buffer();
++            cmd->copy_image_to_buffer(*readback.buffer, image, 0, {}, {readback.width, readback.height, 1}, 0, 0,
++                                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++            cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                         VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++            m_device.submit(cmd, &readback.fence);
++            m_pending = std::move(readback);
++        }
++
++        void publishPendingReadback()
++        {
++            if (!m_pending.buffer)
++                return;
++            m_pending.fence->wait();
++            const size_t bytes = size_t(m_pending.width) * m_pending.height * 4u;
++            const auto *pixels = static_cast<const uint8_t *>(
++                m_device.map_host_buffer(*m_pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT));
++            {
++                std::lock_guard<std::mutex> lock(m_frameMutex);
++                m_frame.assign(pixels, pixels + bytes);
++                // The scanout carries the merge circuit's alpha; the host shows the picture opaque.
++                for (size_t i = 3; i < m_frame.size(); i += 4)
++                    m_frame[i] = 0xFF;
++                m_frameWidth = m_pending.width;
++                m_frameHeight = m_pending.height;
++            }
++            m_device.unmap_host_buffer(*m_pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
++            m_pending = {};
++        }
++
++        GSRegisters &m_privRegs;
++        SignalSink m_signals;
++        Vulkan::Context m_context;
++        Vulkan::Device m_device;
++        ParallelGS::GSInterface m_gs;
++        bool m_ready = false;
++
++        Readback m_pending;
++        std::mutex m_frameMutex;
++        std::vector<uint8_t> m_frame;
++        uint32_t m_frameWidth = 0;
++        uint32_t m_frameHeight = 0;
++    };
++}
++
++std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(GSRegisters &privRegs, std::string &error)
++{
++    auto renderer = std::make_unique<ParallelRenderer>(privRegs);
++    if (!renderer->init(error))
++        return nullptr;
++    return renderer;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
+new file mode 100644
+index 0000000..74a2e2e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
+@@ -0,0 +1,7 @@
++#include "runtime/gs/gs_parallel.h"
++
++std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(GSRegisters &, std::string &error)
++{
++    error = "the runtime was built without paraLLEl-GS (PS2X_PARALLEL_GS_DIR)";
++    return nullptr;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp b/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
+new file mode 100644
+index 0000000..790d4f8
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
+@@ -0,0 +1,80 @@
++#include "runtime/ps2_memory.h"
++#include "ps2_log.h"
++
++#include <cstring>
++
++namespace
++{
++    constexpr uint64_t kCsrSignal = 0x1u;
++
++    void applySignal(GSRegisters &regs, uint64_t value)
++    {
++        const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
++        const uint32_t mask = static_cast<uint32_t>(value >> 32);
++        uint32_t lo = static_cast<uint32_t>(regs.siglblid & 0xFFFFFFFFu);
++        lo = (lo & ~mask) | (id & mask);
++        regs.siglblid = (regs.siglblid & 0xFFFFFFFF00000000ull) | lo;
++        regs.csr.fetch_or(kCsrSignal);
++    }
++}
++
++void gsWriteSignal(GSRegisters &regs, uint64_t value)
++{
++    if ((regs.csr.load(std::memory_order_acquire) & kCsrSignal) == 0u)
++    {
++        applySignal(regs, value);
++        return;
++    }
++    if (regs.queuedSignalCount < GSRegisters::kMaxQueuedSignals)
++    {
++        regs.queuedSignals[regs.queuedSignalCount++] = value;
++        return;
++    }
++    RUNTIME_LOG("[gs:signal] queue full, dropping SIGNAL 0x" << std::hex << value << std::dec << std::endl);
++}
++
++void gsSetCrt(GSRegisters &regs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode)
++{
++    regs.smode2 = (static_cast<uint64_t>(interlaced) & 0x1ull) | ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
++
++    // SMODE1's line clock (LC) and colour mode (CMOD) tell the scanout which video format the
++    // display registers are in.
++    uint64_t lineClock = 32u; // NTSC/PAL analog
++    uint64_t colourMode = (videoMode == 3u) ? 3u : 2u;
++    if (videoMode >= 0x50u)
++    {
++        lineClock = 22u; // HDTV
++        colourMode = 0u;
++    }
++    else if (videoMode >= 0x1Au)
++    {
++        lineClock = 15u; // VESA
++        colourMode = 0u;
++    }
++    constexpr uint64_t kSmode1Fields = (0x7Full << 3) | (0x3ull << 13);
++    regs.smode1 = (regs.smode1 & ~kSmode1Fields) | (lineClock << 3) | (colourMode << 13);
++}
++
++void gsWriteFinish(GSRegisters &regs)
++{
++    regs.csr.fetch_or(0x2u, std::memory_order_acq_rel);
++}
++
++void gsWriteLabel(GSRegisters &regs, uint64_t value)
++{
++    const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
++    const uint32_t mask = static_cast<uint32_t>(value >> 32);
++    uint32_t hi = static_cast<uint32_t>(regs.siglblid >> 32);
++    hi = (hi & ~mask) | (id & mask);
++    regs.siglblid = (static_cast<uint64_t>(hi) << 32) | (regs.siglblid & 0xFFFFFFFFu);
++}
++
++void gsApplyQueuedSignal(GSRegisters &regs)
++{
++    if (regs.queuedSignalCount == 0u || (regs.csr.load(std::memory_order_acquire) & kCsrSignal) != 0u)
++        return;
++    const uint64_t value = regs.queuedSignals[0];
++    regs.queuedSignalCount--;
++    std::memmove(regs.queuedSignals, regs.queuedSignals + 1, regs.queuedSignalCount * sizeof(uint64_t));
++    applySignal(regs, value);
++}
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..6088598 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -56,7 +56,7 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
+-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
++            m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
+     m_queue.clear();
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 23b9b60..e4ff448 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1957,46 +1957,6 @@ bool PS2Memory::pollGsInterruptEdge()
+     return risingEdge;
+ }
+ 
+-namespace
+-{
+-    constexpr uint64_t kCsrSignal = 0x1u;
+-
+-    void applySignal(GSRegisters &regs, uint64_t value)
+-    {
+-        const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
+-        const uint32_t mask = static_cast<uint32_t>(value >> 32);
+-        uint32_t lo = static_cast<uint32_t>(regs.siglblid & 0xFFFFFFFFu);
+-        lo = (lo & ~mask) | (id & mask);
+-        regs.siglblid = (regs.siglblid & 0xFFFFFFFF00000000ull) | lo;
+-        regs.csr.fetch_or(kCsrSignal);
+-    }
+-}
+-
+-void gsWriteSignal(GSRegisters &regs, uint64_t value)
+-{
+-    if ((regs.csr.load(std::memory_order_acquire) & kCsrSignal) == 0u)
+-    {
+-        applySignal(regs, value);
+-        return;
+-    }
+-    if (regs.queuedSignalCount < GSRegisters::kMaxQueuedSignals)
+-    {
+-        regs.queuedSignals[regs.queuedSignalCount++] = value;
+-        return;
+-    }
+-    RUNTIME_LOG("[gs:signal] queue full, dropping SIGNAL 0x" << std::hex << value << std::dec << std::endl);
+-}
+-
+-void gsApplyQueuedSignal(GSRegisters &regs)
+-{
+-    if (regs.queuedSignalCount == 0u || (regs.csr.load(std::memory_order_acquire) & kCsrSignal) != 0u)
+-        return;
+-    const uint64_t value = regs.queuedSignals[0];
+-    regs.queuedSignalCount--;
+-    std::memmove(regs.queuedSignals, regs.queuedSignals + 1, regs.queuedSignalCount * sizeof(uint64_t));
+-    applySignal(regs, value);
+-}
+-
+ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ {
+     if (m_path3Masked || m_path3MaskedFifo.empty())
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index c1eb34f..0eecc84 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -15,6 +15,7 @@
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+ 
++#include <cstdlib>
+ #include <iostream>
+ #include <stdexcept>
+ #include <fstream>
+@@ -666,8 +667,8 @@ bool PS2Runtime::syncCoreSubsystems()
+     }
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+-                                    { m_gs.processGIFPacket(data, size); });
++    m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
++                                    { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
+     m_memory.setGifArbiter(&m_gifArbiter);
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+@@ -714,6 +715,39 @@ bool PS2Runtime::syncCoreSubsystems()
+     return true;
+ }
+ 
++// PS2_GS_BACKEND picks the GS renderer: "parallel" (paraLLEl-GS on Vulkan, the default) or "cpu".
++// When the default cannot start (no Vulkan, built without paraLLEl-GS) the CPU GS takes over; an
++// explicit "parallel" that cannot start is an error.
++bool PS2Runtime::selectGsRenderer()
++{
++    const char *choice = std::getenv("PS2_GS_BACKEND");
++    const std::string backend = choice ? choice : "";
++    if (backend == "cpu")
++    {
++        std::cout << "[gs] renderer: CPU (PS2_GS_BACKEND=cpu)" << std::endl;
++        return true;
++    }
++    if (!backend.empty() && backend != "parallel")
++    {
++        std::cerr << "[gs] unknown PS2_GS_BACKEND '" << backend << "' (expected parallel or cpu)" << std::endl;
++        return false;
++    }
++
++    std::string error;
++    if (m_gs.enableParallelRenderer(error))
++    {
++        std::cout << "[gs] renderer: paraLLEl-GS (Vulkan)" << std::endl;
++        return true;
++    }
++    if (backend == "parallel")
++    {
++        std::cerr << "[gs] paraLLEl-GS unavailable: " << error << std::endl;
++        return false;
++    }
++    std::cerr << "[gs] paraLLEl-GS unavailable (" << error << "), falling back to the CPU GS" << std::endl;
++    return true;
++}
++
+ bool PS2Runtime::initialize(const char *title)
+ {
+     try
+@@ -729,6 +763,8 @@ bool PS2Runtime::initialize(const char *title)
+             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
+             return false;
+         }
++        if (!selectGsRenderer())
++            return false;
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd75bba..87a59ac 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -922,7 +922,7 @@ void VU1Interpreter::finishXgkick()
+     if (m_activeMemory)
+         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+     else if (m_activeGs)
+-        m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
++        m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes, 1u);
+     m_xgkick.active = false;
+ }
+ 
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index dfc3794..27f3058 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -45,6 +45,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_vu0_ftoi_tests.cpp
+     src/ps2_qword_access_tests.cpp
+     src/ps2_fpu_order_tests.cpp
++    src/ps2_gs_parallel_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/gs_cache/CMakeLists.txt b/ps2xTest/gs_cache/CMakeLists.txt
+index 6b7210a..b3898ef 100644
+--- a/ps2xTest/gs_cache/CMakeLists.txt
++++ b/ps2xTest/gs_cache/CMakeLists.txt
+@@ -15,6 +15,8 @@ add_library(ps2_gs_cache_backend_under_test STATIC
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
+     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
++    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_priv_registers.cpp"
++    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_parallel_stub.cpp"
+ )
+ target_include_directories(ps2_gs_cache_backend_under_test PUBLIC "${PS2_GS_RUNTIME_DIR}/include")
+ target_compile_features(ps2_gs_cache_backend_under_test PUBLIC cxx_std_20)
+diff --git a/ps2xTest/src/gpu_gs_test_support.h b/ps2xTest/src/gpu_gs_test_support.h
+new file mode 100644
+index 0000000..ae295df
+--- /dev/null
++++ b/ps2xTest/src/gpu_gs_test_support.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "MiniTest.h"
++#include "runtime/gs/gs_frontend.h"
++
++#include <cstdlib>
++#include <iostream>
++#include <string>
++
++// Switches gs to the GPU renderer (paraLLEl-GS). Without a usable Vulkan device the test is skipped
++// with a note, unless PS2_TEST_REQUIRE_GPU=1 asks for it to fail instead.
++inline bool requireGpuGs(TestCase &t, GS &gs)
++{
++    std::string error;
++    if (gs.enableParallelRenderer(error))
++        return true;
++    const char *required = std::getenv("PS2_TEST_REQUIRE_GPU");
++    if (required && std::string(required) == "1")
++        t.Fail("GPU GS required (PS2_TEST_REQUIRE_GPU=1) but unavailable: " + error);
++    else
++        std::cout << "    skipped: GPU GS unavailable (" << error << ")" << std::endl;
++    return false;
++}
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 2b4ed08..4d3b6de 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -26,6 +26,7 @@ void register_ps2_vu0_fdiv_tests();
+ void register_ps2_vu0_ftoi_tests();
+ void register_ps2_qword_access_tests();
+ void register_ps2_fpu_order_tests();
++void register_ps2_gs_parallel_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -56,6 +57,7 @@ int main()
+     register_ps2_vu0_ftoi_tests();
+     register_ps2_qword_access_tests();
+     register_ps2_fpu_order_tests();
++    register_ps2_gs_parallel_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+new file mode 100644
+index 0000000..8473622
+--- /dev/null
++++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+@@ -0,0 +1,214 @@
++#include "MiniTest.h"
++#include "gpu_gs_test_support.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/gs_parallel.h"
++#include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_memory.h"
++
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <vector>
++
++// The GPU GS (paraLLEl-GS) path: the layout helpers it shares with the dump recorder, and the GS
++// behaviour the game depends on, checked on the GPU renderer (and on the CPU one where both apply).
++
++namespace
++{
++    constexpr uint8_t kRegPrim = 0x00;
++    constexpr uint8_t kRegRgbaq = 0x01;
++    constexpr uint8_t kRegXyz2 = 0x05;
++    constexpr uint8_t kRegXyoffset1 = 0x18;
++    constexpr uint8_t kRegScissor1 = 0x40;
++    constexpr uint8_t kRegTest1 = 0x47;
++    constexpr uint8_t kRegFrame1 = 0x4C;
++    constexpr uint8_t kRegZbuf1 = 0x4E;
++    constexpr uint8_t kRegBitbltbuf = 0x50;
++    constexpr uint8_t kRegTrxpos = 0x51;
++    constexpr uint8_t kRegTrxreg = 0x52;
++    constexpr uint8_t kRegTrxdir = 0x53;
++    constexpr uint8_t kRegSignal = 0x60;
++    constexpr uint8_t kRegFinish = 0x61;
++    constexpr uint8_t kRegLabel = 0x62;
++
++    // A GS with its own local memory and privileged registers, on the CPU or the GPU renderer.
++    struct GsFixture
++    {
++        std::vector<uint8_t> vram = std::vector<uint8_t>(PS2_GS_VRAM_SIZE, 0u);
++        std::unique_ptr<GSRegisters> regs = std::make_unique<GSRegisters>();
++        GS gs;
++
++        GsFixture() { gs.init(vram.data(), static_cast<uint32_t>(vram.size()), regs.get()); }
++    };
++
++    // One A+D GIF packet writing the given registers.
++    std::vector<uint64_t> adPacket(const std::vector<std::pair<uint8_t, uint64_t>> &writes)
++    {
++        std::vector<uint64_t> packet{static_cast<uint64_t>(writes.size()) | (1ull << 15) | (1ull << 60), 0xEull};
++        for (const auto &[reg, value] : writes)
++        {
++            packet.push_back(value);
++            packet.push_back(reg);
++        }
++        return packet;
++    }
++
++    void send(GS &gs, const std::vector<uint64_t> &packet)
++    {
++        gs.processGIFPacket(reinterpret_cast<const uint8_t *>(packet.data()),
++                            static_cast<uint32_t>(packet.size() * sizeof(uint64_t)));
++    }
++
++    void runSignalFinishLabel(TestCase &t, bool gpu)
++    {
++        GsFixture f;
++        if (gpu && !requireGpuGs(t, f.gs))
++            return;
++        send(f.gs, adPacket({{kRegSignal, (0xFFFFull << 32) | 0x2u},
++                             {kRegFinish, 0u},
++                             {kRegLabel, (0xFFFFull << 32) | 0x1234u}}));
++        const uint64_t csr = f.regs->csr.load();
++        t.Equals(csr & 0x1u, 0x1ull, "SIGNAL raises CSR.SIGNAL");
++        t.Equals(csr & 0x2u, 0x2ull, "FINISH raises CSR.FINISH");
++        t.Equals(f.regs->siglblid & 0xFFFFFFFFull, 0x2ull, "SIGNAL sets the SIGLBLID signal id");
++        t.Equals(f.regs->siglblid >> 32, 0x1234ull, "LABEL sets the SIGLBLID label id");
++    }
++
++    void runLocalToHost(TestCase &t, bool gpu)
++    {
++        GsFixture f;
++        if (gpu && !requireGpuGs(t, f.gs))
++            return;
++
++        // 8x8 PSMCT32 block at block address 0x1000 (1 MiB), buffer width 64 pixels.
++        std::vector<uint8_t> pixels(8u * 8u * 4u);
++        for (size_t i = 0; i < pixels.size(); ++i)
++            pixels[i] = static_cast<uint8_t>(i * 7u + 3u);
++        const uint64_t trxreg = 8ull | (8ull << 32);
++        f.gs.uploadImageNative((0x1000ull << 32) | (1ull << 48), 0u, trxreg, 0u, pixels.data(),
++                               static_cast<uint32_t>(pixels.size()));
++
++        f.gs.writeRegister(kRegBitbltbuf, 0x1000ull | (1ull << 16));
++        f.gs.writeRegister(kRegTrxpos, 0u);
++        f.gs.writeRegister(kRegTrxreg, trxreg);
++        f.gs.writeRegister(kRegTrxdir, 1u);
++        std::vector<uint8_t> readBack(pixels.size(), 0u);
++        const uint32_t bytes = f.gs.consumeLocalToHostBytes(readBack.data(), static_cast<uint32_t>(readBack.size()));
++        t.Equals(bytes, static_cast<uint32_t>(pixels.size()), "the whole rectangle is read back");
++        t.IsTrue(readBack == pixels, "local->host returns what host->local wrote");
++    }
++}
++
++void register_ps2_gs_parallel_tests()
++{
++    MiniTest::Case("PS2GsParallel", [](TestCase &tc)
++    {
++        tc.Run("privileged registers are packed in the paraLLEl-GS layout", [](TestCase &t)
++        {
++            auto regs = std::make_unique<GSRegisters>();
++            regs->pmode = 0x11u;
++            regs->smode1 = 0x22u;
++            regs->dispfb1 = 0x33u;
++            regs->display2 = 0x44u;
++            regs->bgcolor = 0x55u;
++            regs->csr.store(0x66u);
++            regs->imr = 0x77u;
++            regs->busdir = 0x88u;
++            regs->siglblid = 0x99u;
++            uint64_t packed[kGsPrivStateQwords];
++            std::memset(packed, 0xCD, sizeof(packed));
++            gsPackPrivRegisters(*regs, packed);
++
++            t.Equals(packed[0x00], 0x11ull, "PMODE is at 0x12000000");
++            t.Equals(packed[0x02], 0x22ull, "SMODE1 is at 0x12000010");
++            t.Equals(packed[0x0E], 0x33ull, "DISPFB1 is at 0x12000070");
++            t.Equals(packed[0x14], 0x44ull, "DISPLAY2 is at 0x120000A0");
++            t.Equals(packed[0x1C], 0x55ull, "BGCOLOR is at 0x120000E0");
++            t.Equals(packed[0x200], 0x66ull, "CSR is at 0x12001000");
++            t.Equals(packed[0x202], 0x77ull, "IMR is at 0x12001010");
++            t.Equals(packed[0x208], 0x88ull, "BUSDIR is at 0x12001040");
++            t.Equals(packed[0x210], 0x99ull, "SIGLBLID is at 0x12001080");
++            t.Equals(packed[0x01], 0ull, "the upper half of each 128-bit register is zero");
++        });
++
++        tc.Run("an image upload is rebuilt as its GIF packet", [](TestCase &t)
++        {
++            uint8_t pixels[40];
++            for (uint8_t i = 0; i < sizeof(pixels); ++i)
++                pixels[i] = i;
++            const std::vector<uint64_t> packet = gsBuildImageUploadPacket(0xB1u, 0xB2u, 0xB3u, 0xB4u, pixels, sizeof(pixels));
++
++            t.Equals(packet.size(), static_cast<size_t>(12u + 4u), "A+D tag, 4 registers, IMAGE tag, 2 whole qwords");
++            t.Equals(packet[0], 4ull | (1ull << 60), "PACKED tag with NLOOP=4, NREG=1");
++            t.Equals(packet[1], 0xEull, "the register is A+D");
++            t.Equals(packet[2], 0xB1ull, "BITBLTBUF value");
++            t.Equals(packet[3], 0x50ull, "BITBLTBUF address");
++            t.Equals(packet[9], 0x53ull, "TRXDIR address comes last");
++            t.Equals(packet[10], 2ull | (1ull << 15) | (2ull << 58), "IMAGE tag with EOP and NLOOP=2");
++            t.IsTrue(std::memcmp(packet.data() + 12, pixels, 32) == 0, "the pixel qwords follow the IMAGE tag");
++        });
++
++        tc.Run("the GIF arbiter reports the path each packet came on", [](TestCase &t)
++        {
++            std::vector<GifPathId> paths;
++            GifArbiter arbiter([&](GifPathId path, const uint8_t *, uint32_t) { paths.push_back(path); });
++            const uint64_t packet[2] = {1ull << 15, 0u};
++            arbiter.submit(GifPathId::Path3, reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
++            arbiter.submit(GifPathId::Path1, reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
++            arbiter.drain();
++            const std::vector<GifPathId> expected{GifPathId::Path1, GifPathId::Path3};
++            t.IsTrue(paths == expected, "packets are delivered by path priority, each with its path");
++        });
++
++        tc.Run("SIGNAL, FINISH and LABEL reach CSR and SIGLBLID (CPU GS)", [](TestCase &t)
++               { runSignalFinishLabel(t, false); });
++        tc.Run("SIGNAL, FINISH and LABEL reach CSR and SIGLBLID (GPU GS)", [](TestCase &t)
++               { runSignalFinishLabel(t, true); });
++
++        tc.Run("local->host transfer reads back uploaded pixels (CPU GS)", [](TestCase &t)
++               { runLocalToHost(t, false); });
++        tc.Run("local->host transfer reads back uploaded pixels (GPU GS)", [](TestCase &t)
++               { runLocalToHost(t, true); });
++
++        tc.Run("a sprite drawn into the display buffer is presented (GPU GS)", [](TestCase &t)
++        {
++            GsFixture f;
++            if (!requireGpuGs(t, f.gs))
++                return;
++
++            // PAL display of a 512x512 PSMCT32 buffer at page 0, as Soulcalibur III sets it up.
++            f.regs->pmode = 0x1u | (1u << 2) | (1u << 5) | (0xFFu << 8); // EN1, CRTMD=1, MMOD, ALP=0xFF
++            f.regs->smode1 = (32ull << 3) | (3ull << 13);                 // LC=32, CMOD=PAL
++            f.regs->smode2 = 0x1u;
++            f.regs->dispfb1 = 8ull << 9;                                  // FBW=8 (512 pixels)
++            f.regs->display1 = 0x1FE9FF0204B296ull;
++
++            send(f.gs, adPacket({{kRegFrame1, 8ull << 16},
++                                 {kRegZbuf1, 0x100ull | (1ull << 32)},
++                                 {kRegTest1, (1ull << 16) | (1ull << 17)},
++                                 {kRegXyoffset1, 0u},
++                                 {kRegScissor1, (511ull << 16) | (511ull << 48)},
++                                 {kRegPrim, 6u},
++                                 {kRegRgbaq, 0x20u | (0xC0u << 8) | (0x40u << 16) | (0x80ull << 24)},
++                                 {kRegXyz2, 0u},
++                                 {kRegXyz2, (512ull << 4) | ((512ull << 4) << 16)}}));
++            // The picture of a vsync is read back asynchronously and published on the next one.
++            f.gs.onVsync(0u);
++            f.gs.onVsync(1u);
++            f.gs.latchHostPresentationFrame();
++
++            std::vector<uint8_t> frame;
++            uint32_t width = 0;
++            uint32_t height = 0;
++            t.IsTrue(f.gs.copyLatchedHostPresentationFrame(frame, width, height), "a frame is presented");
++            t.IsTrue(width >= 256u && height >= 256u, "the frame has the display's size");
++            if (width == 0u || height == 0u)
++                return;
++            const uint8_t *pixel = frame.data() + (static_cast<size_t>(height / 2u) * width + width / 2u) * 4u;
++            t.Equals(static_cast<uint32_t>(pixel[0]), 0x20u, "red of the sprite");
++            t.Equals(static_cast<uint32_t>(pixel[1]), 0xC0u, "green of the sprite");
++            t.Equals(static_cast<uint32_t>(pixel[2]), 0x40u, "blue of the sprite");
++        });
++    });
++}
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 83d91bf..373577c 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -603,6 +603,39 @@ void register_ps2_gs_tests()
+                      "GsSetCrt should return success");
+         });
+ 
++        tc.Run("GsSetCrt programs SMODE1 for the requested video mode", [](TestCase &t)
++        {
++            // SMODE1.LC (bits 3-9) and SMODE1.CMOD (bits 13-14) tell the scanout which video format
++            // the display registers describe; the BIOS sets them in SetGsCrt.
++            auto smode1For = [](uint32_t mode)
++            {
++                PS2Runtime runtime;
++                runtime.memory().initialize();
++                std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
++                R5900Context ctx{};
++                setRegU32(ctx, 4, 1u);
++                setRegU32(ctx, 5, mode);
++                setRegU32(ctx, 6, 1u);
++                GsSetCrt(rdram.data(), &ctx, &runtime);
++                return runtime.memory().gs().smode1;
++            };
++            auto lc = [](uint64_t smode1) { return static_cast<uint32_t>((smode1 >> 3) & 0x7Fu); };
++            auto cmod = [](uint64_t smode1) { return static_cast<uint32_t>((smode1 >> 13) & 0x3u); };
++
++            const uint64_t pal = smode1For(3u);
++            t.Equals(lc(pal), 32u, "PAL uses the analog line clock");
++            t.Equals(cmod(pal), 3u, "PAL selects CMOD=PAL");
++            const uint64_t ntsc = smode1For(2u);
++            t.Equals(lc(ntsc), 32u, "NTSC uses the analog line clock");
++            t.Equals(cmod(ntsc), 2u, "NTSC selects CMOD=NTSC");
++            const uint64_t vesa = smode1For(0x1Au);
++            t.Equals(lc(vesa), 15u, "VESA 640x480 uses the VGA line clock");
++            t.Equals(cmod(vesa), 0u, "VESA is progressive");
++            const uint64_t hdtv = smode1For(0x50u);
++            t.Equals(lc(hdtv), 22u, "HDTV uses the HDTV line clock");
++            t.Equals(cmod(hdtv), 0u, "HDTV is progressive");
++        });
++
+         tc.Run("sceGsSetDefDBuffDc seeds display envs and swap applies the selected page", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+@@ -4212,23 +4245,36 @@ void register_ps2_gs_tests()
+                       "TRXDIR payload must encode dir=0 (host-to-local)");
+         });
+ 
+-        tc.Run("sceGsResetGraph frees its temporary GIF packet", [](TestCase &t)
++        tc.Run("sceGsResetGraph programs the display registers directly", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+ 
+             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+             R5900Context ctx{};
+-            setRegU32(ctx, 4, 0u);
+-            setRegU32(ctx, 5, 1u);
+-            setRegU32(ctx, 6, 2u);
+-            setRegU32(ctx, 7, 1u);
++            setRegU32(ctx, 4, 0u); // reset
++            setRegU32(ctx, 5, 1u); // interlaced
++            setRegU32(ctx, 6, 3u); // PAL
++            setRegU32(ctx, 7, 1u); // frame mode
++            const GSContext scissorBefore = runtime.gs().getDebugSnapshot().ctx[1];
+             ps2_stubs::sceGsResetGraph(rdram.data(), &ctx, &runtime);
+ 
+             t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
+                      "sceGsResetGraph should succeed in reset mode");
+-            expectGuestHeapReusable(t, runtime,
+-                                    "sceGsResetGraph should free its temporary GIF packet");
++            const GSRegisters &gs = runtime.memory().gs();
++            t.Equals(gs.pmode & 0x1ull, 0x1ull, "read circuit 1 is enabled");
++            t.Equals(gs.smode2, 0x3ull, "SMODE2 holds INT and FFMD");
++            t.Equals(static_cast<uint32_t>((gs.smode1 >> 13) & 0x3u), 3u, "SMODE1 selects PAL like SetGsCrt");
++            t.Equals(static_cast<uint32_t>((gs.smode1 >> 3) & 0x7Fu), 32u, "SMODE1 uses the analog line clock");
++            t.Equals(static_cast<uint32_t>((gs.dispfb1 >> 9) & 0x3Fu), 10u, "DISPFB1 is a 640 pixel wide buffer");
++            t.Equals(gs.dispfb2, gs.dispfb1, "both read circuits read the same buffer");
++            t.Equals(gs.display2, gs.display1, "both read circuits show the same area");
++            // The display registers are not GIF-addressable: nothing may land in SCISSOR_2 (0x41) or
++            // ALPHA_1 (0x42), which share the A+D addresses a fake register packet would use.
++            const GSContext ctxAfter = runtime.gs().getDebugSnapshot().ctx[1];
++            t.IsTrue(std::memcmp(&ctxAfter.scissor, &scissorBefore.scissor, sizeof(ctxAfter.scissor)) == 0,
++                     "SCISSOR_2 is left alone");
++            expectGuestHeapReusable(t, runtime, "sceGsResetGraph should not leak guest memory");
+         });
+ 
+         tc.Run("sceGsSyncV resumes through the scheduler with deterministic field parity", [](TestCase &t)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 2f62b24..6d8baaa 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -959,7 +959,7 @@ void register_ps2_memory_tests()
+         tc.Run("GIF arbiter prioritizes PATH1 then PATH2 then PATH3", [](TestCase &t)
+         {
+             std::vector<uint8_t> order;
+-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
+             {
+                 if (data && sizeBytes > 0u)
+                     order.push_back(data[0]);
+@@ -986,7 +986,7 @@ void register_ps2_memory_tests()
+             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+ 
+             std::vector<uint8_t> firstBytes;
+-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
+             {
+                 if (data && sizeBytes > 0u)
+                     firstBytes.push_back(data[0]);
+@@ -2159,7 +2159,7 @@ void register_ps2_memory_tests()
+ 
+             GS gs;
+             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
+             {
+                 gs.processGIFPacket(data, sizeBytes);
+             });
+@@ -2227,7 +2227,7 @@ void register_ps2_memory_tests()
+ 
+             GS gs;
+             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
+             {
+                 gs.processGIFPacket(data, sizeBytes);
+             });
+@@ -2280,7 +2280,7 @@ void register_ps2_memory_tests()
+ 
+             GS gs;
+             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
+             {
+                 gs.processGIFPacket(data, sizeBytes);
+             });
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 4634aaa..7a8ca8f 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -1,4 +1,5 @@
+ #include "MiniTest.h"
++#include "gpu_gs_test_support.h"
+ #include "ps2_runtime.h"
+ #include "ps2_syscalls.h"
+ #include "runtime/ee_scheduler.h"
+@@ -760,11 +761,15 @@ void register_ps2_runtime_interrupt_tests()
+             t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
+         });
+ 
+-        tc.Run("GS SIGNAL from a GIF DMA dispatches the INTC GS handler", [](TestCase &t)
++        // The GS interrupt path must work with both GS renderers: SIGNAL is parsed by the CPU GS
++        // frontend in one case and reported back by paraLLEl-GS in the other.
++        auto runGsSignalInterrupt = [](TestCase &t, bool gpu)
+         {
+             TestEnv env;
+             t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
+             t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
++            if (gpu && !requireGpuGs(t, env.runtime.gs()))
++                return;
+             env.runtime.registerFunction(kGsSignalKickPc, schedulerGsSignalKick);
+             env.runtime.registerFunction(kGsSignalResumePc, schedulerGsSignalResume);
+             env.runtime.registerFunction(kGsSignalHandlerPc, schedulerGsSignalHandler);
+@@ -785,7 +790,11 @@ void register_ps2_runtime_interrupt_tests()
+                      "the GS handler should receive its registered argument");
+             t.Equals(g_gsHandlerSiglblid & 0xFFFFFFFFull, 0x2ull,
+                      "the GS handler should observe the SIGNAL id in SIGLBLID");
+-        });
++        };
++        tc.Run("GS SIGNAL from a GIF DMA dispatches the INTC GS handler", [&](TestCase &t)
++               { runGsSignalInterrupt(t, false); });
++        tc.Run("GS SIGNAL from a GIF DMA dispatches the INTC GS handler with the GPU GS", [&](TestCase &t)
++               { runGsSignalInterrupt(t, true); });
+ 
+         tc.Run("INTC cause raised while disabled is delivered once on enable", [](TestCase &t)
+         {
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 0754b69..427b05c 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1379,7 +1379,7 @@ void register_ps2_vu1_tests()
+ 
+             GS gs;
+             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes)
+             {
+                 gs.processGIFPacket(data, sizeBytes);
+             });

@@ -1,0 +1,183 @@
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..05e42aa 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -626,6 +626,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+                     };
+ 
++                    // V3 reads a fourth element: W takes the next element of the stream (zero past
++                    // the end of the packet). V2 is expanded to x,y,x,y below.
++                    uint32_t fieldsFromStream = static_cast<uint32_t>(components);
++                    if (decoded && components == 3)
++                    {
++                        const uint32_t elementBytes = bytesPerVector / 3u;
++                        const size_t nextElement = static_cast<size_t>(srcVec - data) + bytesPerVector;
++                        if (nextElement + elementBytes <= sizeBytes)
++                            fieldsFromStream = 4u;
++                        else
++                            decompressed[3] = 0u;
++                    }
++
+                     bool handledFormat = true;
+                     if (!decoded)
+                     {
+@@ -644,8 +657,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         }
+                         else
+                         {
+-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+-                            for (uint32_t c = 0; c < limit; ++c)
++                            for (uint32_t c = 0; c < fieldsFromStream; ++c)
+                             {
+                                 uint32_t scalar = 0;
+                                 std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
+@@ -667,8 +679,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         }
+                         else
+                         {
+-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+-                            for (uint32_t c = 0; c < limit; ++c)
++                            for (uint32_t c = 0; c < fieldsFromStream; ++c)
+                             {
+                                 uint16_t raw = 0;
+                                 std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+@@ -688,8 +699,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                         }
+                         else
+                         {
+-                            const uint32_t limit = (components > 4) ? 4u : static_cast<uint32_t>(components);
+-                            for (uint32_t c = 0; c < limit; ++c)
++                            for (uint32_t c = 0; c < fieldsFromStream; ++c)
+                             {
+                                 decompressed[c] = extend8(srcVec[c]);
+                             }
+@@ -697,19 +707,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     }
+                     else if (vl == 3u && vn == 3u)
+                     {
+-                        // V4-5: packed color-like format in a single 16-bit value.
++                        // V4-5: RGBA5551 expanded to 8 bits per channel.
+                         uint16_t packed = 0;
+                         std::memcpy(&packed, srcVec, sizeof(packed));
+-                        decompressed[0] = packed & 0x1Fu;
+-                        decompressed[1] = (packed >> 5) & 0x1Fu;
+-                        decompressed[2] = (packed >> 10) & 0x1Fu;
+-                        decompressed[3] = (packed >> 15) & 0x01u;
++                        decompressed[0] = (packed & 0x001Fu) << 3;
++                        decompressed[1] = (packed & 0x03E0u) >> 2;
++                        decompressed[2] = (packed & 0x7C00u) >> 7;
++                        decompressed[3] = (packed & 0x8000u) >> 8;
+                     }
+                     else
+                     {
+                         handledFormat = false;
+                     }
+ 
++                    if (handledFormat && components == 2)
++                    {
++                        decompressed[2] = decompressed[0];
++                        decompressed[3] = decompressed[1];
++                    }
++
+                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
+                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
+                     {
+@@ -748,6 +764,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                                     if (mode == 2u)
+                                         vif1_regs.row[field] = writeVal;
+                                 }
++                                else if (mode == 3u)
++                                {
++                                    vif1_regs.row[field] = writeVal;
++                                }
+                             }
+                         }
+                         else if (maskSpec == 1u)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 6d8baaa..fc769d0 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -711,6 +711,82 @@ void register_ps2_memory_tests()
+             t.Equals(mem.vif1_regs.row[3], 103u, "difference mode should update row register for W");
+         });
+ 
++        tc.Run("VIF UNPACK V2 V3 and V4-5 write every field as the hardware does", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            std::memset(mem.getVU1Data(), 0xEE, PS2_VU1_DATA_SIZE);
++
++            auto qword = [&](uint32_t addr, uint32_t field)
++            {
++                uint32_t v = 0;
++                std::memcpy(&v, mem.getVU1Data() + addr * 16u + field * 4u, 4u);
++                return v;
++            };
++
++            std::vector<uint8_t> packet;
++            appendU32(packet, makeVifCmd(0x64u, 1u, 0u)); // UNPACK V2-32 -> addr 0
++            appendU32(packet, 1u);
++            appendU32(packet, 2u);
++
++            appendU32(packet, makeVifCmd(0x68u, 2u, 1u)); // UNPACK V3-32 -> addr 1 and 2
++            appendU32(packet, 10u);
++            appendU32(packet, 11u);
++            appendU32(packet, 12u);
++            appendU32(packet, 20u);
++            appendU32(packet, 21u);
++            appendU32(packet, 22u);
++
++            appendU32(packet, makeVifCmd(0x69u, 2u, 3u)); // UNPACK V3-16 -> addr 3 and 4
++            appendU32(packet, 0x00020001u);
++            appendU32(packet, 0xFFFC0003u);
++            appendU32(packet, 0x00060005u);
++
++            appendU32(packet, makeVifCmd(0x6Fu, 2u, 5u)); // UNPACK V4-5 -> addr 5 and 6
++            appendU32(packet, 0x0421FFFFu);
++
++            appendU32(packet, makeVifCmd(0x30u, 0u, 0u)); // STROW
++            appendU32(packet, 100u);
++            appendU32(packet, 200u);
++            appendU32(packet, 300u);
++            appendU32(packet, 400u);
++            appendU32(packet, makeVifCmd(0x05u, 0u, 1u)); // STMOD offset
++            appendU32(packet, makeVifCmd(0x64u, 1u, 7u)); // UNPACK V2-32 -> addr 7
++            appendU32(packet, 1u);
++            appendU32(packet, 2u);
++
++            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
++
++            t.Equals(qword(0, 0), 1u, "V2 X");
++            t.Equals(qword(0, 1), 2u, "V2 Y");
++            t.Equals(qword(0, 2), 1u, "V2 Z repeats X");
++            t.Equals(qword(0, 3), 2u, "V2 W repeats Y");
++
++            t.Equals(qword(1, 0), 10u, "V3 X");
++            t.Equals(qword(1, 2), 12u, "V3 Z");
++            t.Equals(qword(1, 3), 20u, "V3 W takes the next element of the stream");
++            t.Equals(qword(2, 0), 20u, "second V3 vector starts at the next element");
++            t.Equals(qword(2, 2), 22u, "second V3 Z");
++
++            t.Equals(qword(3, 0), 1u, "V3-16 X");
++            t.Equals(qword(3, 2), 3u, "V3-16 Z");
++            t.Equals(qword(3, 3), 0xFFFFFFFCu, "V3-16 W takes the next sign-extended element");
++            t.Equals(qword(4, 0), 0xFFFFFFFCu, "second V3-16 X");
++            t.Equals(qword(4, 2), 6u, "second V3-16 Z");
++
++            t.Equals(qword(5, 0), 0xF8u, "V4-5 R is scaled to 8 bits");
++            t.Equals(qword(5, 1), 0xF8u, "V4-5 G is scaled to 8 bits");
++            t.Equals(qword(5, 2), 0xF8u, "V4-5 B is scaled to 8 bits");
++            t.Equals(qword(5, 3), 0x80u, "V4-5 A is bit 7");
++            t.Equals(qword(6, 0), 0x08u, "second V4-5 R");
++            t.Equals(qword(6, 1), 0x08u, "second V4-5 G");
++            t.Equals(qword(6, 2), 0x08u, "second V4-5 B");
++            t.Equals(qword(6, 3), 0x00u, "second V4-5 A");
++
++            t.Equals(qword(7, 2), 301u, "offset mode adds the row to the repeated V2 Z");
++            t.Equals(qword(7, 3), 402u, "offset mode adds the row to the repeated V2 W");
++        });
++
+         tc.Run("VIF fill write uses STMASK and STROW when WL>CL", [](TestCase &t)
+         {
+             PS2Memory mem;

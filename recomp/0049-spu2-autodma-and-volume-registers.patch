@@ -1,0 +1,470 @@
+From 7473354711c34ccbede66c332f0cb4965f8b4ee9 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 15:52:50 +0300
+Subject: [PATCH] SPU2: AutoDMA input, volume registers at 0x760, AVOL/BVOL
+ roles
+
+- AutoDMA: while ADMAS enables a core, DMA 4/7 writes queue PCM for its
+  sound data input (blocks of 256 left then 256 right samples), played at
+  48 kHz and routed by MMIX 0x80/0x40. The transfer ends, with the DMA
+  interrupt, once its last block is next to play, so the driver's next
+  transfer queues behind it without a gap. Before, the transfer completed
+  after a fixed delay and the data went to sound RAM: the game streamed
+  200 MB in 3 s and played nothing.
+- The shared volume registers (MVOL, EVOL, AVOL, BVOL at 0x760 + 0x28 *
+  core) were decoded as core 1 registers and ignored.
+- AVOL scales the external input (core 0 into core 1) and BVOL the sound
+  data input, as in PCSX2 (ExtVol/InpVol); the two were swapped.
+---
+ ps2xIOP/src/emulator/core/iop_memory.cpp |  19 ++--
+ ps2xIOP/src/emulator/core/iop_memory.h   |   5 +-
+ ps2xIOP/src/emulator/core/iop_spu2.cpp   |  79 ++++++++++++++--
+ ps2xIOP/src/emulator/core/iop_spu2.h     |  19 +++-
+ ps2xIOP/src/emulator/iop_emulator.cpp    |  10 +-
+ ps2xIOP/tests/iop_spu2_tests.cpp         | 112 +++++++++++++++++++++++
+ 6 files changed, 225 insertions(+), 19 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 1210756..9a5a0b4 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -10,8 +10,6 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kDmaSpu0Chcr = 0x1F8010C8u;
+         constexpr uint32_t kDmaSpu1Chcr = 0x1F801508u;
+         constexpr uint32_t kDmaStart = 1u << 24u;
+-        constexpr int kDmaSpu0Irq = 0x24;
+-        constexpr int kDmaSpu1Irq = 0x28;
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -286,14 +284,15 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+-        startSpu2Dma(address, value);
++        if (!startSpu2Dma(address, value))
++            return;
+         m_dmaStart = DmaStart{
+-            secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
++            spu2DmaIrq(secondCore ? 1 : 0),
+             std::max<uint64_t>(transferWords * 2u, 64u),
+         };
+     }
+ 
+-    void IopMemory::startSpu2Dma(uint32_t chcrAddress, uint32_t chcr)
++    bool IopMemory::startSpu2Dma(uint32_t chcrAddress, uint32_t chcr)
+     {
+         const int core = chcrAddress == kDmaSpu1Chcr ? 1 : 0;
+         const uint32_t madr = physicalAddress(readHardware32(chcrAddress - 8u)) & (RamSize - 1u);
+@@ -302,12 +301,14 @@ namespace ps2x::iop::detail
+         const uint32_t blockCount = std::max<uint32_t>(bcr >> 16u, 1u);
+         const uint32_t bytes = std::min<uint32_t>(wordsPerBlock * blockCount * 4u, RamSize - madr);
+         if ((chcr & 1u) != 0u)
+-            m_spu2.dmaWrite(core, m_ram.data() + madr, bytes);
+-        else
+         {
+-            m_spu2.dmaRead(core, m_ram.data() + madr, bytes);
+-            markOwned(madr, bytes);
++            const bool autoDma = m_spu2.autoDmaEnabled(core);
++            m_spu2.dmaWrite(core, m_ram.data() + madr, bytes);
++            return !autoDma;
+         }
++        m_spu2.dmaRead(core, m_ram.data() + madr, bytes);
++        markOwned(madr, bytes);
++        return true;
+     }
+ 
+     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 61cf3bd..84de14b 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -75,12 +75,15 @@ namespace ps2x::iop::detail
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+         [[nodiscard]] IopSpu2 &spu2() noexcept { return m_spu2; }
++        // IOP interrupt of SPU2 DMA channel 4 (core 0) or 7 (core 1).
++        [[nodiscard]] static constexpr int spu2DmaIrq(int core) noexcept { return core == 0 ? 0x24 : 0x28; }
+ 
+     private:
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
+-        void startSpu2Dma(uint32_t chcrAddress, uint32_t chcr);
++        // Returns false for an AutoDMA transfer, which ends when the SPU2 has taken it in.
++        [[nodiscard]] bool startSpu2Dma(uint32_t chcrAddress, uint32_t chcr);
+         [[nodiscard]] static bool isSpu2Address(uint32_t phys) noexcept { return phys >= Spu2Base && phys < Spu2End; }
+ 
+         std::vector<uint8_t> m_ram;
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 00676ed..0a32ba3 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -12,9 +12,11 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kVoiceParamEnd = 0x180u;
+         constexpr uint32_t kVoiceAddressBase = 0x1C0u;
+         constexpr uint32_t kVoiceAddressEnd = kVoiceAddressBase + 24u * 0xCu;
+-        constexpr uint32_t kMasterBase = 0x760u;
++        constexpr uint32_t kMasterBase = 0x760u; // MVOL, EVOL, AVOL, BVOL... of core 0, then core 1
+         constexpr uint32_t kMasterStride = 0x28u;
+         constexpr uint32_t kSpdifIrqInfo = 0x7C2u;
++        constexpr size_t kInputBlockSamples = 256u;
++        constexpr size_t kInputBlockHalfwords = kInputBlockSamples * 2u;
+ 
+         constexpr int32_t kAdpcmPos[5] = {0, 60, 115, 98, 122};
+         constexpr int32_t kAdpcmNeg[5] = {0, 0, -52, -55, -60};
+@@ -146,6 +148,46 @@ namespace ps2x::iop::detail
+         return pending;
+     }
+ 
++    bool IopSpu2::autoDmaEnabled(int coreIndex) const noexcept
++    {
++        const int c = coreIndex & 1;
++        return (m_cores[c].admas & (1u << c)) != 0u;
++    }
++
++    bool IopSpu2::takeAutoDmaDone(int coreIndex) noexcept
++    {
++        Core &core = m_cores[coreIndex & 1];
++        const bool done = core.inputTransferDone;
++        core.inputTransferDone = false;
++        return done;
++    }
++
++    // Plays the sound data input one sample at a time. A transfer counts as taken in once its
++    // last block has started playing; the next one queues behind it, so playback is gapless.
++    void IopSpu2::readInput(Core &core, int32_t &left, int32_t &right)
++    {
++        left = 0;
++        right = 0;
++        if (core.input.size() >= kInputBlockHalfwords)
++        {
++            left = core.input[core.inputSample];
++            right = core.input[kInputBlockSamples + core.inputSample];
++            if (++core.inputSample == kInputBlockSamples)
++            {
++                core.inputSample = 0u;
++                core.input.erase(core.input.begin(), core.input.begin() + kInputBlockHalfwords);
++            }
++        }
++        if (core.input.size() <= kInputBlockHalfwords && core.inputTransferPending)
++        {
++            core.inputTransferPending = false;
++            core.inputTransferDone = true;
++        }
++        // A partial block left by a transfer that was not a whole number of blocks never plays.
++        if (core.input.size() < kInputBlockHalfwords && core.inputSample == 0u)
++            core.input.clear();
++    }
++
+     void IopSpu2::checkIrq(uint32_t begin, uint32_t count)
+     {
+         for (int c = 0; c < 2; ++c)
+@@ -164,7 +206,8 @@ namespace ps2x::iop::detail
+     uint16_t IopSpu2::read16(uint32_t offset) const
+     {
+         offset &= (RegisterBytes - 1u) & ~1u;
+-        if (offset < 2u * kCoreStride)
++        // Core 1 ends where the shared volume registers start (0x760).
++        if (offset < kMasterBase)
+         {
+             const int coreIndex = static_cast<int>(offset / kCoreStride);
+             const uint32_t local = offset % kCoreStride;
+@@ -200,7 +243,8 @@ namespace ps2x::iop::detail
+     {
+         offset &= (RegisterBytes - 1u) & ~1u;
+         m_regs[offset / 2u] = value;
+-        if (offset < 2u * kCoreStride)
++        // Core 1 ends where the shared volume registers start (0x760).
++        if (offset < kMasterBase)
+         {
+             const int coreIndex = static_cast<int>(offset / kCoreStride);
+             const uint32_t local = offset % kCoreStride;
+@@ -458,6 +502,13 @@ namespace ps2x::iop::detail
+             break;
+         case 0x1B0u:
+             core.admas = value;
++            if (!autoDmaEnabled(coreIndex))
++            {
++                // AutoDMA stopped: drop the queued input along with the transfer it came from.
++                core.input.clear();
++                core.inputSample = 0u;
++                core.inputTransferPending = false;
++            }
+             break;
+         case 0x340u:
+             core.endx &= 0xFF0000u;
+@@ -660,15 +711,23 @@ namespace ps2x::iop::detail
+                 }
+ 
+                 // MMIX: bit set routes the source to the dry output
+-                // (0x800/0x400 voices L/R, 0x80/0x40 memory input, 0x8/0x4 external = core 0).
++                // (0x800/0x400 voices L/R, 0x80/0x40 sound data input, 0x8/0x4 external = core 0).
++                // BVOL scales the sound data input and AVOL the external input (PCSX2 InpVol/ExtVol).
+                 int32_t mixL = (core.mmix & 0x800u) != 0u ? dryL : 0;
+                 int32_t mixR = (core.mmix & 0x400u) != 0u ? dryR : 0;
++                int32_t inputL = 0;
++                int32_t inputR = 0;
++                readInput(core, inputL, inputR);
++                if ((core.mmix & 0x80u) != 0u)
++                    mixL += (inputL * core.bvolL) >> 15;
++                if ((core.mmix & 0x40u) != 0u)
++                    mixR += (inputR * core.bvolR) >> 15;
+                 if (c == 1)
+                 {
+                     if ((core.mmix & 0x8u) != 0u)
+-                        mixL += (coreOutL[0] * core.bvolL) >> 15;
++                        mixL += (coreOutL[0] * core.avolL) >> 15;
+                     if ((core.mmix & 0x4u) != 0u)
+-                        mixR += (coreOutR[0] * core.bvolR) >> 15;
++                        mixR += (coreOutR[0] * core.avolR) >> 15;
+                 }
+                 core.mvolL.tick();
+                 core.mvolR.tick();
+@@ -684,6 +743,14 @@ namespace ps2x::iop::detail
+     {
+         Core &core = m_cores[coreIndex & 1];
+         const uint32_t halfwords = bytes / 2u;
++        if (autoDmaEnabled(coreIndex))
++        {
++            const size_t queued = core.input.size();
++            core.input.resize(queued + halfwords);
++            std::memcpy(core.input.data() + queued, source, static_cast<size_t>(halfwords) * 2u);
++            core.inputTransferPending = true;
++            return;
++        }
+         checkIrq(core.tsa, halfwords);
+         for (uint32_t i = 0; i < halfwords; ++i)
+         {
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index ff51b9f..af47695 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -7,8 +7,9 @@
+ namespace ps2x::iop::detail
+ {
+     // SPU2 sound processor: two cores of 24 ADPCM voices each, 2 MB of sound RAM, the
+-    // register file at 0x1F900000 and DMA channels 4/7. Produces 48 kHz stereo output.
+-    // Reverb, noise and the AutoDMA (PCM block streaming) input are not emulated yet.
++    // register file at 0x1F900000 and DMA channels 4/7, including AutoDMA (PCM streaming into a
++    // core's sound data input). Produces 48 kHz stereo output. Reverb and noise are not
++    // emulated yet.
+     class IopSpu2
+     {
+     public:
+@@ -25,6 +26,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint16_t read16(uint32_t offset) const;
+         void write16(uint32_t offset, uint16_t value);
+ 
++        // While ADMAS enables AutoDMA for `core`, a DMA write queues PCM for its sound data input
++        // instead of writing sound RAM: blocks of 256 left samples followed by 256 right ones.
+         void dmaWrite(int core, const uint8_t *source, uint32_t bytes);
+         void dmaRead(int core, uint8_t *destination, uint32_t bytes);
+ 
+@@ -34,6 +37,11 @@ namespace ps2x::iop::detail
+         // True once after a voice, DMA or data-port access hit an enabled IRQA.
+         [[nodiscard]] bool takeIrq() noexcept;
+ 
++        [[nodiscard]] bool autoDmaEnabled(int core) const noexcept;
++        // True once after the last block of the AutoDMA transfer queued on `core` has started
++        // playing: the hardware has taken the transfer in and ends the DMA.
++        [[nodiscard]] bool takeAutoDmaDone(int core) noexcept;
++
+     private:
+         enum class Phase : uint8_t
+         {
+@@ -108,6 +116,12 @@ namespace ps2x::iop::detail
+             uint32_t endx = 0u;
+             uint16_t statx = 0u;
+             uint16_t admas = 0u;
++            // AutoDMA input: queued blocks, the start of the playing one and the next sample in it.
++            std::vector<int16_t> input;
++            size_t inputBlock = 0u;
++            uint32_t inputSample = 0u;
++            bool inputTransferPending = false;
++            bool inputTransferDone = false;
+             Volume mvolL;
+             Volume mvolR;
+             int16_t avolL = 0;
+@@ -130,6 +144,7 @@ namespace ps2x::iop::detail
+         void loadBlock(Core &core, Voice &voice);
+         [[nodiscard]] int32_t sampleVoice(Core &core, int voiceIndex, int32_t previousOutput);
+         void tickEnvelope(Voice &voice);
++        void readInput(Core &core, int32_t &left, int32_t &right);
+         void checkIrq(uint32_t begin, uint32_t count);
+ 
+         std::vector<uint16_t> m_ram;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 4b9704e..ee1239a 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -558,7 +558,8 @@ namespace ps2x::iop::detail
+         }
+ 
+         // Runs the SPU2 up to the current IOP time, hands its output to the host and raises the
+-        // SPU2 interrupt when an IRQA address was hit. Returns whether it raised one.
++        // SPU2 interrupt when an IRQA address was hit, or the DMA interrupt when an AutoDMA
++        // transfer was taken in. Returns whether it raised one.
+         bool advanceSpu()
+         {
+             constexpr uint64_t kCyclesPerSample = IopSpu2::IopCyclesPerSample;
+@@ -580,6 +581,13 @@ namespace ps2x::iop::detail
+                 raised = true;
+             if (raised)
+                 pendingDmaInterrupts[kSpu2Irq] = totalCycles;
++            for (int core = 0; core < 2; ++core)
++            {
++                if (!spu.takeAutoDmaDone(core))
++                    continue;
++                pendingDmaInterrupts[IopMemory::spu2DmaIrq(core)] = totalCycles;
++                raised = true;
++            }
+             return raised;
+         }
+ 
+diff --git a/ps2xIOP/tests/iop_spu2_tests.cpp b/ps2xIOP/tests/iop_spu2_tests.cpp
+index c2d00fd..0a0174c 100644
+--- a/ps2xIOP/tests/iop_spu2_tests.cpp
++++ b/ps2xIOP/tests/iop_spu2_tests.cpp
+@@ -1,12 +1,15 @@
++#include "emulator/core/iop_memory.h"
+ #include "emulator/core/iop_spu2.h"
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstring>
+ #include <iostream>
+ #include <vector>
+ 
+ namespace
+ {
++    using ps2x::iop::detail::IopMemory;
+     using ps2x::iop::detail::IopSpu2;
+ 
+     bool expect(bool value, const char *message)
+@@ -42,6 +45,36 @@ namespace
+         spu.write16(0x400u + 0x198u, 0x000Cu); // core 1 MMIX: external input (core 0) to dry
+         spu.write16(0x19Au, static_cast<uint16_t>(0x8000u | extraAttr)); // ATTR: core enable
+     }
++
++    // AutoDMA blocks of 256 left samples followed by 256 right ones; block b holds
++    // left = 0x1000 * (b + 1) and right = -0x800 * (b + 1).
++    std::vector<uint8_t> inputBlocks(int count, int first = 0)
++    {
++        std::vector<int16_t> samples;
++        for (int b = first; b < first + count; ++b)
++        {
++            samples.insert(samples.end(), 256u, static_cast<int16_t>(0x1000 * (b + 1)));
++            samples.insert(samples.end(), 256u, static_cast<int16_t>(-0x800 * (b + 1)));
++        }
++        std::vector<uint8_t> bytes(samples.size() * 2u);
++        std::memcpy(bytes.data(), samples.data(), bytes.size());
++        return bytes;
++    }
++
++    // Core 0 streams its sound data input to its dry output; core 1 mixes core 0 in.
++    void setUpInput(IopSpu2 &spu)
++    {
++        spu.write16(0x198u, 0x00C0u);          // core 0 MMIX: sound data input to dry
++        spu.write16(0x400u + 0x198u, 0x000Cu); // core 1 MMIX: external input (core 0) to dry
++        spu.write16(0x1B0u, 0x0001u);          // core 0 ADMAS
++    }
++
++    std::vector<int16_t> play(IopSpu2 &spu, uint32_t frames)
++    {
++        std::vector<int16_t> out(frames * 2u);
++        spu.generate(out.data(), frames);
++        return out;
++    }
+ }
+ 
+ int main()
+@@ -91,6 +124,85 @@ int main()
+         if (!expect(back == source, "DMA into sound RAM should read back unchanged")) return 1;
+     }
+ 
++    {
++        IopSpu2 spu;
++        setUpInput(spu);
++        const std::vector<uint8_t> data = inputBlocks(2);
++        spu.dmaWrite(0, data.data(), static_cast<uint32_t>(data.size()));
++        if (!expect(!spu.takeAutoDmaDone(0), "an AutoDMA transfer should not end before it plays")) return 1;
++
++        std::vector<int16_t> out = play(spu, 255u);
++        if (!expect(out[0] > 0x0C00 && out[1] < -0x600, "the input should play left and right from their halves of the block")) return 1;
++        if (!expect(!spu.takeAutoDmaDone(0), "the transfer should not end while its first block plays")) return 1;
++
++        play(spu, 1u);
++        if (!expect(spu.takeAutoDmaDone(0), "the transfer should end once its last block is next")) return 1;
++        if (!expect(!spu.takeAutoDmaDone(0), "the end of a transfer should be reported once")) return 1;
++
++        const std::vector<uint8_t> next = inputBlocks(1, 2);
++        spu.dmaWrite(0, next.data(), static_cast<uint32_t>(next.size()));
++        out = play(spu, 256u);
++        if (!expect(out[0] > 0x1800 && out[255u * 2u] > 0x1800 && out[255u * 2u] < 0x2800, "the second block should follow the first and play to its end")) return 1;
++        out = play(spu, 1u);
++        if (!expect(out[0] > 0x2800, "a transfer queued while the last block plays should follow without a gap")) return 1;
++        if (!expect(spu.takeAutoDmaDone(0), "a one-block transfer should end as soon as it is next")) return 1;
++
++        spu.write16(0x1B0u, 0u);
++        out = play(spu, 1u);
++        if (!expect(out[0] == 0 && out[1] == 0, "clearing ADMAS should drop the queued input")) return 1;
++    }
++
++    {
++        // BVOL scales the sound data input, AVOL the external input (core 0 into core 1).
++        // The volume registers are at 0x760 + 0x28 * core.
++        const auto peakWith = [](uint32_t volumeRegister)
++        {
++            IopSpu2 spu;
++            setUpInput(spu);
++            spu.write16(volumeRegister, 0u);
++            spu.write16(volumeRegister + 2u, 0u);
++            const std::vector<uint8_t> data = inputBlocks(1);
++            spu.dmaWrite(0, data.data(), static_cast<uint32_t>(data.size()));
++            const std::vector<int16_t> out = play(spu, 16u);
++            int32_t peak = 0;
++            for (int16_t sample : out)
++                peak = std::max<int32_t>(peak, sample < 0 ? -sample : sample);
++            return peak;
++        };
++        if (!expect(IopSpu2{}.read16(0x770u) != 0u, "MVOLXL should read core 0's current master volume")) return 1;
++        if (!expect(peakWith(0x76Cu) == 0, "core 0 BVOL = 0 should mute its sound data input")) return 1;
++        if (!expect(peakWith(0x768u) > 0x400, "core 0 AVOL should not scale its sound data input")) return 1;
++        if (!expect(peakWith(0x788u) == 0, "core 1 AVOL = 0 should mute its external input")) return 1;
++        if (!expect(peakWith(0x78Cu) > 0x400, "core 1 BVOL should not scale its external input")) return 1;
++    }
++
++    {
++        // DMA channel 4 through the IOP registers: an AutoDMA transfer ends when the SPU2 has
++        // taken it in, not after a fixed delay.
++        constexpr uint32_t source = 0x10000u;
++        const auto startDma = [&](IopMemory &memory, const std::vector<uint8_t> &data)
++        {
++            for (size_t i = 0; i < data.size(); ++i)
++                memory.write8(source + static_cast<uint32_t>(i), data[i]);
++            memory.write32(0x1F8010C0u, source);                                          // MADR
++            memory.write32(0x1F8010C4u, (static_cast<uint32_t>(data.size()) / 64u) << 16u | 16u); // BCR
++            memory.write32(0x1F8010C8u, 0x01000201u);                                     // CHCR: start, to SPU2
++        };
++
++        IopMemory memory;
++        startDma(memory, inputBlocks(1));
++        const auto plain = memory.takeDmaStart();
++        if (!expect(plain && plain->irq == IopMemory::spu2DmaIrq(0), "a plain DMA to the SPU2 should complete with the channel 4 interrupt")) return 1;
++
++        IopMemory autoDma;
++        IopSpu2 &spu = autoDma.spu2();
++        setUpInput(spu);
++        startDma(autoDma, inputBlocks(2));
++        if (!expect(!autoDma.takeDmaStart(), "an AutoDMA transfer should not complete after a fixed delay")) return 1;
++        play(spu, 256u);
++        if (!expect(spu.takeAutoDmaDone(0), "the SPU2 should end the AutoDMA transfer once it has taken it in")) return 1;
++    }
++
+     std::cout << "ps2xIOP SPU2 tests passed\n";
+     return 0;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

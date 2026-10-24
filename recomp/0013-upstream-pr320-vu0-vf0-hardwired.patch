@@ -1,0 +1,131 @@
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 7684097..d7ba022 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -211,6 +211,11 @@ namespace ps2recomp
+                 inst.rt,
+                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
+         case OPCODE_LDC2:
++            // vf0 is hardwired to (0, 0, 0, 1): an LQC2 into it still reads memory but changes nothing.
++            if (inst.rt == 0)
++            {
++                return fmt::format("(void){};", genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
++            }
+             return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_SDC2:
+             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..535150d 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -148,7 +148,10 @@ struct alignas(16) R5900Context
+     {
+         std::memset(this, 0, sizeof(*this));
+ 
+-        // Initialize VU0 registers
++        // Initialize VU0 registers. vf0 is hardwired to (0, 0, 0, 1) on the VU; thread and
++        // interrupt contexts are built from this constructor, and VU0 code reads vf0.w (a
++        // vrsqrt with fs = vf0.w in a fresh context must compute 1/sqrt(ft), not 0/sqrt(ft)).
++        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+         vu0_q = 1.0f; // Q register usually initialized to 1.0
+ 
+         // Reset COP0 registers
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 37c1b29..21227d3 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -40,6 +40,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_float_semantics_tests.cpp
+     src/ps2_mmi_tests.cpp
+     src/ps2_gs_raster_tests.cpp
++    src/ps2_vu0_vf0_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 5a493e6..2b6da6e 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -21,6 +21,7 @@ void register_ps2_runtime_expansion_tests();
+ void register_ps2_float_semantics_tests();
+ void register_ps2_mmi_tests();
+ void register_ps2_gs_raster_tests();
++void register_ps2_vu0_vf0_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -46,6 +47,7 @@ int main()
+     register_ps2_float_semantics_tests();
+     register_ps2_mmi_tests();
+     register_ps2_gs_raster_tests();
++    register_ps2_vu0_vf0_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_vu0_vf0_tests.cpp b/ps2xTest/src/ps2_vu0_vf0_tests.cpp
+new file mode 100644
+index 0000000..acc7abc
+--- /dev/null
++++ b/ps2xTest/src/ps2_vu0_vf0_tests.cpp
+@@ -0,0 +1,61 @@
++#include "MiniTest.h"
++#include "ps2recomp/code_generator.h"
++#include "ps2recomp/instructions.h"
++#include "ps2recomp/r5900_decoder.h"
++#include "ps2recomp/types.h"
++#include "ps2_runtime.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++// VF0 is hardwired to (0, 0, 0, 1) on the VU. Two paths broke that: every fresh R5900Context
++// started with vf0 = 0 (so thread/interrupt/callback contexts had a zero w lane until something
++// wrote it), and LQC2 into vf0 stored the loaded quadword into it.
++
++using namespace ps2recomp;
++
++namespace
++{
++    std::string translate(uint32_t address, uint32_t raw)
++    {
++        R5900Decoder decoder;
++        CodeGenerator gen({}, {});
++        return gen.translateInstruction(decoder.decodeInstruction(address, raw));
++    }
++
++    bool contains(const std::string &text, const std::string &part)
++    {
++        return text.find(part) != std::string::npos;
++    }
++}
++
++void register_ps2_vu0_vf0_tests()
++{
++    MiniTest::Case("PS2Vu0Vf0", [](TestCase &tc)
++    {
++        tc.Run("a fresh guest context has vf0 = (0, 0, 0, 1)", [](TestCase &t)
++        {
++            // Thread and interrupt contexts start from R5900Context().
++            const R5900Context fresh{};
++            alignas(16) uint32_t vf0[4];
++            _mm_store_si128(reinterpret_cast<__m128i *>(vf0), _mm_castps_si128(fresh.vu0_vf[0]));
++            char got[64];
++            std::snprintf(got, sizeof(got), "%08X %08X %08X %08X", vf0[0], vf0[1], vf0[2], vf0[3]);
++            t.IsTrue(vf0[0] == 0u && vf0[1] == 0u && vf0[2] == 0u && vf0[3] == 0x3F800000u,
++                     std::string("vf0 should be (0, 0, 0, 1.0), got ") + got);
++        });
++
++        tc.Run("LQC2 into vf0 changes nothing", [](TestCase &t)
++        {
++            // Stuntman (SLUS-20250) 0x002428DC (sub_2428B8 restores a VU0 context): lqc2 $vf0, 0($s0)
++            const std::string vf0 = translate(0x002428DCu, 0xDA000000u);
++            t.IsTrue(!contains(vf0, "vu0_vf[0]"), "lqc2 $vf0 must not write vf0 but got: " + vf0);
++            t.IsTrue(contains(vf0, "(void)READ128(ADD32(GPR_U32(ctx, 16), 0))"), "lqc2 $vf0 must still perform the read but got: " + vf0);
++            // Stuntman 0x002428E0: lqc2 $vf1, 0x10($s0)
++            const std::string vf1 = translate(0x002428E0u, 0xDA010010u);
++            t.IsTrue(contains(vf1, "ctx->vu0_vf[1] = _mm_castsi128_ps(READ128(ADD32(GPR_U32(ctx, 16), 16)))"),
++                     "lqc2 $vf1 must load vf1 but got: " + vf1);
++        });
++    });
++}

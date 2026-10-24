@@ -1,0 +1,541 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,7 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -688,7 +689,24 @@
+                 next = &thread;
+         }
+         if (next == nullptr)
++        {
++            // TEMP-DEBUG: dump blocked IOP threads periodically
++            static uint64_t idleCalls = 0;
++            ++idleCalls;
++            if (idleCalls == 300000ull || idleCalls == 3000000ull)
++            {
++                std::fprintf(stderr, "[IOPDBG] ---- idleCalls=%llu cycle=%llu\n", (unsigned long long)idleCalls, (unsigned long long)currentCycle);
++                for (auto &[id, t] : m_threads)
++                    std::fprintf(stderr, "[IOPDBG] thr=%d state=%d entry=0x%x pc=0x%x ra=0x%x waitId=%d waitBits=0x%x mode=%u wake=%llu prio=%u\n",
++                                 id, static_cast<int>(t.state), t.entry, t.cpu.pc, t.cpu.gpr[31], t.waitId, t.waitBits, t.waitMode,
++                                 (unsigned long long)t.wakeCycle, t.priority);
++                for (auto &[id, e] : m_eventFlags)
++                    std::fprintf(stderr, "[IOPDBG] evf=%d bits=0x%x\n", id, e.bits);
++                for (auto &[id, sm] : m_semaphores)
++                    std::fprintf(stderr, "[IOPDBG] sema=%d cur=%d max=%d\n", id, sm.current, sm.maximum);
++            }
+             return nullptr;
++        }
+ 
+         // Exhausting a host instruction budget is not a guest yield. Keep the
+         // running thread ahead of equal-priority peers, even if an older thread
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..7a2bc8a 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -22,7 +22,7 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        static constexpr uint32_t HeapBase = 0x00090000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..5db9adc 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -1,3 +1,6 @@
++#include <cstdio>
++#include <string>
++#include <set>
+ #include "iop_emulator.h"
+ #include "imports/iop_cdvd.h"
+ #include "core/iop_cpu.h"
+@@ -239,6 +242,21 @@ namespace ps2x::iop::detail
+ 
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+         {
++            { // TEMP-DEBUG: first call of each distinct import, in order
++                static std::set<std::pair<std::string, int>> dbgSeen;
++                static uint64_t dbgSeq = 0;
++                if (dbgSeen.insert({std::string(call.library), (int)call.ordinal}).second)
++                    std::fprintf(stderr, "[IMPDBG] #%llu %s:%d pc=0x%x a0=0x%x a1=0x%x\n", (unsigned long long)++dbgSeq, std::string(call.library).c_str(), (int)call.ordinal, cpu.pc, cpu.gpr[4], cpu.gpr[5]);
++            }
++            {
++                static int dbgEv = 0;
++                const std::string lib(call.library);
++                if (false && dbgEv < 400 && (lib == "thsemap" || lib == "thevent" || lib == "intrman" || lib == "dmacman" || lib == "libsd"))
++                {
++                    ++dbgEv;
++                    std::fprintf(stderr, "[EVDBG] %s:%d pc=0x%x ra=0x%x a0=0x%x a1=0x%x a2=0x%x cyc=%llu\n", lib.c_str(), (int)call.ordinal, cpu.pc, cpu.gpr[31], cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], (unsigned long long)totalCycles);
++                }
++            }
+             const uint32_t a0 = cpu.gpr[4];
+             auto setV0 = [&](uint32_t value)
+             {
+@@ -742,6 +760,14 @@ namespace ps2x::iop::detail
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
++        // The EE reports time in tiny steps (one per loop back-edge); a full IOP scheduling pass per
++        // step dominated the run time. Batch the work: run the IOP once per kMinBatchIopCycles.
++        constexpr uint64_t kMinBatchIopCycles = 64u;
++        if (total < kMinBatchIopCycles * 8u)
++        {
++            m_impl->eeCycleCarry = total;
++            return;
++        }
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
+         if (iopCycles)
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..1e5e29e 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -278,6 +278,7 @@ public:
+     void run();
+     void requestStop();
+     void postEvent(EeEvent event);
++    static constexpr uint32_t kCheckpointBatchCycles = 1024u;
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+@@ -426,6 +427,7 @@ private:
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
++    uint64_t m_unaccountedCycles = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..13cc83e 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -356,7 +357,27 @@ void EeScheduler::postEvent(EeEvent event)
+ 
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
+-    accountCycles(cycles);
++    { // TEMP-DEBUG EE thread dump
++        static uint64_t dbgN = 0;
++        if ((++dbgN % 4000000ull) == 0ull && dbgN <= 20000000ull)
++        {
++            std::fprintf(stderr, "[EETHR] ---- cycle=%llu vsync=%llu cur=%d\n", (unsigned long long)m_eeCycle, (unsigned long long)m_vsyncTick, m_currentThreadId);
++            for (auto &[id, t] : m_threads)
++                std::fprintf(stderr, "[EETHR] thr=%d status=%d entry=0x%x pc=0x%x ra=0x%x prio=%d waitReason=%d waitIdx=%d\n", id, (int)t.status, t.entry, t.activeContext().pc, getRegU32(&t.activeContext(), 31), t.currentPriority, (int)t.wait.reason, (int)t.wait.payload.index());
++            for (auto &[id, sm] : m_semaphores)
++                std::fprintf(stderr, "[EETHR] sema=%d count=%d max=%d waiters=%zu\n", id, sm.count, sm.maxCount, sm.waiters.size());
++        }
++    }
++    // Generated loops call this on every back-edge. Running the full accounting (EE timers, IOP,
++    // deadlines) each time made tight guest loops ~100x slower than native, so batch it.
++    m_unaccountedCycles += std::max<uint32_t>(1u, cycles);
++    if (m_unaccountedCycles < kCheckpointBatchCycles)
++    {
++        return m_checkpointPending.load(std::memory_order_acquire) ||
++               m_stopRequested.load(std::memory_order_acquire);
++    }
++    accountCycles(static_cast<uint32_t>(std::min<uint64_t>(m_unaccountedCycles, 0xFFFFFFFFull)));
++    m_unaccountedCycles = 0;
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..57dbc1b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "Common.h"
+ #include "CD.h"
+ #include "MPEG.h"
+@@ -206,6 +207,7 @@ namespace ps2_stubs
+ 
+     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdRead a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
+         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
+         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
+@@ -325,6 +327,7 @@ namespace ps2_stubs
+ 
+     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdSync a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         setReturnS32(ctx, 0); // 0 = completed/not busy
+     }
+ 
+@@ -370,11 +373,13 @@ namespace ps2_stubs
+ 
+     void sceCdDiskReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdDiskReady a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         setReturnS32(ctx, 2);
+     }
+ 
+     void sceCdGetDiskType(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdGetDiskType a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         // SCECdPS2DVD
+         setReturnS32(ctx, 0x14);
+     }
+@@ -396,6 +401,7 @@ namespace ps2_stubs
+ 
+     void sceCdInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdInit a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         g_cdInitialized = true;
+         g_lastCdError = 0;
+         g_cdStreamTiming = {};
+@@ -467,6 +473,7 @@ namespace ps2_stubs
+ 
+     void sceCdReadChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdReadChain a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         uint32_t chainAddr = getRegU32(ctx, 4);
+         bool ok = true;
+ 
+@@ -544,6 +551,7 @@ namespace ps2_stubs
+ 
+     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdSearchFile a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); const char *dbgName = reinterpret_cast<const char *>(rdram + (getRegU32(ctx, 5) & 0x1FFFFFFFu)); std::fprintf(stderr, "[CDDBG]   name=%.64s\n", dbgName); } } // TEMP-DEBUG
+         uint32_t fileAddr = getRegU32(ctx, 4);
+         uint32_t pathAddr = getRegU32(ctx, 5);
+         const std::string path = readPs2CStringBounded(rdram, pathAddr, 260);
+@@ -650,12 +658,14 @@ namespace ps2_stubs
+ 
+     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdSeek a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         restartCdStreamAt(getRegU32(ctx, 4), runtime);
+         setReturnS32(ctx, 1);
+     }
+ 
+     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdStandby a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         setReturnS32(ctx, 1);
+     }
+ 
+@@ -666,6 +676,7 @@ namespace ps2_stubs
+ 
+     void sceCdStInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdStInit a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         const uint32_t bufferSectors = getRegU32(ctx, 4);
+         const uint32_t bankCount = getRegU32(ctx, 5);
+         const uint32_t bufferAddr = getRegU32(ctx, 6);
+@@ -852,6 +863,7 @@ namespace ps2_stubs
+ 
+     void sceCdStRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdStRead a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         const uint32_t requestedSectors = getRegU32(ctx, 4);
+         const uint32_t buffer = getRegU32(ctx, 5);
+         const uint32_t mode = getRegU32(ctx, 6);
+@@ -931,6 +943,7 @@ namespace ps2_stubs
+ 
+     void sceCdStStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdStStart a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         const uint32_t lbn = getRegU32(ctx, 4);
+         const uint32_t modeAddr = getRegU32(ctx, 5);
+         uint8_t spindleControl = 0u;
+@@ -958,6 +971,7 @@ namespace ps2_stubs
+ 
+     void sceCdStStat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdStStat a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         const uint32_t buffered = bufferedCdStreamSectors(runtime);
+         const uint32_t bankSize = std::max(1u, g_cdStreamTiming.sectorsPerBank);
+         setReturnS32(ctx, static_cast<int32_t>((buffered / bankSize) * bankSize));
+@@ -965,6 +979,7 @@ namespace ps2_stubs
+ 
+     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdStStop a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         updateCdStreamProduction(runtime);
+         g_cdStreamTiming.active = false;
+         g_cdStreamTiming.paused = false;
+@@ -974,6 +989,7 @@ namespace ps2_stubs
+ 
+     void sceCdSyncS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 60) { std::fprintf(stderr, "[CDDBG] sceCdSyncS a0=0x%x a1=0x%x a2=0x%x a3=0x%x call#%d ra=0x%x\n", getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), dbgC, getRegU32(ctx, 31)); } } // TEMP-DEBUG
+         setReturnS32(ctx, 0);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..06769d4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "Common.h"
+ #include "MPEG.h"
+ #include "runtime/ee_scheduler.h"
+@@ -1875,6 +1876,7 @@ namespace ps2_stubs
+ 
+     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 5) std::fprintf(stderr, "[MPEGDBG] sceMpegAddBs call#%d\n", dbgC); } // TEMP-DEBUG
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t dataAddr = getRegU32(ctx, 5);
+         const uint32_t byteCount = getRegU32(ctx, 6);
+@@ -1985,6 +1987,7 @@ namespace ps2_stubs
+ 
+     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 5) std::fprintf(stderr, "[MPEGDBG] sceMpegCreate call#%d\n", dbgC); } // TEMP-DEBUG
+         const uint32_t param_1 = getRegU32(ctx, 4); // a0
+         const uint32_t param_2 = getRegU32(ctx, 5); // a1
+         const uint32_t param_3 = getRegU32(ctx, 6); // a2
+@@ -2282,6 +2285,7 @@ namespace ps2_stubs
+ 
+     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 5) std::fprintf(stderr, "[MPEGDBG] sceMpegGetPicture call#%d\n", dbgC); } // TEMP-DEBUG
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t imageAddr = getRegU32(ctx, 5);
+         uint32_t width = kStubMovieWidth;
+@@ -2430,6 +2434,7 @@ namespace ps2_stubs
+ 
+     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 5) std::fprintf(stderr, "[MPEGDBG] sceMpegInit call#%d\n", dbgC); } // TEMP-DEBUG
+         (void)rdram;
+         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+@@ -2449,6 +2454,7 @@ namespace ps2_stubs
+ 
+     void sceMpegIsEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 5) std::fprintf(stderr, "[MPEGDBG] sceMpegIsEnd call#%d\n", dbgC); } // TEMP-DEBUG
+         (void)rdram;
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+ 
+@@ -2501,6 +2507,7 @@ namespace ps2_stubs
+ 
+     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { static int dbgC = 0; if (++dbgC <= 5) std::fprintf(stderr, "[MPEGDBG] sceMpegReset call#%d\n", dbgC); } // TEMP-DEBUG
+         (void)runtime;
+         const uint32_t param_1 = getRegU32(ctx, 4);
+         {
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+index 121fcc7..b49293c 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Dispatcher.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "Common.h"
+ #include "Dispatcher.h"
+ #include "System.h"
+@@ -6,6 +7,18 @@ namespace ps2_syscalls
+ {
+     bool dispatchNumericSyscall(uint32_t syscallNumber, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        { // TEMP-DEBUG syscall histogram
++            static uint64_t dbgHist[256] = {};
++            static uint64_t dbgTotal = 0;
++            ++dbgHist[syscallNumber & 0xFFu];
++            if (++dbgTotal % 300u == 0u)
++            {
++                std::fprintf(stderr, "[SYSDBG] total=%llu", (unsigned long long)dbgTotal);
++                for (int i = 0; i < 256; ++i)
++                    if (dbgHist[i]) std::fprintf(stderr, " 0x%02x:%llu", i, (unsigned long long)dbgHist[i]);
++                std::fprintf(stderr, "\n");
++            }
++        }
+         if (dispatchSyscallOverride(syscallNumber, rdram, ctx, runtime))
+         {
+             return true;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..2dccf52 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -1,3 +1,5 @@
++#include <map>
++#include <cstdio>
+ #include "Common.h"
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+@@ -329,6 +331,12 @@ namespace ps2_syscalls
+             client->cbuf = 0;
+         }
+ 
++        {
++            static std::map<uint32_t, int> dbgBind;
++            int &c = dbgBind[rpcId];
++            if (++c <= 3 || (c % 1000) == 0)
++                std::fprintf(stderr, "[RPCDBG] BindRpc sid=0x%x client=0x%x server=0x%x (count=%d) ra=0x%x\n", rpcId, clientPtr, serverPtr, c, getRegU32(ctx, 31));
++        }
+         SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
+         event.clientPtr = clientPtr;
+         event.serverPtr = serverPtr;
+@@ -347,6 +355,13 @@ namespace ps2_syscalls
+         const uint32_t rpcNum = getRegU32(ctx, 5);
+         const uint32_t mode = getRegU32(ctx, 6);
+         const uint32_t sendBuf = getRegU32(ctx, 7);
++        {
++            static int dbgCall = 0;
++            uint32_t dbgSid = 0;
++            { std::lock_guard<std::mutex> lk(g_rpc_mutex); auto it = g_rpc_clients.find(clientPtr); if (it != g_rpc_clients.end()) dbgSid = it->second.sid; }
++            if (++dbgCall <= 80 || (dbgCall % 2000) == 0)
++                std::fprintf(stderr, "[RPCDBG] CallRpc client=0x%x sid=0x%x rpc=0x%x mode=0x%x send=0x%x call#%d ra=0x%x\n", clientPtr, dbgSid, rpcNum, mode, sendBuf, dbgCall, getRegU32(ctx, 31));
++        }
+         const uint32_t stackPointer = getRegU32(ctx, 29);
+ 
+         const uint32_t sendSizeRegisters = getRegU32(ctx, 8);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..1c14e51 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,5 @@
++#include <tuple>
++#include <map>
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -548,6 +550,33 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
++    { // TEMP-DEBUG draw summary
++        static std::map<std::tuple<uint32_t, int, int, int, uint32_t, int, uint32_t>, uint64_t> dbgDraws;
++        static uint64_t dbgTotal = 0;
++        const GSDrawState &st = batch.state;
++        const GSVertex &v0 = batch.vertices[0];
++        const uint32_t rgba = (uint32_t(v0.r) << 16) | (uint32_t(v0.g) << 8) | uint32_t(v0.b);
++        dbgDraws[{st.context.frame.fbp, st.context.frame.psm, st.prim.tme ? 1 : 0, st.prim.abe ? 1 : 0, st.context.frame.fbmsk, (int)st.prim.type, rgba & 0xFFFFFFu ? 1u : 0u}]++;
++        {
++            static int dbgTex = 0;
++            if (st.prim.tme && st.context.frame.fbp == 140 && dbgTex < 12 && (dbgTotal % 50u) == 0u)
++            {
++                ++dbgTex;
++                const GSVertex &v1 = batch.vertices[1];
++                std::fprintf(stderr, "[TEXDBG] tbp0=%u tbw=%u psm=%u tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=%u fst=%d | v0=(%.1f,%.1f) v1=(%.1f,%.1f) uv0=(%u,%u) uv1=(%u,%u) rgba0=(%u,%u,%u,%u) alpha=0x%llx test=0x%llx texW=%u texH=%u\n",
++                             st.context.tex0.tbp0, st.context.tex0.tbw, st.context.tex0.psm, st.context.tex0.tw, st.context.tex0.th, st.context.tex0.tcc, st.context.tex0.tfx, st.context.tex0.cbp, st.context.tex0.cpsm, st.prim.fst ? 1 : 0,
++                             v0.x, v0.y, v1.x, v1.y, v0.u, v0.v, v1.u, v1.v, v0.r, v0.g, v0.b, v0.a,
++                             (unsigned long long)st.context.alpha, (unsigned long long)st.context.test, st.textureWidth, st.textureHeight);
++            }
++        }
++        if (++dbgTotal % 20000u == 0u)
++        {
++            std::fprintf(stderr, "[DRAWDBG] total=%llu (fbp,psm,tme,abe,fbmsk,type,colorNonZero)=count:", (unsigned long long)dbgTotal);
++            for (auto &[k, c] : dbgDraws)
++                std::fprintf(stderr, " (%u,%d,%d,%d,0x%x,%d,%u)=%llu", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), std::get<6>(k), (unsigned long long)c);
++            std::fprintf(stderr, "\n");
++        }
++    }
+     DrawPrimitive(batch);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..c4259c3 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -402,6 +402,8 @@ bool PS2Memory::initialize(size_t ramSize)
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
++    // The BIOS leaves Timer 3 free-running (CUE, BUSCLK/256); some games busy-wait on its count.
++    m_eeTimers[3].mode = kEeTimerModeCue | 2u;
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..17c4acb 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "ps2_runtime.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+@@ -444,6 +445,31 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         }
+         ++s_uploadDebugCount;
+     });
++    { // TEMP-DEBUG frame stats
++        static uint64_t dbgFrames = 0;
++        if ((++dbgFrames % 20u) == 1u)
++        {
++            size_t nz = 0;
++            for (size_t i = 0; i + 3 < s_scratch.size(); i += 4)
++                if (s_scratch[i] | s_scratch[i + 1] | s_scratch[i + 2]) ++nz;
++            if (dbgFrames % 100u == 1u)
++            {
++                const uint8_t *vr = rt->memory().getGSVRAM();
++                std::fprintf(stderr, "[VRAMDBG]");
++                for (uint32_t region = 0; region < 16; ++region)
++                {
++                    size_t cnt = 0;
++                    const uint32_t *w = reinterpret_cast<const uint32_t *>(vr + region * 0x40000u);
++                    for (size_t i = 0; i < 0x10000u; ++i) cnt += (w[i] != 0u);
++                    std::fprintf(stderr, " %u:%zu", region, cnt);
++                }
++                std::fprintf(stderr, "\n");
++            }
++            std::fprintf(stderr, "[FRAMEDBG] n=%llu tick=%llu %ux%u dispFbp=%u srcFbp=%u pref=%d nonblack=%zu/%zu\n",
++                         (unsigned long long)dbgFrames, (unsigned long long)currentTick, width, height, displayFbp, sourceFbp,
++                         usedPreferredDisplaySource ? 1 : 0, nz, s_scratch.size() / 4);
++        }
++    }
+     s_lastDisplayFbp = displayFbp;
+     s_lastSourceFbp = sourceFbp;
+     s_lastPreferred = usedPreferredDisplaySource;
+@@ -1351,6 +1377,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+                                      const char *debugName)
+ {
+     ctx->pc = targetPc;
++    { // TEMP-DEBUG dispatch history dump
++        static uint64_t dbgCalls = 0;
++        if ((++dbgCalls % 3000000ull) == 0ull && dbgCalls <= 15000000ull)
++            std::fprintf(stderr, "[HISTDBG] calls=%llu trace=%s\n", (unsigned long long)dbgCalls, formatDispatchHistory().c_str());
++    }
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+ 
+     // Every inter-function transfer is also a deterministic EE safe point.
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..0f441c1 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ // Based on Blackline Interactive implementation
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
+@@ -340,6 +341,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;
+ 
++        { // TEMP-DEBUG VIF opcode histogram
++            static uint64_t dbgHist[128] = {};
++            static uint64_t dbgTotal = 0;
++            ++dbgHist[opcode];
++            if (++dbgTotal % 2000u == 1u)
++            {
++                std::fprintf(stderr, "[VIFDBG] total=%llu", (unsigned long long)dbgTotal);
++                for (int i = 0; i < 128; ++i)
++                    if (dbgHist[i]) std::fprintf(stderr, " 0x%02x:%llu", i, (unsigned long long)dbgHist[i]);
++                std::fprintf(stderr, "\n");
++            }
++        }
+         // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;

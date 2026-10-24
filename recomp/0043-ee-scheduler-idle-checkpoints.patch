@@ -1,0 +1,315 @@
+From 1e3e6ed7772588009bdcb230bf91ca103289f2ea Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 22:53:48 +0300
+Subject: [PATCH] Skip EE timer and event work between interrupts
+
+---
+ ps2xRuntime/include/runtime/ps2_memory.h   |  9 +++
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp | 10 +++
+ ps2xRuntime/src/lib/ps2_memory.cpp         | 33 +++++++-
+ ps2xTest/src/ps2_memory_tests.cpp          | 47 +++++++++++
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp  | 90 ++++++++++++++++++++++
+ 5 files changed, 185 insertions(+), 4 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index d6a6511..9c2328a 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -478,6 +478,15 @@ public:
+     };
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
++    // advanceEeTimers runs every few EE cycles, so it only adds them up; the
++    // counters catch up once an interrupt can be due or a timer register is
++    // accessed, which gives the same counts as stepping them every time.
++    uint64_t m_eeTimerPendingCycles = 0;
++    uint64_t m_eeTimerSyncCycles = 0; // pending cycles at which the next interrupt is due
++    // GIF_STAT in m_ioRegisters, whose FQC drains as soon as time passes.
++    uint32_t *m_gifStat = nullptr;
++    uint32_t syncEeTimers() noexcept;
++    uint64_t eeTimerInterruptDistance() const noexcept;
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 54bd6b0..3f648d2 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1757,6 +1757,16 @@ void EeScheduler::applyPendingPreemption()
+ void EeScheduler::processPendingEvents()
+ {
+     assertExecutor();
++    // This runs after every guest call. With no event posted, no timer
++    // interrupt and no deadline due there is nothing to take the event lock
++    // for; postEvent and scheduleEvent publish both flags under that lock.
++    const uint64_t nextDeadline = m_nextDeadlineCycle.load(std::memory_order_acquire);
++    if (!m_checkpointPending.load(std::memory_order_acquire) && m_pendingEeTimerInterrupts == 0u &&
++        (nextDeadline == 0u || m_eeCycle < nextDeadline))
++    {
++        applyPendingPreemption();
++        return;
++    }
+     processDueDeadlines();
+     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
+     m_pendingEeTimerInterrupts = 0u;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e4ff448..b5568a2 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -371,6 +371,7 @@ bool PS2Memory::initialize(size_t ramSize)
+ 
+         // Initialize I/O registers
+         m_ioRegisters.clear();
++        m_gifStat = &m_ioRegisters[0x10003020u];
+ 
+         // Initialize GS registers
+         memset(&gs_regs, 0, sizeof(gs_regs));
+@@ -422,6 +423,8 @@ void PS2Memory::resetEeTimers() noexcept
+     m_eeTimers = {};
+     // The BIOS leaves Timer 3 free-running (CUE, BUSCLK/256); some games busy-wait on its count.
+     m_eeTimers[3].mode = kEeTimerModeCue | 2u;
++    m_eeTimerPendingCycles = 0u;
++    m_eeTimerSyncCycles = 0u;
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+@@ -431,12 +434,20 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+         return 0u;
+     }
+ 
+-    constexpr uint32_t kGifStat = 0x10003020u;
+     constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-    auto gifStatIt = m_ioRegisters.find(kGifStat);
+-    if (gifStatIt != m_ioRegisters.end())
+-        gifStatIt->second &= ~kGifFqcMask;
++    if (m_gifStat)
++        *m_gifStat &= ~kGifFqcMask;
+ 
++    m_eeTimerPendingCycles += eeCycles;
++    if (m_eeTimerPendingCycles < m_eeTimerSyncCycles)
++        return 0u;
++    return syncEeTimers();
++}
++
++uint32_t PS2Memory::syncEeTimers() noexcept
++{
++    const uint64_t eeCycles = m_eeTimerPendingCycles;
++    m_eeTimerPendingCycles = 0u;
+     uint32_t interruptMask = 0u;
+     for (size_t index = 0; index < m_eeTimers.size(); ++index)
+     {
+@@ -497,10 +508,20 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+             interruptMask |= 1u << index;
+         }
+     }
++    m_eeTimerSyncCycles = eeTimerInterruptDistance();
+     return interruptMask;
+ }
+ 
+ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
++{
++    const uint64_t distance = eeTimerInterruptDistance();
++    if (distance == std::numeric_limits<uint64_t>::max())
++        return distance;
++    return distance > m_eeTimerPendingCycles ? distance - m_eeTimerPendingCycles : 1u;
++}
++
++// From the counters as of the last sync.
++uint64_t PS2Memory::eeTimerInterruptDistance() const noexcept
+ {
+     uint64_t nearest = std::numeric_limits<uint64_t>::max();
+     for (const EeTimer &timer : m_eeTimers)
+@@ -1150,6 +1171,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        // Catching up raises no interrupt: none is due before m_eeTimerSyncCycles.
++        syncEeTimers();
+         EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+@@ -1177,6 +1200,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         default:
+             return false;
+         }
++        m_eeTimerSyncCycles = eeTimerInterruptDistance();
+         return true;
+     }
+ 
+@@ -2322,6 +2346,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+     {
++        syncEeTimers();
+         const EeTimer &timer = m_eeTimers[timerIndex];
+         switch (timerOffset)
+         {
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 91db72b..e4615fa 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -310,6 +310,53 @@ void register_ps2_memory_tests()
+             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
+         });
+ 
++        tc.Run("EE timers advanced a cycle at a time interrupt on the exact cycle", [](TestCase &t)
++        {
++            // The counters only catch up when an interrupt can be due or a register is
++            // accessed; an interrupt must still come on its own cycle, reads must see the
++            // live count, and a register write must move the next interrupt.
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kTimer0 = 0x10000000u;
++            constexpr uint32_t kTimer1 = 0x10000800u;
++            constexpr uint32_t kZret = 1u << 6u;
++            constexpr uint32_t kCue = 1u << 7u;
++            constexpr uint32_t kCmpe = 1u << 8u;
++            constexpr uint32_t kOvfe = 1u << 9u;
++
++            // Timer0: BUSCLK (2 EE cycles a tick), compare at 100 -> EE cycle 200.
++            mem.writeIORegister(kTimer0, 0u);
++            mem.writeIORegister(kTimer0 + 0x20u, 100u);
++            mem.writeIORegister(kTimer0 + 0x10u, kZret | kCue | kCmpe);
++            // Timer1: BUSCLK/16 (32 EE cycles a tick), overflow after 16 ticks -> EE cycle 512,
++            // until the count is rewritten at cycle 300 to overflow one tick later, at 332.
++            mem.writeIORegister(kTimer1, 0xFFF0u);
++            mem.writeIORegister(kTimer1 + 0x10u, 1u | kCue | kOvfe);
++
++            bool exact = true;
++            for (uint32_t cycle = 1u; cycle <= 1000u; ++cycle)
++            {
++                const uint32_t raised = mem.advanceEeTimers(1u);
++                const uint32_t expected = cycle == 200u ? 1u : cycle == 332u ? 2u : 0u;
++                if (raised != expected)
++                {
++                    t.Fail("cycle " + std::to_string(cycle) + ": raised " + std::to_string(raised) + ", expected " +
++                           std::to_string(expected));
++                    exact = false;
++                    break;
++                }
++                if (cycle == 50u)
++                    t.Equals(mem.cyclesUntilNextEeTimerInterrupt(), static_cast<uint64_t>(150u),
++                             "the next interrupt counts the cycles not applied yet");
++                if (cycle == 150u)
++                    t.Equals(mem.readIORegister(kTimer0), 75u, "a read sees the count of the cycles so far");
++                if (cycle == 300u)
++                    mem.writeIORegister(kTimer1, 0xFFFFu);
++            }
++            t.IsTrue(exact, "TIM0 comes on cycle 200 and TIM1 on cycle 332 only");
++        });
++
+         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
+         {
+             PS2Memory mem;
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 63b12d9..9f8898d 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -399,6 +399,60 @@ namespace
+         ctx->pc = 0u;
+     }
+ 
++    constexpr uint32_t K_POST_EVENT_LOOP = 0x300900u;
++    constexpr uint32_t K_WAKE_HIGH = 0x300A00u;
++    constexpr uint32_t K_WAKE_HIGH_RESUME = 0x300A04u;
++    constexpr uint32_t K_WAKE_LOW = 0x300B00u;
++    constexpr uint32_t K_WAKE_LOW_RESUME = 0x300B04u;
++    int gWakeHighId = -1;
++    uint64_t gVsyncBefore = 0u;
++    uint64_t gVsyncAfter = 0u;
++
++    // Posts a VBlank, then looks at the VSync count on its next dispatch.
++    void schedulerPostEventLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        const uint64_t tick = runtime->memory().gs().vsyncTick.load(std::memory_order_acquire);
++        if (gSchedulerTrace->empty())
++        {
++            gSchedulerTrace->push_back(1);
++            gVsyncBefore = tick;
++            runtime->eeScheduler().postEvent(EeEvent{EeEventType::VBlankStart, 0u, 0u});
++            ctx->pc = K_POST_EVENT_LOOP;
++            return;
++        }
++        gVsyncAfter = tick;
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void schedulerWakeHigh(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gSchedulerTrace->push_back(50);
++        ctx->pc = K_WAKE_HIGH_RESUME;
++        SleepThread(rdram, ctx, runtime);
++    }
++
++    void schedulerWakeHighResume(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        gSchedulerTrace->push_back(51);
++        ctx->pc = 0u;
++    }
++
++    // Wakes the higher-priority thread without switching to it on the spot.
++    void schedulerWakeLow(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gSchedulerTrace->push_back(60);
++        runtime->eeScheduler().wakeupThread(gWakeHighId, false);
++        ctx->pc = K_WAKE_LOW_RESUME;
++    }
++
++    void schedulerWakeLowResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gSchedulerTrace->push_back(61);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
+     void schedulerWaitA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         if (ctx->pc == K_SCHED_A)
+@@ -855,6 +909,42 @@ void register_ps2_runtime_kernel_tests()
+             t.IsTrue(trace == expected, "higher priority should run before the starter continues");
+         });
+ 
++        tc.Run("an event posted by guest code is handled before its next dispatch", [](TestCase &t)
++        {
++            TestEnv env;
++            std::vector<int> trace;
++            gSchedulerTrace = &trace;
++            env.runtime.registerFunction(K_POST_EVENT_LOOP, schedulerPostEventLoop);
++            env.ctx.pc = K_POST_EVENT_LOOP;
++            env.runtime.eeScheduler().reset(env.rdram.data(), env.ctx);
++            env.runtime.eeScheduler().run();
++            t.Equals(gVsyncAfter, gVsyncBefore + 1u, "the posted VBlank should have advanced the VSync count");
++        });
++
++        tc.Run("a wakeup that leaves preemption pending switches before the waker continues", [](TestCase &t)
++        {
++            TestEnv env;
++            std::vector<int> trace;
++            gSchedulerTrace = &trace;
++            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
++            env.runtime.registerFunction(K_WAKE_HIGH, schedulerWakeHigh);
++            env.runtime.registerFunction(K_WAKE_HIGH_RESUME, schedulerWakeHighResume);
++            env.runtime.registerFunction(K_WAKE_LOW, schedulerWakeLow);
++            env.runtime.registerFunction(K_WAKE_LOW_RESUME, schedulerWakeLowResume);
++            env.ctx.pc = K_SCHED_MAIN;
++
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.reset(env.rdram.data(), env.ctx);
++            gWakeHighId = ee.createThread(EeThreadCreateParams{0, K_WAKE_HIGH, 0x20000u, 0x800u, 0, 5, 0});
++            const int low = ee.createThread(EeThreadCreateParams{0, K_WAKE_LOW, 0x21000u, 0x800u, 0, 20, 0});
++            ee.startThread(gWakeHighId, 0, env.ctx, false);
++            ee.startThread(low, 0, env.ctx, false);
++            ee.run();
++
++            const std::vector<int> expected{1, 50, 60, 51, 61};
++            t.IsTrue(trace == expected, "the woken higher-priority thread should run before the waker resumes");
++        });
++
+         tc.Run("semaphore waiters are FIFO and signal transfers one token directly", [](TestCase &t)
+         {
+             TestEnv env;
+-- 
+2.54.0 (Apple Git-157)
+

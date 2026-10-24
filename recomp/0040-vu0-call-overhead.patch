@@ -1,0 +1,223 @@
+From ed7f9699c91d8535e3cc54ab31a7b156b9ab09fc Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 19:11:20 +0300
+Subject: [PATCH] Make a VU0 macro call cheaper: no reset, clear only what is
+ in use
+
+---
+ ps2xRuntime/include/runtime/ps2_vu1.h      |  2 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |  3 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp    | 27 ++++++-----
+ ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp | 14 +++++-
+ ps2xTest/src/ps2_vu1_program_tests.cpp     | 15 ++++++
+ ps2xTest/src/ps2_vu1_tests.cpp             | 54 ++++++++++++++++++++++
+ 6 files changed, 102 insertions(+), 13 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 1cd154a..083f36b 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -254,6 +254,8 @@ private:
+     // Cycle at which each VF lane / VI register / ACC lane write becomes
+     // readable by a following instruction.
+     std::array<uint64_t, kReadySlotCount> m_ready{};
++    // The latest cycle in m_ready, so a reset only clears it when one is still ahead.
++    uint64_t m_readyHorizon = 0;
+     std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
+     std::array<uint64_t, 16> m_viLatestWrite{};
+     std::array<uint64_t, 4> m_accLatestWrite{};
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f105040..086473b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1477,7 +1477,8 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+         return;
+     }
+ 
+-    m_vu0->reset();
++    // The context holds all of VU0's state, and execute() starts the
++    // pipelines empty, so the unit needs no reset per call.
+     copyVu0ContextToState(ctx, m_vu0->state());
+     m_vu0->execute(vu0Code, PS2_VU0_CODE_SIZE,
+                   vu0Data, PS2_VU0_DATA_SIZE,
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index 6761303..1491e86 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -46,19 +46,20 @@ namespace
+ 
+ void VU1Interpreter::resetScheduler()
+ {
+-    m_flagPipeline = {};
++    // Runs on every VU0 macro call, so it only clears what is in use. Pipeline
++    // entries are read only while their mask bit is set, and claiming one
++    // fills it in, so clearing the masks empties the pipelines.
++    // A ready cycle that has passed reads like a cleared one.
++    if (m_readyHorizon > m_cycle)
++    {
++        m_ready = {};
++        m_readyHorizon = 0;
++    }
++    // The latest-write sequences stay: a write that lands compares them with
++    // its own, which it set when it queued.
+     m_fdiv = {};
+     m_efu = {};
+-    m_storePipeline = {};
+     m_xgkick = {};
+-    m_vfWritePipeline = {};
+-    m_viWritePipeline = {};
+-    m_accWritePipeline = {};
+-    m_ready = {};
+-    m_vfLatestWrite = {};
+-    m_viLatestWrite = {};
+-    m_accLatestWrite = {};
+-    m_nextWriteSequence = 0;
+     m_efuResourceReady = 0;
+     m_nextCommitCycle = std::numeric_limits<uint64_t>::max();
+     m_flagMask = 0;
+@@ -675,7 +676,11 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+ {
+     for (uint32_t index = 0; index < decoded.writeSlotCount; ++index)
+-        m_ready[decoded.writeSlots[index]] = m_cycle + decoded.writeLatencies[index];
++    {
++        const uint64_t ready = m_cycle + decoded.writeLatencies[index];
++        m_ready[decoded.writeSlots[index]] = ready;
++        m_readyHorizon = std::max(m_readyHorizon, ready);
++    }
+ }
+ 
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+index 767bddc..9127aac 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+@@ -201,6 +201,7 @@ void Access::pendVf(VU1Interpreter &vu, uint8_t reg, uint8_t lanes, uint64_t rea
+             vu.m_vfLatestWrite[reg][component] = write.sequence;
+             vu.m_ready[VU1Interpreter::kReadyVfBase + reg * 4u + component] = ready;
+         }
++    vu.m_readyHorizon = std::max(vu.m_readyHorizon, ready);
+ }
+ 
+ void Access::pendVi(VU1Interpreter &vu, uint8_t reg, uint64_t ready)
+@@ -217,6 +218,7 @@ void Access::pendVi(VU1Interpreter &vu, uint8_t reg, uint64_t ready)
+     write.value = vu.m_state.vi[reg];
+     vu.m_viLatestWrite[reg] = write.sequence;
+     vu.m_ready[VU1Interpreter::kReadyViBase + reg] = ready;
++    vu.m_readyHorizon = std::max(vu.m_readyHorizon, ready);
+ }
+ 
+ void Access::pendFlags(VU1Interpreter &vu, uint64_t issue, uint32_t mac, uint32_t status,
+@@ -438,8 +440,18 @@ void Run::handBack()
+                           fmac ? statusOf(entry.sticky) : 0u, (entry.writes & 8u) != 0u ? entry.value : 0u,
+                           static_cast<uint8_t>(entry.writes));
+     }
+-    for (uint8_t reg = 1u; reg < 32u; ++reg)
++    // Few registers have a write in flight, so find those first.
++    uint32_t inFlight = 0u;
++    for (uint32_t reg = 1u; reg < 32u; ++reg)
+     {
++        const auto &ready = m_vfReady[reg];
++        const uint32_t last = std::max(std::max(ready[0], ready[1]), std::max(ready[2], ready[3]));
++        inFlight |= static_cast<uint32_t>(last > m_cycle) << reg;
++    }
++    while (inFlight != 0u)
++    {
++        const auto reg = static_cast<uint8_t>(std::countr_zero(inFlight));
++        inFlight &= inFlight - 1u;
+         // Lanes written by one pair share a result cycle and an entry.
+         uint8_t done = 0u;
+         for (uint32_t component = 0; component < 4u; ++component)
+diff --git a/ps2xTest/src/ps2_vu1_program_tests.cpp b/ps2xTest/src/ps2_vu1_program_tests.cpp
+index 86f53cc..6a63413 100644
+--- a/ps2xTest/src/ps2_vu1_program_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_program_tests.cpp
+@@ -299,6 +299,21 @@ namespace
+         const std::vector<uint8_t> finalData(oracle.data(), oracle.data() + oracle.dataSize());
+         const auto finalPackets = oracle.packets;
+ 
++        // A VU0 macro call or an MSCAL starts the next program without a reset,
++        // so the same program again on the same unit ends the same, its clock aside.
++        const uint64_t firstEnd = native.cycles();
++        native.vu.state() = initial;
++        std::memcpy(native.data(), data.data(), native.dataSize());
++        native.packets.clear();
++        native.start(entry.pc, kWideBudget);
++        VU1State again = native.vu.state();
++        again.cycles -= firstEnd;
++        if (!check(t, std::memcmp(&again, &finalState, sizeof(VU1State)) == 0 &&
++                           std::memcmp(native.data(), finalData.data(), native.dataSize()) == 0 &&
++                           native.packets == finalPackets,
++                   describe(entry, kWideBudget, oracle) + ": a second run without a reset ends like the first"))
++            return;
++
+         // A budget the program outlasts stops it at a block boundary and the
+         // interpreter takes over; then the rest in uneven slices.
+         std::vector<uint64_t> budgets;
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 30918bc..c7640de 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1844,5 +1844,59 @@ void register_ps2_vu1_tests()
+             t.Equals(vu1.state().vi[1], 0,
+                      "instruction following a reserved opcode must not execute");
+         });
++
++        tc.Run("execute and reset start a program with nothing in flight", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++
++            // At 0: ILW.x vi2 and ADD.x vf3, both still in flight a cycle later.
++            // At 0x100: IADDIU vi3, vi2, 1 and ADD.x vf4, vf3, vf3, which read them, then E.
++            const uint32_t word = 7u;
++            std::memcpy(fx.data, &word, sizeof(word));
++            writeVuInstructionPair(fx.code, 0u, makeVuIlw(0x8u, 2u, 0u, 0), makeVuUpper(0x28u, 0x8u, 2u, 1u, 3u));
++            writeVuInstructionPair(fx.code, 0x100u, makeVuIaddiu(3u, 2u, 1),
++                                   makeVuUpper(0x28u, 0x8u, 3u, 3u, 4u) | 0x40000000u);
++            writeVuInstructionPair(fx.code, 0x108u, 0u, kVuUpperNop);
++
++            const auto runReader = [&](VU1Interpreter &vu)
++            {
++                vu.state().vf[1][0] = 1.0f;
++                vu.state().vf[2][0] = 2.0f;
++                vu.state().vf[3][0] = 10.0f;
++                vu.state().vi[2] = 5;
++                const uint64_t start = vu.state().cycles;
++                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                           0x100u, 0u, 0u, 64u);
++                return vu.state().cycles - start;
++            };
++            VU1Interpreter fresh;
++            const uint64_t freshCycles = runReader(fresh);
++            const auto matchesFresh = [&](VU1Interpreter &vu, uint64_t cycles, const char *what)
++            {
++                const std::string prefix = what;
++                t.Equals(vu.state().vf[4][0], 20.0f, prefix + ": ADD reads the VF value the program started with");
++                t.Equals(vu.state().vi[3], 6, prefix + ": IADDIU reads the VI value the program started with");
++                t.Equals(vu.state().vf[3][0], 10.0f, prefix + ": an earlier program's VF write never lands");
++                t.Equals(vu.state().vi[2], 5, prefix + ": an earlier program's VI write never lands");
++                t.Equals(cycles, freshCycles, prefix + ": nothing earlier stalls the program");
++            };
++
++            matchesFresh(fresh, freshCycles, "fresh unit");
++
++            // Stopped one cycle in, with both writes still pending.
++            VU1Interpreter interrupted;
++            interrupted.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                                0u, 0u, 0u, 1u);
++            matchesFresh(interrupted, runReader(interrupted), "after an interrupted program");
++
++            // Both writes landed, then a reset rewinds the clock to before their ready cycles.
++            VU1Interpreter rewound;
++            rewound.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                            0u, 0u, 0u, 16u);
++            t.Equals(rewound.state().vi[2], 7, "the first program's ILW lands within its budget");
++            rewound.reset();
++            matchesFresh(rewound, runReader(rewound), "after a reset");
++        });
+     });
+ }
+-- 
+2.54.0 (Apple Git-157)
+

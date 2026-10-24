@@ -1,0 +1,104 @@
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_display_rect.h b/ps2xRuntime/include/runtime/gs/ps2_display_rect.h
+new file mode 100644
+index 0000000..a60ddf1
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/ps2_display_rect.h
+@@ -0,0 +1,26 @@
++#pragma once
++
++// The PS2 scans its display area out over the whole TV picture whatever the
++// size of the buffer behind it (DISPLAY.MAGH/MAGV magnify it), e.g. a 512x512
++// buffer with MAGH=4 fills a 4:3 PAL screen. The host therefore shows the
++// presented buffer stretched to a picture of the TV's aspect ratio, fitted
++// into the window, instead of keeping the buffer's own pixel aspect.
++struct Ps2HostRect
++{
++    float x;
++    float y;
++    float width;
++    float height;
++};
++
++inline Ps2HostRect ps2FitDisplayRect(float windowWidth, float windowHeight, float aspect = 4.0f / 3.0f)
++{
++    float width = windowWidth;
++    float height = width / aspect;
++    if (height > windowHeight)
++    {
++        height = windowHeight;
++        width = height * aspect;
++    }
++    return {(windowWidth - width) * 0.5f, (windowHeight - height) * 0.5f, width, height};
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 99fcfc6..c1eb34f 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "runtime/gs/ps2_display_rect.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -2443,17 +2444,10 @@ void PS2Runtime::run()
+         ClearBackground(BLACK);
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+-        const float screenWidth = static_cast<float>(GetScreenWidth());
+-        const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
++        const Ps2HostRect picture = ps2FitDisplayRect(static_cast<float>(GetScreenWidth()),
++                                                      static_cast<float>(GetScreenHeight()));
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+-        const Rectangle dstRect{
+-            (screenWidth - dstWidth) * 0.5f,
+-            (screenHeight - dstHeight) * 0.5f,
+-            dstWidth,
+-            dstHeight};
++        const Rectangle dstRect{picture.x, picture.y, picture.width, picture.height};
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 60bf2f0..83d91bf 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -1,4 +1,5 @@
+ #include "MiniTest.h"
++#include <cmath>
+ #include "runtime/ps2_memory.h"
+ #include "ps2_runtime.h"
+ #include "ps2_stubs.h"
+@@ -6,6 +7,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "runtime/gs/ps2_display_rect.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
+@@ -441,6 +443,22 @@ void register_ps2_gs_tests()
+             t.Equals(mem.read32(kGsImr + 4u), 0x01234567u, "IMR high dword should match");
+         });
+ 
++        tc.Run("host picture keeps the TV aspect whatever the display buffer size", [](TestCase &t)
++        {
++            // A 512x512 PAL buffer (MAGH=4) covers the whole 4:3 screen; showing it
++            // with square pixels squeezed the picture into a 448x448 square.
++            const Ps2HostRect window = ps2FitDisplayRect(640.0f, 448.0f);
++            t.Equals(window.height, 448.0f, "a wide window should be filled vertically");
++            t.IsTrue(std::fabs(window.width - 448.0f * 4.0f / 3.0f) < 0.01f, "the picture should be 4:3");
++            t.IsTrue(std::fabs(window.x - (640.0f - window.width) * 0.5f) < 0.01f, "the picture should be centred horizontally");
++            t.Equals(window.y, 0.0f, "no vertical bars in a wide window");
++
++            const Ps2HostRect tall = ps2FitDisplayRect(800.0f, 900.0f);
++            t.Equals(tall.width, 800.0f, "a tall window should be filled horizontally");
++            t.Equals(tall.height, 600.0f, "the picture should keep 4:3 in a tall window");
++            t.Equals(tall.y, 150.0f, "the picture should be centred vertically");
++        });
++
+         tc.Run("GS interrupt line follows CSR events unmasked by IMR", [](TestCase &t)
+         {
+             PS2Memory mem;

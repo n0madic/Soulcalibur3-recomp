@@ -1,0 +1,451 @@
+From 2808eb18b67ffce1c2bc5093d50052655c72a669 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 11:10:15 +0300
+Subject: [PATCH] Cut a Ghidra map function with a far chunk at the next
+ function
+
+The Ghidra function CSV gives End as the highest address of a function's
+body. A body with a far chunk, typically a shared tail reached by a jump,
+therefore spans every function in between, and the recompiler decoded the
+whole span with an entry at every address: in Soulcalibur III
+FUN_003b6428 has Size 32 but End 0x3D2D08 and came out as 25,770
+instructions. 18 such functions added 0.31M instructions, and the six
+generated units holding the largest ones took 4 to 61 minutes each to
+compile.
+
+A body never runs into the start of another function, so when a span
+exceeds Size, end it at the next function start of the map (labels such
+as entry_ and caseD_ do not count). Bodies with only small holes (2,907
+in Soulcalibur III) have no function start in their span and keep their
+End.
+
+The long span also stood in for what Ghidra missed in it, so two things
+are kept explicitly. Runs of non-zero words in the cut-away part that no
+map entry covers become functions (code reached only through pointers,
+e.g. 0x40abd8, called by the ADX reader). A direct branch, jump or call
+from anywhere into the middle of another function in a cut span gets an
+entry there (e.g. JAL 0x406928 from 0x4069c8). Without either, the game
+stopped on a missing target and showed a black screen.
+---
+ ps2xRecomp/src/lib/elf_parser.cpp     | 236 ++++++++++++++++++++++++++
+ ps2xTest/src/ps2_recompiler_tests.cpp | 115 +++++++++++++
+ 2 files changed, 351 insertions(+)
+
+diff --git a/ps2xRecomp/src/lib/elf_parser.cpp b/ps2xRecomp/src/lib/elf_parser.cpp
+index 9d3b9f0..7d12729 100644
+--- a/ps2xRecomp/src/lib/elf_parser.cpp
++++ b/ps2xRecomp/src/lib/elf_parser.cpp
+@@ -23,6 +23,7 @@
+ #include <sstream>
+ #include <algorithm>
+ #include <cstring>
++#include <cstdio>
+ 
+ namespace
+ {
+@@ -34,6 +35,39 @@ namespace
+                name.rfind("DAT_", 0) == 0;
+     }
+ 
++    // Target of a direct jump, call or branch (J, JAL, the conditional branches and BC0/1/2).
++    bool DirectTransferTarget(uint32_t address, uint32_t word, uint32_t &target)
++    {
++        const uint32_t opcode = word >> 26;
++        if (opcode == 2u || opcode == 3u)
++        {
++            target = ((address + 4u) & 0xF0000000u) | ((word & 0x03FFFFFFu) << 2);
++            return true;
++        }
++        const uint32_t rs = (word >> 21) & 31u;
++        const uint32_t rt = (word >> 16) & 31u;
++        const bool branch = (opcode >= 4u && opcode <= 7u) || (opcode >= 20u && opcode <= 23u) ||
++                            (opcode == 1u && (rt <= 3u || (rt >= 16u && rt <= 19u))) ||
++                            ((opcode >= 16u && opcode <= 18u) && rs == 8u);
++        if (!branch)
++        {
++            return false;
++        }
++        const int32_t offset = static_cast<int32_t>(static_cast<int16_t>(word & 0xFFFFu)) * 4;
++        target = address + 4u + static_cast<uint32_t>(offset);
++        return true;
++    }
++
++    // Labels Ghidra exports next to functions: branch and jump-table targets inside a body.
++    bool IsGhidraLabelName(const std::string &name)
++    {
++        return name.rfind("entry_", 0) == 0 ||
++               name.rfind("caseD_", 0) == 0 ||
++               name.rfind("switchD_", 0) == 0 ||
++               name == "default" ||
++               name.rfind("LAB_", 0) == 0;
++    }
++
+     void AppendLoadSegmentsAsSections(const ELFIO::elfio &elf, std::vector<ps2recomp::Section> &sections)
+     {
+         const ELFIO::Elf_Half segCount = elf.segments.size();
+@@ -2142,6 +2176,9 @@ namespace ps2recomp
+         int skippedNonExecutable = 0;
+         int skippedInvalidRange = 0;
+         std::unordered_set<uint32_t> mapStarts;
++        // Starts of map functions other than labels, and the rows whose End lies past their Size.
++        std::vector<uint32_t> functionStarts;
++        std::vector<size_t> spanPastSize;
+         while (std::getline(file, line))
+         {
+             if (line.empty())
+@@ -2162,6 +2199,15 @@ namespace ps2recomp
+             {
+                 uint32_t start = std::stoul(startStr, nullptr, 0);
+                 uint32_t end = std::stoul(endStr, nullptr, 0);
++                uint32_t size = 0;
++                try
++                {
++                    size = std::stoul(sizeStr, nullptr, 0);
++                }
++                catch (...)
++                {
++                    size = 0; // an unreadable Size keeps the row with its End, as before
++                }
+ 
+                 const Section *section = FindFunctionSectionByAddress(m_sections, start);
+                 if (!section)
+@@ -2185,6 +2231,14 @@ namespace ps2recomp
+                 func.isStub = false;
+                 func.isSkipped = false;
+ 
++                if (!IsGhidraLabelName(name))
++                {
++                    functionStarts.push_back(start);
++                }
++                if (size != 0 && end - start > size)
++                {
++                    spanPastSize.push_back(m_extraFunctions.size());
++                }
+                 m_extraFunctions.push_back(std::move(func));
+                 mapStarts.insert(start);
+                 count++;
+@@ -2195,6 +2249,188 @@ namespace ps2recomp
+             }
+         }
+ 
++        // End is the highest address of a body, and a body can have a far chunk (e.g. a shared tail
++        // reached by a jump): its span then covers every function in between. A body never runs into
++        // the next function's start, so cut such a span there. Ghidra exports the far chunk's own label,
++        // so the jump out of the shortened body becomes a call. Bodies with only small holes have no
++        // function start inside their span and keep their End.
++        std::sort(functionStarts.begin(), functionStarts.end());
++        struct CutSpan
++        {
++            uint32_t start, cut, end;
++        };
++        std::vector<CutSpan> cutAway;
++        for (const size_t index : spanPastSize)
++        {
++            Function &func = m_extraFunctions[index];
++            const auto next = std::upper_bound(functionStarts.begin(), functionStarts.end(), func.start);
++            if (next != functionStarts.end() && *next < func.end)
++            {
++                cutAway.push_back({func.start, *next, func.end});
++                func.end = *next;
++            }
++        }
++
++        // The cut-away part can hold code that no map entry covers (functions Ghidra missed, often
++        // reached only through pointers). The long span used to recompile it, so keep each such run
++        // of non-zero words as a function of its own.
++        if (!cutAway.empty())
++        {
++            // Address ranges of the map's entries (labels included), merged. Analyzer functions do not
++            // count: the auto-named ones that are not in the map are dropped below.
++            std::vector<std::pair<uint32_t, uint32_t>> covered;
++            covered.reserve(m_extraFunctions.size());
++            for (const Function &func : m_extraFunctions)
++            {
++                if (mapStarts.contains(func.start))
++                {
++                    covered.emplace_back(func.start, func.end);
++                }
++            }
++            std::sort(covered.begin(), covered.end());
++            std::vector<std::pair<uint32_t, uint32_t>> merged;
++            for (const auto &range : covered)
++            {
++                if (!merged.empty() && range.first <= merged.back().second)
++                {
++                    merged.back().second = std::max(merged.back().second, range.second);
++                }
++                else
++                {
++                    merged.push_back(range);
++                }
++            }
++            auto isCovered = [&merged](uint32_t address)
++            {
++                auto it = std::upper_bound(merged.begin(), merged.end(), address,
++                                           [](uint32_t value, const std::pair<uint32_t, uint32_t> &range)
++                                           { return value < range.first; });
++                return it != merged.begin() && address < std::prev(it)->second;
++            };
++
++            std::vector<Function> orphans;
++            for (const CutSpan &span : cutAway)
++            {
++                const uint32_t from = span.cut, to = span.end;
++                // A run starts at its first non-zero word, so leading padding is left out.
++                uint32_t runStart = 0;
++                for (uint32_t address = from; address <= to; address += 4)
++                {
++                    const bool inRun = address < to && !isCovered(address);
++                    if (inRun)
++                    {
++                        if (runStart == 0 && readWord(address) != 0)
++                        {
++                            runStart = address;
++                        }
++                        continue;
++                    }
++                    if (runStart != 0 && !mapStarts.contains(runStart))
++                    {
++                        char orphanName[16];
++                        std::snprintf(orphanName, sizeof(orphanName), "FUN_%08x", runStart);
++                        Function orphan{};
++                        orphan.name = orphanName;
++                        orphan.start = runStart;
++                        orphan.end = address;
++                        orphans.push_back(orphan);
++                        mapStarts.insert(runStart);
++                    }
++                    runStart = 0;
++                }
++            }
++            for (Function &orphan : orphans)
++            {
++                m_extraFunctions.push_back(std::move(orphan));
++            }
++
++            // The long span made every address of it an entry. Once cut, a direct branch, jump or call
++            // from anywhere into the middle of another function there needs an entry of its own.
++            std::vector<std::pair<uint32_t, uint32_t>> owners; // functions and orphans, not labels
++            std::vector<std::pair<uint32_t, uint32_t>> entries; // every map range
++            for (const Function &func : m_extraFunctions)
++            {
++                if (!mapStarts.contains(func.start))
++                {
++                    continue;
++                }
++                entries.emplace_back(func.start, func.end);
++                if (!IsGhidraLabelName(func.name))
++                {
++                    owners.emplace_back(func.start, func.end);
++                }
++            }
++            std::sort(owners.begin(), owners.end());
++            std::sort(entries.begin(), entries.end());
++            // The range with the highest start at or below the address that contains it.
++            auto containing = [](const std::vector<std::pair<uint32_t, uint32_t>> &ranges, uint32_t address)
++                -> const std::pair<uint32_t, uint32_t> *
++            {
++                auto it = std::upper_bound(ranges.begin(), ranges.end(), address,
++                                           [](uint32_t value, const std::pair<uint32_t, uint32_t> &range)
++                                           { return value < range.first; });
++                while (it != ranges.begin())
++                {
++                    --it;
++                    if (address < it->second)
++                    {
++                        return &*it;
++                    }
++                    if (address - it->first > 0x200000u)
++                    {
++                        break;
++                    }
++                }
++                return nullptr;
++            };
++
++            std::vector<std::pair<uint32_t, uint32_t>> spans;
++            for (const CutSpan &span : cutAway)
++            {
++                spans.emplace_back(span.start, span.end);
++            }
++            std::sort(spans.begin(), spans.end());
++            std::vector<Function> crossTargets;
++            for (const Section &section : m_sections)
++            {
++                if (!section.isCode || !section.data)
++                {
++                    continue;
++                }
++                for (uint32_t offset = 0; offset + 4u <= section.size; offset += 4u)
++                {
++                    const uint32_t address = section.address + offset;
++                    uint32_t word = 0;
++                    std::memcpy(&word, section.data + offset, sizeof(word));
++                    uint32_t target = 0;
++                    if (!DirectTransferTarget(address, word, target) || mapStarts.contains(target) ||
++                        !containing(spans, target))
++                    {
++                        continue;
++                    }
++                    const auto *source = containing(owners, address);
++                    if (source && target >= source->first && target < source->second)
++                    {
++                        continue; // a branch inside one function stays a label
++                    }
++                    const auto *host = containing(entries, target);
++                    char entryName[16];
++                    // Named like Ghidra's labels: an auto-generated name inside a labelled range would be dropped.
++                    std::snprintf(entryName, sizeof(entryName), "entry_%08x", target);
++                    Function entry{};
++                    entry.name = entryName;
++                    entry.start = target;
++                    entry.end = host ? host->second : target + 4u;
++                    crossTargets.push_back(entry);
++                    mapStarts.insert(target);
++                }
++            }
++            for (Function &entry : crossTargets)
++            {
++                m_extraFunctions.push_back(std::move(entry));
++            }
++        }
++
+         if (count > 0)
+         {
+             m_hasLoadedGhidraMap = true;
+diff --git a/ps2xTest/src/ps2_recompiler_tests.cpp b/ps2xTest/src/ps2_recompiler_tests.cpp
+index 1cf42a8..e4557b6 100644
+--- a/ps2xTest/src/ps2_recompiler_tests.cpp
++++ b/ps2xTest/src/ps2_recompiler_tests.cpp
+@@ -156,6 +156,51 @@ static bool writeMinimalMipsElfWithJalFallbackTarget(const std::filesystem::path
+     return writer.save(elfPath.string());
+ }
+ 
++// A short function whose body ends with a jump to a shared tail further down, past another
++// function. Ghidra exports such a body with End at the end of the far chunk.
++static bool writeMinimalMipsElfWithSharedTail(const std::filesystem::path &elfPath)
++{
++    ELFIO::elfio writer;
++    writer.create(ELFIO::ELFCLASS32, ELFIO::ELFDATA2LSB);
++    writer.set_os_abi(ELFIO::ELFOSABI_NONE);
++    writer.set_type(ELFIO::ET_EXEC);
++    writer.set_machine(ELFIO::EM_MIPS);
++    writer.set_entry(0x00100000u);
++
++    ELFIO::section *text = writer.sections.add(".text");
++    text->set_type(ELFIO::SHT_PROGBITS);
++    text->set_flags(ELFIO::SHF_ALLOC | ELFIO::SHF_EXECINSTR);
++    text->set_addr_align(4);
++    text->set_address(0x00100000u);
++
++    const std::array<uint32_t, 14> textWords = {
++        0x27BDFFF0u, // 0x100000 addiu $sp, $sp, -16
++        0x08040008u, // 0x100004 j 0x00100020 (shared tail)
++        0x00000000u, // 0x100008 nop
++        0x0C040009u, // 0x10000C jal 0x00100024 (into the middle of the shared tail's range)
++        0x00000000u, // 0x100010 nop
++        0x03E00008u, // 0x100014 jr $ra
++        0x00000000u, // 0x100018 padding
++        0x27BDFFF0u, // 0x10001C addiu $sp, $sp, -16 (code Ghidra did not map)
++        0x03E00008u, // 0x100020 jr $ra (shared tail)
++        0x27BD0010u, // 0x100024 addiu $sp, $sp, 16
++        0x0C040004u, // 0x100028 jal 0x00100010 (from outside the span into a function's middle)
++        0x00000000u, // 0x10002C nop
++        0x03E00008u, // 0x100030 jr $ra
++        0x00000000u  // 0x100034 nop
++    };
++    text->set_data(reinterpret_cast<const char *>(textWords.data()),
++                   static_cast<ELFIO::Elf_Word>(textWords.size() * sizeof(uint32_t)));
++
++    ELFIO::segment *textSegment = writer.segments.add();
++    textSegment->set_type(ELFIO::PT_LOAD);
++    textSegment->set_flags(ELFIO::PF_R | ELFIO::PF_X);
++    textSegment->set_align(0x1000);
++    textSegment->add_section_index(text->get_index(), text->get_addr_align());
++
++    return writer.save(elfPath.string());
++}
++
+ static bool writeMinimalMipsElfWithVuMicroprogramSection(const std::filesystem::path &elfPath)
+ {
+     ELFIO::elfio writer;
+@@ -1752,6 +1797,76 @@ void register_ps2_recompiler_tests()
+             std::filesystem::remove(mapPath, removeError);
+         });
+ 
++        tc.Run("ghidra map cuts a span with a far chunk at the next function", [](TestCase &t) {
++            const auto uniqueSuffix = std::to_string(
++                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
++            const std::filesystem::path elfPath =
++                std::filesystem::temp_directory_path() / ("ps2recomp-ghidra-size-" + uniqueSuffix + ".elf");
++            const std::filesystem::path mapPath =
++                std::filesystem::temp_directory_path() / ("ps2recomp-ghidra-size-" + uniqueSuffix + ".csv");
++
++            const bool writeOk = writeMinimalMipsElfWithSharedTail(elfPath);
++            t.IsTrue(writeOk, "temporary ELF should be generated");
++            if (!writeOk)
++            {
++                return;
++            }
++
++            ElfParser parser(elfPath.string());
++            const bool parseOk = parser.parse();
++            t.IsTrue(parseOk, "generated ELF should parse");
++
++            std::ofstream mapFile(mapPath);
++            t.IsTrue(static_cast<bool>(mapFile), "ghidra map file should be writable");
++            if (!parseOk || !mapFile)
++            {
++                std::error_code removeError;
++                std::filesystem::remove(elfPath, removeError);
++                std::filesystem::remove(mapPath, removeError);
++                return;
++            }
++            // As exported by Ghidra: End is the highest address of the body, Size counts only its
++            // bytes. FUN_00100000 has 12 local bytes and the far chunk at 0x100020; FUN_0010000c has
++            // a hole of 4 bytes and only a label inside its span; nothing covers 0x100018..0x100020.
++            mapFile << "Name,Start,End,Size\n";
++            mapFile << "FUN_00100000,0x00100000,0x00100028,20\n";
++            mapFile << "FUN_0010000c,0x0010000C,0x00100018,8\n";
++            mapFile << "entry_00100014,0x00100014,0x00100018,4\n";
++            mapFile << "entry_00100020,0x00100020,0x00100028,?\n";
++            mapFile << "FUN_00100028,0x00100028,0x00100038,16\n";
++            mapFile.close();
++
++            t.IsTrue(parser.loadGhidraFunctionMap(mapPath.string()), "ghidra map should load");
++
++            const auto functions = parser.extractFunctions();
++            auto endOf = [&functions](uint32_t start) -> uint32_t
++            {
++                const auto it = std::find_if(functions.begin(), functions.end(),
++                                             [start](const Function &fn)
++                                             { return fn.start == start; });
++                return it == functions.end() ? 0u : it->end;
++            };
++
++            t.Equals(endOf(0x00100000u), 0x0010000Cu,
++                     "a span with a far chunk must end at the next function's start, not at End");
++            t.Equals(endOf(0x0010000Cu), 0x00100018u,
++                     "a body with a hole and no function start inside keeps its End");
++            t.Equals(endOf(0x00100020u), 0x00100028u,
++                     "the shared tail stays a function, and an unreadable size keeps its End");
++            t.Equals(endOf(0x0010001Cu), 0x00100020u,
++                     "code that only the cut span covered stays a function of its own");
++            t.Equals(endOf(0x00100018u), 0u,
++                     "zero padding left by the cut does not become a function");
++            t.Equals(endOf(0x00100024u), 0x00100028u,
++                     "a call from one function into the middle of another inside the cut span gets an entry");
++            t.Equals(endOf(0x00100010u), 0x00100018u,
++                     "so does a call from outside the span into a function's middle there");
++
++            std::error_code removeError;
++            std::filesystem::remove(elfPath, removeError);
++            std::filesystem::remove(mapPath, removeError);
++        });
++
+         tc.Run("elf parser discovers address-taken callbacks in stripped ELFs", [](TestCase &t) {
+             const auto uniqueSuffix = std::to_string(
+                 static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,51 @@
+# Only port sources and tooling belong in this repository.
+# New files/directories stay local until explicitly allowed below.
+/*
+!/.gitignore
+!/AGENTS.md
+!/CLAUDE.md
+!/Makefile
+!/README.md
+!/recomp/
+
+/recomp/*
+!/recomp/[0-9][0-9][0-9][0-9]-*.patch
+!/recomp/PS2Recomp.commit
+!/recomp/parallel-gs.commit
+!/recomp/README.md
+!/recomp/build.sh
+!/recomp/ghidra_export.sh
+!/recomp/pointer_entries.py
+!/recomp/sc3.toml
+!/recomp/skip_intro.toml
+!/recomp/debug/
+!/recomp/ghidra_scripts/
+!/recomp/parallel-gs/
+
+/recomp/debug/*
+!/recomp/debug/diagnostics-*.patch
+/recomp/ghidra_scripts/*
+!/recomp/ghidra_scripts/*.java
+/recomp/parallel-gs/*
+!/recomp/parallel-gs/*.patch
+
+# Original game files, local checkouts, generated code, VU recordings,
+# dependencies, captures, analysis projects and build outputs stay here.
+/recomp/work/
+
+# Local caches and editor/OS temporary files, including allowed directories.
+**/__pycache__/
+**/.cache/
+**/.ccache/
+**/CMakeFiles/
+**/node_modules/
+*.py[cod]
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+.DS_Store
+._*

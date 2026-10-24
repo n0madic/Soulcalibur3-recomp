@@ -1,0 +1,24 @@
+
+# Skip the start-up screens (appended to the config by build.sh unless SKIP_INTRO=0).
+#
+# 1. Scene 1 (boot) requests scene 34 ("OptCS", a modal display-option dialog that waits for a pad
+#    button and draws nothing in this runtime). Request scene 35 (the scene that follows it) instead.
+#    0x198e8c: li $a0, 0x22  ->  li $a0, 0x23
+[[patches.instructions]]
+address = "0x198e8c"
+value = "0x24040023"
+
+# 2. The attract-mode step chooser (FUN_0019a9e0, called by scene 29 after the Sofdec/ADX logos) starts the
+#    cycle with the intro movie: it requests scene 30. Playback needs ENABLE_FFMPEG=ON and patches
+#    0054-0060. When the movie ends, scene 30 requests scene 49 (0x31); request that one directly.
+#    0x19aa84 (delay slot of the "jal 0x197878" set-next-scene call): li $a0, 0x1e  ->  li $a0, 0x31
+[[patches.instructions]]
+address = "0x19aa84"
+value = "0x24040031"
+
+# 3. Scene 49 (notice screen) is followed by scene 12, which plays the main opening movie (same scene
+#    functions as scene 30). When that movie ends the game requests scene 6; request that one directly.
+#    0x1995cc: li $a0, 0xc  ->  li $a0, 6
+[[patches.instructions]]
+address = "0x1995cc"
+value = "0x24040006"

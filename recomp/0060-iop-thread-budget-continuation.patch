@@ -1,0 +1,80 @@
+From b781d3b7ad35eed59297d08660d7103fb0857b63 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:50:20 +0300
+Subject: [PATCH] IOP: preserve the running thread across host instruction
+ budgets
+
+The IOP scheduler reselected the lowest thread ID at every execution
+budget boundary. An older ready thread could therefore preempt a running
+thread of equal priority, including between the two channels of CRI's
+PCM queue operations.
+
+This makes the EE receive unequal left/right free-space acknowledgements.
+The native stereo decoder sizes both outputs from the left queue and can
+then overwrite the right queue before SIF transmits it. Captures show
+right-channel samples from the next 8192-frame ring generation while the
+left channel and both decoder outputs remain correct.
+
+Remember the last selected thread across host slices. Continue it while
+ready unless it yielded or a higher-priority thread is ready; also retain
+it while interrupts are suspended. Look up the ID instead of retaining a
+pointer so deleted threads and IOP resets cannot leave a dangling owner.
+
+The clean runtime and local game runner build. A manual THX capture has
+1576 paired producer commits with zero size mismatches, and both output
+channels remain aligned with the source through the loud ending. No new
+tests or diagnostic code are included.
+---
+ ps2xIOP/src/emulator/core/iop_kernel.cpp | 17 +++++++++++++++++
+ ps2xIOP/src/emulator/core/iop_kernel.h   |  1 +
+ 2 files changed, 18 insertions(+)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..dff2c5d 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -32,6 +32,7 @@ namespace ps2x::iop::detail
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
+         m_currentThread = nullptr;
++        m_continuationThreadId = 0;
+     }
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+@@ -689,6 +690,22 @@ namespace ps2x::iop::detail
+         if (next == nullptr)
+             return nullptr;
+ 
++        // Exhausting a host instruction budget is not a guest yield. Keep the
++        // running thread ahead of equal-priority peers, even if an older thread
++        // became ready during the slice. Interrupt suspension also protects it
++        // from higher-priority preemption until the critical section ends.
++        const auto continuation = m_threads.find(m_continuationThreadId);
++        if (continuation != m_threads.end() && continuation->second.state == IopThreadState::Ready)
++        {
++            IopThread &previous = continuation->second;
++            if (m_memory.interruptControl() == 0u ||
++                (!previous.cpu.yielded && previous.priority <= next->priority))
++            {
++                next = &previous;
++            }
++        }
++
++        m_continuationThreadId = next->id;
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+         next->cpu.stopped = false;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..d84a0bb 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -99,5 +99,6 @@ namespace ps2x::iop::detail
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+         IopThread *m_currentThread = nullptr;
++        int m_continuationThreadId = 0;
+     };
+ }
+-- 
+2.54.0 (Apple Git-157)
+

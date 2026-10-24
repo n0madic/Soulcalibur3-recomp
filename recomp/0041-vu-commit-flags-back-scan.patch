@@ -1,0 +1,73 @@
+From 1816e450a06e0e14d904e561c9e7de9d196ef104 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 20:31:50 +0300
+Subject: [PATCH] Commit compiled-routine flags without a branch per result
+
+---
+ ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp | 43 +++++++++++++++-------
+ 1 file changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+index 9127aac..ca357ee 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+@@ -320,27 +320,42 @@ Run::PendingFlags *Run::commitFlags(PendingFlags *head, PendingFlags *tail, uint
+     if (end == head)
+         return head;
+ 
+-    // Usually every one is an FMAC result: the last sets MAC and the current
+-    // status bits, and all of them add to the sticky bits. That loop vectorizes.
+-    uint32_t conditions = 0u, other = 0u;
+-    for (const PendingFlags *entry = head; entry != end; ++entry)
++    // Without an FSSET in the queue, the usual case, MAC, CLIP and the current
++    // status bits keep their last writer's value, found from the back, and the
++    // sticky bits collect every FMAC result in a pass that vectorizes. FMAC and
++    // CLIP results interleave, so a pass that branches on each one mispredicts.
++    if (m_fssetQueued == 0u)
+     {
+-        conditions |= entry->value | entry->sticky;
+-        other |= entry->writes ^ 3u;
+-    }
+-    if (other == 0u)
+-    {
+-        const uint32_t now = statusOf(end[-1].value);
+-        m_state.mac = end[-1].value;
+-        m_state.status = (m_state.status & 0xFF0u) | now | ((now | statusOf(conditions)) << 6u);
++        uint32_t conditions = 0u, writes = 0u;
++        for (const PendingFlags *entry = head; entry != end; ++entry)
++        {
++            const uint32_t fmac = 0u - ((entry->writes >> 1u) & 1u);
++            conditions |= (entry->value | entry->sticky) & fmac;
++            writes |= entry->writes;
++        }
++        const auto last = [end](uint32_t write)
++        {
++            const PendingFlags *entry = end - 1;
++            while ((entry->writes & write) == 0u)
++                --entry;
++            return entry->value;
++        };
++        if ((writes & 1u) != 0u)
++            m_state.mac = last(1u);
++        if ((writes & 8u) != 0u)
++            m_state.clip = last(8u);
++        if ((writes & 2u) != 0u)
++        {
++            const uint32_t now = statusOf(last(2u));
++            m_state.status = (m_state.status & 0xFF0u) | now | ((now | statusOf(conditions)) << 6u);
++        }
+         return end;
+     }
+ 
+     // MAC and CLIP keep the last result; the sticky bits collect every FMAC
+     // result until an FSSET, so status is folded once per run of those.
+     uint32_t mac = m_state.mac, status = m_state.status, clip = m_state.clip;
+-    uint32_t current = 0u;
+-    conditions = 0u;
++    uint32_t current = 0u, conditions = 0u;
+     bool pending = false;
+     const auto fold = [&] {
+         const uint32_t now = statusOf(current);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,64 @@
+From 3bcee580e6e925e3c7e21d96454d3220c50ae938 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Sat, 24 Oct 2026 09:42:33 +0300
+Subject: [PATCH] GS: finalize DMA packet counts only at termination
+
+HLE append helpers previously refreshed inline QWC eagerly. Native sceGifPkTerminate adds the same payload length when mixed with HLE helpers, doubling the count and walking into GIF data as DMA tags. Soulcalibur III movie chains used CNT QWC 6 instead of 3 and ended before their image references.
+
+Match the guest additive finalization and leave pending QWC untouched until termination. This supports both complete HLE builders and mixed native/HLE construction.
+---
+ ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index cc6c54f..c16187d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -122,7 +122,7 @@ namespace ps2_stubs
+             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+         }
+ 
+-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
++        void finalizePacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
+         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr);
+ 
+         void initPacketBuilderState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -158,6 +158,7 @@ namespace ps2_stubs
+             }
+ 
+             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
++            finalizePacketBuilderPendingCount(rdram, runtime, stateAddr);
+             writeGuestBytes(rdram,
+                             runtime,
+                             stateAddr + 8u,
+@@ -227,7 +228,7 @@ namespace ps2_stubs
+                             sizeof(temp));
+         }
+ 
+-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr)
++        void finalizePacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr)
+         {
+             uint32_t currentAddr = 0u;
+             uint32_t pendingCountAddr = 0u;
+@@ -252,14 +253,15 @@ namespace ps2_stubs
+                 deltaQwords = (deltaBytes >> 4u) - 1u;
+             }
+ 
+-            countWord = (countWord & 0xFFFF0000u) | (deltaQwords & 0xFFFFu);
+-            writeGuestU32(rdram, runtime, pendingCountAddr, countWord);
++            // The guest builder adds inline QWC once, when terminating the DMA tag.
++            // Guest code can terminate a tag opened by HLE (and vice versa), so
++            // updating it while appending data would count that payload twice.
++            writeGuestU32(rdram, runtime, pendingCountAddr, countWord + deltaQwords);
+         }
+ 
+         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
+         {
+             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
+-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
+         }
+ 
+         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
+-- 
+2.54.0 (Apple Git-157)
+
