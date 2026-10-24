@@ -5,7 +5,7 @@ Tool: [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) at the commit in `PS
 
 ## Version control
 
-Git tracks the port tooling and progress: patches `0001`–`0060`, dependency commit pins, build and analysis scripts, recompiler configuration/address metadata, and this documentation. The root `.gitignore` allows only those source locations; add new source paths there deliberately.
+Git tracks the port tooling and progress: patches `0001`–`0062`, dependency commit pins, build and analysis scripts, recompiler configuration/address metadata, and this documentation. The root `.gitignore` allows only those source locations; add new source paths there deliberately.
 
 Original game data is supplied locally. The disc image, extracted ELF/IRX/assets, generated game C++, recorded VU microcode, audio/video/frame or memory dumps, Ghidra projects, cloned dependencies, build products and caches are excluded. `recomp/work/` is entirely local; paths to investigation evidence below refer to that untracked directory. No original game binaries or assets are included in the repository.
 
@@ -93,6 +93,8 @@ Files:
 | `0059-mpeg-native-ipu-presentation.patch` | **Remove silent PCM inserted upstream of SPU2.** Native IPU users already schedule display through Sofdec/ADX. The HLE GetPicture wait assumed 59.94 Hz fields and limited 29.97 fps video to 25 fps on PAL, blocking the shared SFD demux until audio ran short. Skip that wait for native toIPU input; retain it for HLE AddBs/PSS input. The affected THX passage has **25 silent spans before, 0 after**, and the PCM stays aligned with the source ADX. |
 | `0060-iop-thread-budget-continuation.patch` | **Keep stereo PCM queues synchronized.** An IOP instruction budget incorrectly reselected the lowest ready thread ID, allowing an older thread of the same priority to preempt between left/right queue operations. CRI then acknowledged unequal free space; its native stereo decoder sized both outputs from the left queue and overwrote unsent right-channel samples. Preserve the current ready thread across host budgets, while respecting guest yields, higher priorities and interrupt suspension. A manual THX capture has **1576 paired producer commits, 0 length mismatches**; both channels remain aligned through the loud ending. |
 | `parallel-gs.commit`, `parallel-gs/*.patch` | The tested paraLLEl-GS commit (cloned with its Granite/volk/Vulkan-Headers submodules by `build.sh`) and a Granite fix for macOS (no `clock_nanosleep`). |
+| `0061-mpeg-active-ipu-decoder.patch` | **Fixes the freeze when entering a main-menu mode.** The menu creates two Sofdec players, then starts the first. The native IPU sink was captured by the last `sceMpegCreate`, so the first player's `sceMpegGetPicture` waited forever while eight decoded pictures filled the idle second player's queue. Select the native decoder when it requests a picture, hold toIPU DMA until one is selected, preserve its running state on CHCR polls, and resume pending input before decoding. Reset/recreation releases ownership; another decoder can acquire it after deletion. A deterministic run now reaches character selection, the story and a Zasalamel/Ivy battle. Includes a two-decoder regression with synthetic MPEG-2 input. |
+| `0062-pad-separate-player-input.patch` | **Independent controls in VS Battle.** The backend ignored the PS2 port and mirrored gamepad 0 and the same keys to both fighters. Route host gamepad 0/1 to PS2 port 0/1, preserve the P1 keys, and give P2 a disjoint keyboard layout. The runtime-less stub fallback uses the same routing. Regression tests cover every keyboard binding, both controllers' buttons/sticks with all connection combinations, and unsupported ports/slots. |
 | `skip_intro.toml` | Instruction patches that skip the start-up dialog and the two movies (appended by `build.sh`; `SKIP_INTRO=0` disables). |
 | `build.sh` | End-to-end build script. |
 | `ghidra_export.sh`, `ghidra_scripts/` | Ghidra import/export and analysis helpers (see below). |
@@ -171,6 +173,34 @@ In the manual A/B captures, retaining only interrupt-disabled execution delayed 
 A separate **60 s menu run** reaches scene 7 after temporarily skipping the movies and injecting Start. Its 1888 native stereo decoder calls supply 38.25 s of reference PCM. In the sampled music passages (source seconds 6–36), both SPU2 output channels correlate above **0.99999996** with that reference after a constant gain. The comparison accounts for 28 decoded samples omitted from playback at one shared boundary; there is no independent right-channel ring-generation jump. Results are in `0060-production-menu-waveform-result.txt`. Movie skips, input changes and decoder probes are then restored, and the normal runner rebuilt. The final diagnostic-free runner has the same production source used for the natural movie capture.
 
 The existing kernel section of `debug/diagnostics-full.patch` is rebased onto `0060`. Its other applicability failures, and those in the loader/scene diagnostics, also occur on the unchanged `0059` parent; `diagnostics-vu1-verify.patch` applies. These optional diagnostic patches are not used by a normal build. No automated tests were added or run.
+
+## Two-player controls (`0062`)
+
+VS Battle now reads independent input for PS2 ports 0 and 1. Host gamepad #1 controls P1; host gamepad #2 controls P2. A missing controller leaves its own port idle unless that player's keyboard keys are pressed. Port assignments use host controller indices, with no fallback to the first available controller; the remaining controller is never reused for both players. Keyboard and controller input are merged only within the same player's port.
+
+| Action | P1 keyboard | P2 keyboard |
+| --- | --- | --- |
+| Up / left / down / right | Arrow keys or W / A / S / D | I / J / K / L |
+| Square / Cross / Circle / Triangle | Z / X / C / V | F / G / H / T |
+| L1 / R1 | Q / E | R / Y |
+| L2 / R2 | Left Shift / Right Shift | U / O |
+| Start / Select | Enter / Tab | Backspace (Delete on Mac) / Right Control |
+
+P1 also retains Space = Cross, Escape = Circle, keypad 0 = Square, and keypad 1 = Triangle. Keys refer to the Latin keyboard layout. There is no remapping UI yet.
+
+Validation: all **17 pad tests pass**, including isolation of every key and both sticks/buttons with zero, one or two connected controllers. With the previous backend retained (only its test signature adapted), the three new tests fail, reproducing the shared-input bug. The full CPU-GS suite runs **529 tests: 527 pass, 2 fail**, with the same pre-existing VIF packet and MPEG callback failures documented below. Evidence stays local in `work/pad-investigation-2026-10-24/`. Both optional scene-state and VU verification patches apply after `0062`; the scene diagnostic's automatic input is restricted to P1 and remains disabled in a normal build. The production runner rebuilds and starts normally with no `TEMP-DEBUG`/`VIFDBG` strings. Physical two-controller VS Battle play has not been verified; the routing checks use fake host inputs.
+
+## Main-menu freeze (`0061`)
+
+Reproduced 2026-10-24 with Start at 20 s and Cross at 25 s after the first pad poll (startup movies temporarily skipped only in the diagnostic build). The menu creates MPEG work areas `0x1221c78` and `0x1429358`; it starts the first one. Before the fix, native toIPU DMA fed the second work area because `sceMpegCreate` captured its address in the sink. Eight pictures queued there while GetPicture on the first repeatedly invoked Nodata without receiving any. Scene 7 stopped at logic tick 273; VSync, IOP audio and the host window continued. This is separate from the IOP scheduling fix in `0060`.
+
+The IPU sink now reads an explicit active decoder ID, selected by native `sceMpegGetPicture`. Before that call, backpressure keeps a submitted DMA pending instead of delivering it to an idle preallocated player. GetPicture selects its work area and resumes the pending transfer before checking the picture queue. Native toIPU CHCR reads now preserve the start bit while a transfer is stalled; the generic DMA read path incorrectly cleared it on every poll. Creating another player does not steal ownership; resetting or recreating the active player releases it. The sink is reinstalled when a surviving player requests a picture after deletion of the old owner. HLE AddBs/PSS streams retain their presentation pacing.
+
+The same input sequence passes the formerly frozen menu, reaches scene 11 (character selection), then scene 8 (Tales of Souls story and battle). Captured frames show Zasalamel fighting Ivy and continuing logic ticks. Evidence is local under `work/menu-investigation-2026-10-24/`: `menu-baseline.log`, `menu-fixed.log`, `menu-freeze.sample.txt`, `fixed-frames/`, and the final rerun `menu-final.log` / `final-frames/` (frame 3801 shows the fight starting).
+
+Validation: the clean FFmpeg-enabled test build runs **526 tests: 524 pass, 2 fail**. The same two failures are present on the unchanged `0060` parent: `VIF1 packet builders keep chain qwc live before terminate` and `sceMpegDemuxPssRing dispatches registered video and audio stream callbacks` (its recreate/callback expectation). With the new regression retained but both production files reverted to `0060`, the two-decoder test fails as well (523 pass, 3 fail); with `0061` it decodes the first player's synthetic 32x32 frame and passes. The 37 synthetic VU program images/50 entries are included in this run. This build uses the CPU GS, so GPU-specific checks are skipped. Logs: `tests-fixed3.log` and `tests-parent.log`.
+
+The local runner also contained old optional investigation probes in runtime, IOP and generated game code. These were removed from the live build: no `TEMP-DEBUG`, `VIFDBG`, temporary automatic pad input, per-draw histograms or audio counters remain. The production patch series already excluded these probes, so their cleanup does not add another runtime patch. Optional diagnostics remain available in `debug/`. Startup movie skips and test input changes used for reproduction were restored before the normal runner was rebuilt. The final executable contains neither `TEMP-DEBUG` nor `VIFDBG` strings; the ordinary startup log also contains zero occurrences.
 
 ## Compiled VU microprograms
 

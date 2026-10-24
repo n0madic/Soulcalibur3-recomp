@@ -491,14 +491,14 @@ index 8590f14..21c5405 100644
  #include "runtime/ps2_pad.h"
  #include "ps2_host_backend.h"
  #include <cstring>
-@@ -119,6 +120,12 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
-             clearBit(PAD_SELECT);
+@@ -132,6 +133,12 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size, int port, int slot)
+         if (input.isKeyDown(KEY_RIGHT_CONTROL)) clearBit(PAD_SELECT);
      }
  
 +    { // TEMP-DEBUG autopress
 +        static const bool s_auto = std::getenv("PS2_AUTOPRESS") != nullptr;
 +        static uint32_t s_n = 0u;
-+        if (s_auto && (++s_n / 200u) % 6u == 3u)
++        if (port == 0 && s_auto && (++s_n / 200u) % 6u == 3u)
 +            btns &= static_cast<uint16_t>(~PAD_CROSS);
 +    }
      data[2] = static_cast<uint8_t>(btns & 0xFF);
