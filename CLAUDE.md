@@ -13,7 +13,8 @@ A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ra
 - `recomp/debug/*.patch` are diagnostics that are never applied by default.
   - `diagnostics-scene-state.patch`: frame dumps and the `[TEMP-DEBUG globals]` scene/tick line.
   - `diagnostics-vu1-verify.patch`: `PS2_VU_VERIFY=1` shadows each compiled VU run with the interpreter.
-- `recomp/sc3.toml` is the recompiler config, including the stub list that maps library functions to runtime HLE stubs. `recomp/skip_intro.toml` holds instruction patches that skip the option dialog and the movies.
+- `recomp/parallel-gs/` holds patches to the paraLLEl-GS clone in `work/deps/parallel-gs`: `*.patch` for its Granite submodule, `gs/*.patch` for paraLLEl-GS itself. `build.sh` applies them only when it clones.
+- `recomp/sc3.toml` is the recompiler config, including the stub list that maps library functions to runtime HLE stubs. `recomp/display_mode.toml` holds instruction patches that answer the display-mode dialog with PAL60 (`DISPLAY_DIALOG=1` keeps it), and `recomp/skip_intro.toml` those that skip the movies (`SKIP_INTRO=0` keeps them).
 - `recomp/work/` is local only and must never be committed:
   - `PS2Recomp/` is the patched working tree, which also carries uncommitted `TEMP-DEBUG` instrumentation.
   - `game/` is the extracted disc. The runner must be started from this directory.
@@ -78,7 +79,7 @@ PS2_TEST_REQUIRE_GPU=1 PS2_VU_PROGRAM_FIXTURES=<fixture dir> PS2_VU_REQUIRE_PROG
 - **Memory and hardware: `PS2Memory`.** It owns RAM, the I/O registers (an `unordered_map`), DMA, the VIF1 interpreter (`ps2_vif1_interpreter.cpp`) and the EE timers. The timer counters are brought up to date lazily, and Timer 3 counts H-blanks. GS privileged registers live in `GSRegisters`.
 - **Sound.** The game's own sound IRX modules run on the emulated IOP and drive the SPU2 emulation in `ps2xIOP` (`iop_spu2.cpp`, patches `0048`/`0049`), including AutoDMA for the ADX streams. Its output goes to a raylib `AudioStream`.
 - **Movies.** CRI Sofdec feeds its MPEG video bitstream to the IPU itself over the toIPU DMA (channel 4) and libmpeg's Nodata callback. `PS2Memory` hands that DMA to an IPU input sink, and the HLE `sceMpeg*` stubs decode it with FFmpeg (`0056`, `0061`, `0063`). Sofdec and ADX stream from disc in the ADX manager's idle thread, which needs `ResumeThread` to return the thread id (`0064`). Building with movies needs `ENABLE_FFMPEG=ON SKIP_INTRO=0 ./recomp/build.sh`.
-- **Graphics.** paraLLEl-GS (Vulkan via MoltenVK) is the default GS. `PS2_GS_BACKEND=cpu` selects the software GS.
+- **Graphics.** paraLLEl-GS (Vulkan via MoltenVK) is the default GS. `PS2_GS_BACKEND=cpu` selects the software GS. paraLLEl-GS publishes each vsync's picture one vsync later; the host window takes a picture only when a new one is published (`GS::latchNewHostPresentationFrame`, `0065`), not when the vsync tick changes. `PS2_GS_SSAA` (default 8, run as 4 on Apple GPUs) scans out at twice the resolution and replaces the game's final blit by its source (`0066`, which needs the paraLLEl-GS fix `recomp/parallel-gs/gs/0001` tested by `0068`); `PS2_GS_SSAA=1` gives the exact original picture. The window scales the picture with a bicubic shader (`PS2_HOST_FILTER`, `0067`).
 - **VU0/VU1.** There is an interpreter (`ps2xRuntime/src/lib/vu`), plus compiled routines. Microcode recorded with `PS2_VU_PROGRAM_PROFILE` is compiled into the runner by `tools/compile_vu_programs.py` (CMake `PS2X_VU_PROGRAM_PROFILES`). `ps2_vu_program::run` enters a compiled routine only from a drained pipeline. `Run::handBack` returns in-flight results to the interpreter in the interpreter's own view. `PS2_VU_EXECUTION=interpreter` disables the compiled routines.
 
 ## Measuring and debugging

@@ -1,0 +1,242 @@
+From 454dc1bf0992419b4e4a5aa6f19ae246eb713c54 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 17:24:39 +0200
+Subject: [PATCH] Runtime: bicubic scaling of the picture to the window
+
+The window showed the PS2 picture with raylib's default nearest-neighbour
+filter. The picture is rarely an integer fraction of the window (1024x1024
+or 1280x896 with super-sampling, stretched to 4:3), so pixels came out of
+uneven width. PS2_HOST_FILTER selects bicubic (default: a Catmull-Rom
+shader built from nine bilinear fetches), bilinear or nearest; the shader
+falls back to bilinear if it does not compile.
+---
+ .../include/runtime/gs/ps2_host_filter.h      | 63 +++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp           | 54 ++++++++++++++--
+ ps2xTest/src/ps2_gs_tests.cpp                 | 10 +++
+ 3 files changed, 122 insertions(+), 5 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/gs/ps2_host_filter.h
+
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_host_filter.h b/ps2xRuntime/include/runtime/gs/ps2_host_filter.h
+new file mode 100644
+index 0000000..69e0d28
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/ps2_host_filter.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <cstring>
++#include <optional>
++
++// How the host scales the PS2 picture to the window (PS2_HOST_FILTER). The picture is rarely an
++// integer fraction of the window, so nearest-neighbour gives pixels of uneven width and bilinear
++// blurs; bicubic (Catmull-Rom) stays sharp without either.
++enum class Ps2HostFilter
++{
++    Nearest,
++    Bilinear,
++    Bicubic,
++};
++
++inline std::optional<Ps2HostFilter> ps2ParseHostFilter(const char *value)
++{
++    if (!value)
++        return std::nullopt;
++    if (std::strcmp(value, "bicubic") == 0)
++        return Ps2HostFilter::Bicubic;
++    if (std::strcmp(value, "bilinear") == 0)
++        return Ps2HostFilter::Bilinear;
++    if (std::strcmp(value, "nearest") == 0)
++        return Ps2HostFilter::Nearest;
++    return std::nullopt;
++}
++
++// Catmull-Rom bicubic filter for raylib's default vertex shader (GLSL 330) and a bilinear-filtered,
++// edge-clamped texture: the 4x4 taps are folded into 9 bilinear fetches. textureSize is the texture's
++// size in texels.
++inline constexpr const char *kPs2BicubicFragmentShader = R"glsl(#version 330
++in vec2 fragTexCoord;
++in vec4 fragColor;
++uniform sampler2D texture0;
++uniform vec4 colDiffuse;
++uniform vec2 textureSize;
++out vec4 finalColor;
++void main()
++{
++    vec2 samplePos = fragTexCoord * textureSize;
++    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
++    vec2 f = samplePos - texPos1;
++    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
++    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
++    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
++    vec2 w3 = f * f * (-0.5 + 0.5 * f);
++    vec2 w12 = w1 + w2;
++    vec2 p0 = (texPos1 - 1.0) / textureSize;
++    vec2 p12 = (texPos1 + w2 / w12) / textureSize;
++    vec2 p3 = (texPos1 + 2.0) / textureSize;
++    vec4 c = texture(texture0, vec2(p0.x, p0.y)) * w0.x * w0.y
++           + texture(texture0, vec2(p12.x, p0.y)) * w12.x * w0.y
++           + texture(texture0, vec2(p3.x, p0.y)) * w3.x * w0.y
++           + texture(texture0, vec2(p0.x, p12.y)) * w0.x * w12.y
++           + texture(texture0, vec2(p12.x, p12.y)) * w12.x * w12.y
++           + texture(texture0, vec2(p3.x, p12.y)) * w3.x * w12.y
++           + texture(texture0, vec2(p0.x, p3.y)) * w0.x * w3.y
++           + texture(texture0, vec2(p12.x, p3.y)) * w12.x * w3.y
++           + texture(texture0, vec2(p3.x, p3.y)) * w3.x * w3.y;
++    finalColor = clamp(c, 0.0, 1.0) * colDiffuse * fragColor;
++}
++)glsl";
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f99ebe1..1534013 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_runtime.h"
+ #include "runtime/gs/ps2_display_rect.h"
++#include "runtime/gs/ps2_host_filter.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -380,8 +381,15 @@ namespace
+     }
+ }
+ 
++// The bicubic shader reads the texture through bilinear fetches and must not wrap at its edges.
++static void setFrameTextureFilter(const Texture2D &tex, Ps2HostFilter filter)
++{
++    SetTextureFilter(tex, filter == Ps2HostFilter::Nearest ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
++    SetTextureWrap(tex, TEXTURE_WRAP_CLAMP);
++}
++
+ // The texture takes each picture's size: a high-resolution scanout is larger than FB_WIDTH x FB_HEIGHT.
+-static void resizeFrameTexture(Texture2D &tex, uint32_t width, uint32_t height)
++static void resizeFrameTexture(Texture2D &tex, uint32_t width, uint32_t height, Ps2HostFilter filter)
+ {
+     if (static_cast<uint32_t>(tex.width) == width && static_cast<uint32_t>(tex.height) == height)
+         return;
+@@ -389,9 +397,10 @@ static void resizeFrameTexture(Texture2D &tex, uint32_t width, uint32_t height)
+     Image blank = GenImageColor(static_cast<int>(width), static_cast<int>(height), BLANK);
+     tex = LoadTextureFromImage(blank);
+     UnloadImage(blank);
++    setFrameTextureFilter(tex, filter);
+ }
+ 
+-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
++static void UploadFrame(Texture2D &tex, Ps2HostFilter filter, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
+     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
+@@ -421,7 +430,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                                                    &sourceFbp,
+                                                    &usedPreferredDisplaySource))
+     {
+-        resizeFrameTexture(tex, FB_WIDTH, FB_HEIGHT);
++        resizeFrameTexture(tex, FB_WIDTH, FB_HEIGHT, filter);
+         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+         UpdateTexture(tex, blank.data);
+         UnloadImage(blank);
+@@ -459,7 +468,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     s_lastHeight = height;
+ 
+     // copyLatchedHostPresentationFrame packs the rows, so the pixels fill a texture of the picture's size.
+-    resizeFrameTexture(tex, width, height);
++    resizeFrameTexture(tex, width, height, filter);
+     UpdateTexture(tex, s_scratch.data());
+     outWidth = width;
+     outHeight = height;
+@@ -2417,6 +2426,31 @@ void PS2Runtime::run()
+     // A blank image to use as a framebuffer
+     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+     Texture2D frameTex = LoadTextureFromImage(blank);
++
++    Ps2HostFilter hostFilter = Ps2HostFilter::Bicubic;
++    if (const char *name = std::getenv("PS2_HOST_FILTER"))
++    {
++        if (const std::optional<Ps2HostFilter> parsed = ps2ParseHostFilter(name))
++            hostFilter = *parsed;
++        else
++            std::cerr << "[host] unknown PS2_HOST_FILTER '" << name
++                      << "' (expected bicubic, bilinear or nearest), using bicubic" << std::endl;
++    }
++    Shader bicubicShader{};
++    int bicubicTextureSize = -1;
++    if (hostFilter == Ps2HostFilter::Bicubic)
++    {
++        bicubicShader = LoadShaderFromMemory(nullptr, kPs2BicubicFragmentShader);
++        bicubicTextureSize = GetShaderLocation(bicubicShader, "textureSize");
++        // raylib substitutes its default shader, which has no textureSize, when compiling fails.
++        if (bicubicTextureSize < 0)
++        {
++            std::cerr << "[host] the bicubic shader did not compile, using bilinear" << std::endl;
++            UnloadShader(bicubicShader);
++            hostFilter = Ps2HostFilter::Bilinear;
++        }
++    }
++    setFrameTextureFilter(frameTex, hostFilter);
+     UnloadImage(blank);
+ 
+     std::atomic<bool> gameThreadFinished{false};
+@@ -2479,7 +2513,7 @@ void PS2Runtime::run()
+         });
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+-        UploadFrame(frameTex, this, presentWidth, presentHeight);
++        UploadFrame(frameTex, hostFilter, this, presentWidth, presentHeight);
+ 
+         BeginDrawing();
+         ClearBackground(BLACK);
+@@ -2489,7 +2523,15 @@ void PS2Runtime::run()
+                                                       static_cast<float>(GetScreenHeight()));
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+         const Rectangle dstRect{picture.x, picture.y, picture.width, picture.height};
++        if (hostFilter == Ps2HostFilter::Bicubic)
++        {
++            const float textureSize[2] = {static_cast<float>(frameTex.width), static_cast<float>(frameTex.height)};
++            SetShaderValue(bicubicShader, bicubicTextureSize, textureSize, SHADER_UNIFORM_VEC2);
++            BeginShaderMode(bicubicShader);
++        }
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (hostFilter == Ps2HostFilter::Bicubic)
++            EndShaderMode();
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
+@@ -2516,6 +2558,8 @@ void PS2Runtime::run()
+         m_debugUiInitialized = false;
+     }
+     UnloadTexture(frameTex);
++    if (hostFilter == Ps2HostFilter::Bicubic)
++        UnloadShader(bicubicShader);
+     CloseWindow();
+ 
+     RUNTIME_LOG("[run] exiting loop");
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 4f0d037..6a7b0ae 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -8,6 +8,7 @@
+ #include "runtime/ee_scheduler.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "runtime/gs/ps2_display_rect.h"
++#include "runtime/gs/ps2_host_filter.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
+@@ -459,6 +460,15 @@ void register_ps2_gs_tests()
+             t.Equals(tall.y, 150.0f, "the picture should be centred vertically");
+         });
+ 
++        tc.Run("PS2_HOST_FILTER names the window scaling filter", [](TestCase &t)
++        {
++            t.IsTrue(ps2ParseHostFilter("bicubic") == Ps2HostFilter::Bicubic, "bicubic");
++            t.IsTrue(ps2ParseHostFilter("bilinear") == Ps2HostFilter::Bilinear, "bilinear");
++            t.IsTrue(ps2ParseHostFilter("nearest") == Ps2HostFilter::Nearest, "nearest");
++            t.IsFalse(ps2ParseHostFilter("lanczos").has_value(), "an unknown filter is rejected");
++            t.IsFalse(ps2ParseHostFilter("").has_value(), "an empty value is rejected");
++        });
++
+         tc.Run("GS interrupt line follows CSR events unmasked by IMR", [](TestCase &t)
+         {
+             PS2Memory mem;
+-- 
+2.54.0 (Apple Git-157)
+

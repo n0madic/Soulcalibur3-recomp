@@ -45,13 +45,14 @@ for dep in "${DEPS[@]}"; do
   DEP_FLAGS+=("-DFETCHCONTENT_SOURCE_DIR_${upper}=$WORK/deps/$name")
 done
 # paraLLEl-GS (LGPL-3.0+), the default GS renderer: Vulkan compute, MoltenVK on macOS
-# (brew install molten-vk vulkan-loader). Only the submodules its standalone build needs, plus a
-# macOS fix for Granite (no clock_nanosleep).
+# (brew install molten-vk vulkan-loader). Only the submodules its standalone build needs, a macOS
+# fix for Granite (no clock_nanosleep), and fixes to paraLLEl-GS itself (parallel-gs/gs/).
 if [ ! -d deps/parallel-gs ]; then
   git clone https://github.com/Arntzen-Software/parallel-gs.git deps/parallel-gs
   git -C deps/parallel-gs checkout "$(cat "$HERE/parallel-gs.commit")"
   (cd deps/parallel-gs && ./checkout_submodules.sh)
   for p in "$HERE"/parallel-gs/*.patch; do git -C deps/parallel-gs/Granite apply "$p"; done
+  for p in "$HERE"/parallel-gs/gs/*.patch; do git -C deps/parallel-gs apply "$p"; done
 fi
 DEP_FLAGS+=("-DPS2X_PARALLEL_GS_DIR=$WORK/deps/parallel-gs")
 # ccache (brew install ccache) for the ~2200 generated translation units: a regeneration rewrites
@@ -88,7 +89,11 @@ sed "s#GAME_DIR#$WORK/game#g" "$HERE/sc3.toml" > sc3.base.toml
 if [ -f "$WORK/ghidra-export/sc3_functions.csv" ]; then
   sed -i.bak "s#^ghidra_output = .*#ghidra_output = \"$WORK/ghidra-export/sc3_functions.csv\"#" sc3.base.toml
 fi
-# Start-up screens that the runtime cannot show yet (see skip_intro.toml); SKIP_INTRO=0 keeps them.
+# PAL60 without the display-mode dialog (see display_mode.toml); DISPLAY_DIALOG=1 keeps the dialog.
+if [ "${DISPLAY_DIALOG:-0}" != 1 ]; then
+  cat "$HERE/display_mode.toml" >> sc3.base.toml
+fi
+# The two start-up movies (see skip_intro.toml); SKIP_INTRO=0 keeps them (they need ENABLE_FFMPEG=ON).
 if [ "${SKIP_INTRO:-1}" = 1 ]; then
   cat "$HERE/skip_intro.toml" >> sc3.base.toml
 fi

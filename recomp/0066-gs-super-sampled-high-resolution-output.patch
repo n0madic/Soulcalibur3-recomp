@@ -1,0 +1,524 @@
+From 1760f97f7e428026443b3a3b8b2535c5f67f360e Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 16:49:38 +0200
+Subject: [PATCH] GS: super-sampled, double-resolution output with the game's
+ final blit replaced
+
+PS2_GS_SSAA (default 8; 1, 4, 8 or 16) sets paraLLEl-GS's super-sampling.
+paraLLEl-GS scans out one sample per pixel unless it scans out at twice the
+resolution, so any rate above 1 also enables high_resolution_scanout. Many
+games, Soulcalibur III among them, render into one buffer and blit it into
+the displayed one (here a 640x448 PSMCT32 buffer, blended into a 512x512
+PSMCT16 buffer with 27% of the previous picture); the samples would not
+survive that blit. With super-sampling the renderer therefore samples
+super-sampled textures per sample and enables paraLLEl-GS's
+backbuffer_promotion hack, which scans out the blit's source instead.
+PS2_GS_SSAA=1 keeps the exact display.
+
+The host keeps the GPU renderer's picture at its own size instead of
+cropping it to 640x512, and the window texture follows that size.
+---
+ ps2xRuntime/include/runtime/gs/gs_frontend.h |   3 +-
+ ps2xRuntime/include/runtime/gs/gs_parallel.h |  19 +++-
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp       |  38 ++++---
+ ps2xRuntime/src/lib/gs/gs_parallel.cpp       |  19 +++-
+ ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp  |   2 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |  57 +++++-----
+ ps2xTest/src/gpu_gs_test_support.h           |   4 +-
+ ps2xTest/src/ps2_gs_parallel_tests.cpp       | 112 +++++++++++++++++++
+ 8 files changed, 204 insertions(+), 50 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index bb09d2b..2210056 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -112,7 +112,7 @@ public:
+ 
+     // Hands all GS emulation to paraLLEl-GS (GPU): GIF traffic goes to it unparsed, the CPU backend
+     // and the host copy of GS memory are no longer updated. Requires init() with privRegs first.
+-    bool enableParallelRenderer(std::string &error);
++    bool enableParallelRenderer(std::string &error, const GSParallelOptions &options = {});
+     bool usesParallelRenderer() const { return static_cast<bool>(m_parallel); }
+     // Display scanout for this vsync (GPU renderer only; the CPU path scans out on presentation).
+     void onVsync(uint32_t field);
+@@ -238,6 +238,7 @@ private:
+     uint32_t m_preferredDisplayDestFbp = 0;
+     bool m_hasPreferredDisplaySource = false;
+     std::vector<uint8_t> m_hostPresentationFrame;
++    uint32_t m_hostPresentationRowPixels = 0; // row pitch of m_hostPresentationFrame
+     uint32_t m_hostPresentationWidth = 0;
+     uint32_t m_hostPresentationHeight = 0;
+     uint32_t m_hostPresentationDisplayFbp = 0;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+index 714325d..7a8e0fa 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_parallel.h
++++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+@@ -3,6 +3,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -19,6 +20,21 @@ void gsPackPrivRegisters(const GSRegisters &regs, uint64_t (&out)[kGsPrivStateQw
+ std::vector<uint64_t> gsBuildImageUploadPacket(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
+                                                const uint8_t *data, uint32_t sizeBytes);
+ 
++// Image quality settings of the GPU renderer.
++struct GSParallelOptions
++{
++    // Samples per pixel: 1, 4, 8 or 16. 1 scans out exactly what the game displays. With 4 or more the
++    // picture is scanned out at twice its resolution from the samples (4: one per output pixel, 8 and
++    // 16: averaged, which smooths polygon edges); a game's final blit of its frame into the display
++    // buffer (often scaled down, 16-bit, or blended with the previous picture) is replaced by the
++    // blit's source buffer, so that the samples reach the screen.
++    uint32_t superSampling = 1u;
++};
++
++// Parses a sample count for GSParallelOptions::superSampling (PS2_GS_SSAA); nullopt if unsupported
++// (paraLLEl-GS's 2x cannot be scanned out at a higher resolution, so it is not offered).
++std::optional<uint32_t> gsParseSuperSampling(const char *value);
++
+ // GS emulated by paraLLEl-GS (Vulkan compute). It consumes raw GIF traffic and owns the GS local
+ // memory; SIGNAL/FINISH/LABEL are reported back into the privileged registers passed to create().
+ // Not thread safe: the GS frontend serialises every call.
+@@ -27,7 +43,8 @@ class GSParallelRenderer
+ public:
+     // Returns nullptr (and the reason in error) when the runtime was built without paraLLEl-GS or no
+     // suitable Vulkan device is available.
+-    static std::unique_ptr<GSParallelRenderer> create(GSRegisters &privRegs, std::string &error);
++    static std::unique_ptr<GSParallelRenderer> create(GSRegisters &privRegs, const GSParallelOptions &options,
++                                                      std::string &error);
+ 
+     virtual ~GSParallelRenderer() = default;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index d85677b..b3a02d1 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -12,8 +12,8 @@
+ 
+ namespace
+ {
++    // Row pitch of the CPU backend's presented frames.
+     static constexpr uint32_t kHostFrameWidth = 640u;
+-    static constexpr uint32_t kHostFrameHeight = 512u;
+ 
+     GSPrimReg decodePrimRegister(uint64_t value)
+     {
+@@ -530,25 +530,18 @@ void GS::latchHostPresentationFrame()
+ {
+     if (m_parallel)
+     {
+-        // The GPU renderer scans out at vsync; take the latest picture it read back, stored with the
+-        // same row pitch as the CPU path's frames.
++        // The GPU renderer scans out at vsync; take the latest picture it read back, whatever its size
++        // (high-resolution scanout doubles it).
+         std::vector<uint8_t> rgba;
+         uint32_t width = 0u;
+         uint32_t height = 0u;
+         uint64_t sequence = 0u;
+         const bool hasFrame = m_parallel->copyLatestFrame(rgba, width, height, sequence);
+-        const uint32_t keptWidth = std::min(width, kHostFrameWidth);
+-        const uint32_t keptHeight = std::min(height, kHostFrameHeight);
+         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+-        m_hostPresentationFrame.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
+-        for (uint32_t y = 0; hasFrame && y < keptHeight; ++y)
+-        {
+-            std::memcpy(m_hostPresentationFrame.data() + static_cast<size_t>(y) * kHostFrameWidth * 4u,
+-                        rgba.data() + static_cast<size_t>(y) * width * 4u,
+-                        static_cast<size_t>(keptWidth) * 4u);
+-        }
+-        m_hostPresentationWidth = hasFrame ? keptWidth : 0u;
+-        m_hostPresentationHeight = hasFrame ? keptHeight : 0u;
++        m_hostPresentationFrame = std::move(rgba);
++        m_hostPresentationRowPixels = width;
++        m_hostPresentationWidth = hasFrame ? width : 0u;
++        m_hostPresentationHeight = hasFrame ? height : 0u;
+         m_hostPresentationDisplayFbp = m_hostPresentationSourceFbp = 0u;
+         m_hostPresentationUsedPreferred = false;
+         m_hasHostPresentationFrame = hasFrame;
+@@ -591,6 +584,7 @@ void GS::latchHostPresentationFrame()
+     {
+         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+         m_hostPresentationFrame = std::move(frame.pixels);
++        m_hostPresentationRowPixels = kHostFrameWidth;
+         m_hostPresentationWidth = width;
+         m_hostPresentationHeight = height;
+         m_hostPresentationDisplayFbp = displayFbp;
+@@ -660,7 +654,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
+     if (outWidth != 0u && outHeight != 0u)
+     {
+-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
++        const size_t sourceRowBytes = static_cast<size_t>(m_hostPresentationRowPixels) * 4u;
+         for (uint32_t y = 0; y < outHeight; ++y)
+         {
+             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
+@@ -1703,7 +1697,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+ 
+-bool GS::enableParallelRenderer(std::string &error)
++bool GS::enableParallelRenderer(std::string &error, const GSParallelOptions &options)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (m_parallel)
+@@ -1713,7 +1707,7 @@ bool GS::enableParallelRenderer(std::string &error)
+         error = "GS::init() with the privileged registers must run first";
+         return false;
+     }
+-    m_parallel = GSParallelRenderer::create(*m_privRegs, error);
++    m_parallel = GSParallelRenderer::create(*m_privRegs, options, error);
+     return static_cast<bool>(m_parallel);
+ }
+ 
+@@ -1724,6 +1718,16 @@ void GS::onVsync(uint32_t field)
+         m_parallel->vsync(field);
+ }
+ 
++std::optional<uint32_t> gsParseSuperSampling(const char *value)
++{
++    if (!value)
++        return std::nullopt;
++    for (const uint32_t rate : {1u, 4u, 8u, 16u})
++        if (std::to_string(rate) == value)
++            return rate;
++    return std::nullopt;
++}
++
+ void gsPackPrivRegisters(const GSRegisters &regs, uint64_t (&out)[kGsPrivStateQwords])
+ {
+     std::memset(out, 0, sizeof(out));
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+index fdf2ee3..5704361 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+@@ -95,7 +95,7 @@ namespace
+                 m_device.wait_idle();
+         }
+ 
+-        bool init(std::string &error)
++        bool init(const GSParallelOptions &settings, std::string &error)
+         {
+             bindGraniteThread();
+             PFN_vkGetInstanceProcAddr addr = loadVulkan(error);
+@@ -118,12 +118,22 @@ namespace
+             m_device.init_frame_contexts(4);
+ 
+             ParallelGS::GSOptions options = {};
++            options.super_sampling = static_cast<ParallelGS::SuperSampling>(settings.superSampling);
++            m_highResolution = settings.superSampling > 1u;
++            // Textures rendered super-sampled are sampled per sample, so that a blit keeps the samples.
++            options.super_sampled_textures = m_highResolution;
+             if (!m_gs.init(&m_device, options))
+             {
+                 error = "the Vulkan device lacks features paraLLEl-GS needs";
+                 return false;
+             }
+             m_gs.set_signal_interface(&m_signals);
++            if (m_highResolution)
++            {
++                ParallelGS::Hacks hacks;
++                hacks.backbuffer_promotion = true;
++                m_gs.set_hacks(hacks);
++            }
+             m_ready = true;
+             return true;
+         }
+@@ -165,6 +175,7 @@ namespace
+             info.force_progressive = true;
+             info.anti_blur = true;
+             info.adapt_to_internal_horizontal_resolution = true;
++            info.high_resolution_scanout = m_highResolution;
+ 
+             m_gs.flush();
+             ParallelGS::ScanoutResult result = m_gs.vsync(info);
+@@ -268,13 +279,15 @@ namespace
+         uint32_t m_frameWidth = 0;
+         uint32_t m_frameHeight = 0;
+         uint64_t m_frameSequence = 0;
++        bool m_highResolution = false;
+     };
+ }
+ 
+-std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(GSRegisters &privRegs, std::string &error)
++std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(GSRegisters &privRegs, const GSParallelOptions &options,
++                                                              std::string &error)
+ {
+     auto renderer = std::make_unique<ParallelRenderer>(privRegs);
+-    if (!renderer->init(error))
++    if (!renderer->init(options, error))
+         return nullptr;
+     return renderer;
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
+index 74a2e2e..abf18c5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
+@@ -1,6 +1,6 @@
+ #include "runtime/gs/gs_parallel.h"
+ 
+-std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(GSRegisters &, std::string &error)
++std::unique_ptr<GSParallelRenderer> GSParallelRenderer::create(GSRegisters &, const GSParallelOptions &, std::string &error)
+ {
+     error = "the runtime was built without paraLLEl-GS (PS2X_PARALLEL_GS_DIR)";
+     return nullptr;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b71aab8..f99ebe1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -380,6 +380,17 @@ namespace
+     }
+ }
+ 
++// The texture takes each picture's size: a high-resolution scanout is larger than FB_WIDTH x FB_HEIGHT.
++static void resizeFrameTexture(Texture2D &tex, uint32_t width, uint32_t height)
++{
++    if (static_cast<uint32_t>(tex.width) == width && static_cast<uint32_t>(tex.height) == height)
++        return;
++    UnloadTexture(tex);
++    Image blank = GenImageColor(static_cast<int>(width), static_cast<int>(height), BLANK);
++    tex = LoadTextureFromImage(blank);
++    UnloadImage(blank);
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
+@@ -389,7 +400,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     static uint32_t s_lastHeight = 0u;
+     static bool s_hasUploadedFrame = false;
+     static std::vector<uint8_t> s_scratch;
+-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+ 
+     if (!rt->gs().latchNewHostPresentationFrame() && s_hasUploadedFrame)
+     {
+@@ -411,6 +421,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                                                    &sourceFbp,
+                                                    &usedPreferredDisplaySource))
+     {
++        resizeFrameTexture(tex, FB_WIDTH, FB_HEIGHT);
+         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+         UpdateTexture(tex, blank.data);
+         UnloadImage(blank);
+@@ -447,28 +458,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     s_lastWidth = width;
+     s_lastHeight = height;
+ 
+-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+-    if (!s_scratch.empty() && width != 0u && height != 0u)
+-    {
+-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
+-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
+-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
+-        for (uint32_t y = 0; y < copyHeight; ++y)
+-        {
+-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
+-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
+-            if (srcOffset + copyRowBytes > s_scratch.size() ||
+-                dstOffset + copyRowBytes > s_uploadBuffer.size())
+-            {
+-                break;
+-            }
+-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
+-        }
+-    }
+-
+-    UpdateTexture(tex, s_uploadBuffer.data());
++    // copyLatchedHostPresentationFrame packs the rows, so the pixels fill a texture of the picture's size.
++    resizeFrameTexture(tex, width, height);
++    UpdateTexture(tex, s_scratch.data());
+     outWidth = width;
+     outHeight = height;
+     s_hasUploadedFrame = true;
+@@ -730,10 +722,25 @@ bool PS2Runtime::selectGsRenderer()
+         return false;
+     }
+ 
++    // 8x super-sampling by default: twice the resolution with smoothed edges, at no cost to the frame
++    // rate on an M1 Pro. PS2_GS_SSAA=1 shows exactly what the game displays.
++    GSParallelOptions options;
++    options.superSampling = 8u;
++    if (const char *ssaa = std::getenv("PS2_GS_SSAA"))
++    {
++        const std::optional<uint32_t> rate = gsParseSuperSampling(ssaa);
++        if (!rate)
++        {
++            std::cerr << "[gs] unsupported PS2_GS_SSAA '" << ssaa << "' (expected 1, 2, 4, 8 or 16)" << std::endl;
++            return false;
++        }
++        options.superSampling = *rate;
++    }
++
+     std::string error;
+-    if (m_gs.enableParallelRenderer(error))
++    if (m_gs.enableParallelRenderer(error, options))
+     {
+-        std::cout << "[gs] renderer: paraLLEl-GS (Vulkan)" << std::endl;
++        std::cout << "[gs] renderer: paraLLEl-GS (Vulkan), " << options.superSampling << "x super-sampling" << std::endl;
+         return true;
+     }
+     if (backend == "parallel")
+diff --git a/ps2xTest/src/gpu_gs_test_support.h b/ps2xTest/src/gpu_gs_test_support.h
+index ae295df..aa9d568 100644
+--- a/ps2xTest/src/gpu_gs_test_support.h
++++ b/ps2xTest/src/gpu_gs_test_support.h
+@@ -9,10 +9,10 @@
+ 
+ // Switches gs to the GPU renderer (paraLLEl-GS). Without a usable Vulkan device the test is skipped
+ // with a note, unless PS2_TEST_REQUIRE_GPU=1 asks for it to fail instead.
+-inline bool requireGpuGs(TestCase &t, GS &gs)
++inline bool requireGpuGs(TestCase &t, GS &gs, const GSParallelOptions &options = {})
+ {
+     std::string error;
+-    if (gs.enableParallelRenderer(error))
++    if (gs.enableParallelRenderer(error, options))
+         return true;
+     const char *required = std::getenv("PS2_TEST_REQUIRE_GPU");
+     if (required && std::string(required) == "1")
+diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+index e00e87f..35fb620 100644
+--- a/ps2xTest/src/ps2_gs_parallel_tests.cpp
++++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+@@ -18,8 +18,11 @@ namespace
+ {
+     constexpr uint8_t kRegPrim = 0x00;
+     constexpr uint8_t kRegRgbaq = 0x01;
++    constexpr uint8_t kRegUv = 0x03;
+     constexpr uint8_t kRegXyz2 = 0x05;
++    constexpr uint8_t kRegTex01 = 0x06;
+     constexpr uint8_t kRegXyoffset1 = 0x18;
++    constexpr uint8_t kRegPrmodecont = 0x1A;
+     constexpr uint8_t kRegScissor1 = 0x40;
+     constexpr uint8_t kRegTest1 = 0x47;
+     constexpr uint8_t kRegFrame1 = 0x4C;
+@@ -60,6 +63,83 @@ namespace
+                             static_cast<uint32_t>(packet.size() * sizeof(uint64_t)));
+     }
+ 
++    // PAL display of a 512x512 PSMCT32 buffer at page 0, as Soulcalibur III sets it up.
++    void setUpPalDisplay(GSRegisters &regs)
++    {
++        regs.pmode = 0x1u | (1u << 2) | (1u << 5) | (0xFFu << 8); // EN1, CRTMD=1, MMOD, ALP=0xFF
++        regs.smode1 = (32ull << 3) | (3ull << 13);                 // LC=32, CMOD=PAL
++        regs.smode2 = 0x1u;
++        regs.dispfb1 = 8ull << 9;                                  // FBW=8 (512 pixels)
++        regs.display1 = 0x1FE9FF0204B296ull;
++    }
++
++    // Not representable in PSMCT16 (5 bits per channel): a 16-bit buffer shows it as 0xC0.
++    constexpr uint32_t kTriangleGreen = 0xC4u;
++
++    struct Presented
++    {
++        uint32_t width = 0u;
++        uint32_t height = 0u;
++        uint32_t partlyCoveredPixels = 0u; // neither the triangle's green nor the black around it
++        uint8_t centreGreen = 0u;
++    };
++
++    // The way Soulcalibur III builds a frame: it renders into a 640x448 PSMCT32 buffer at page 0, then
++    // blits that buffer with a textured sprite into the 512x512 PSMCT16 buffer at page 0x8C, which is
++    // what the display circuit reads. The frame is a green triangle with a diagonal edge over black.
++    // The blit follows a vsync, as in the game, so it is a render pass of its own.
++    Presented presentBlittedFrame(TestCase &t, uint32_t superSampling)
++    {
++        GsFixture f;
++        if (!requireGpuGs(t, f.gs, GSParallelOptions{superSampling}))
++            return {};
++        setUpPalDisplay(*f.regs);
++        f.regs->dispfb1 = 0x8Cull | (8ull << 9) | (2ull << 15); // page 0x8C, 512 pixels, PSMCT16
++        f.gs.onVsync(0u);
++
++        send(f.gs, adPacket({{kRegFrame1, 10ull << 16},
++                             {kRegTest1, 0u},
++                             {kRegXyoffset1, 0u},
++                             {kRegScissor1, (639ull << 16) | (447ull << 48)},
++                             {kRegPrim, 6u},
++                             {kRegRgbaq, 0x80ull << 24},
++                             {kRegXyz2, 0u},
++                             {kRegXyz2, (640ull << 4) | ((448ull << 4) << 16)},
++                             {kRegPrim, 3u},
++                             {kRegRgbaq, (kTriangleGreen << 8) | (0x80ull << 24)},
++                             {kRegXyz2, 0u},
++                             {kRegXyz2, 600ull << 4},
++                             {kRegXyz2, (440ull << 4) << 16}}));
++        f.gs.onVsync(1u); // the game blits a finished frame at the start of the next one
++        // TEX0: page 0, 640 wide, PSMCT24, 1024x512, TCC, DECAL. PRIM: sprite, TME, FST.
++        const uint64_t tex0 = (10ull << 14) | (1ull << 20) | (10ull << 26) | (9ull << 30) | (1ull << 34) | (1ull << 35);
++        send(f.gs, adPacket({{kRegPrmodecont, 1u}, // the attributes come from PRIM
++                             {kRegFrame1, 0x8Cull | (8ull << 16) | (2ull << 24)},
++                             {kRegScissor1, (511ull << 16) | (511ull << 48)},
++                             {kRegTex01, tex0},
++                             {kRegPrim, 0x116u},
++                             {kRegUv, 0u},
++                             {kRegXyz2, 0u},
++                             {kRegUv, (640ull << 4) | ((448ull << 4) << 16)},
++                             {kRegXyz2, (512ull << 4) | ((512ull << 4) << 16)}}));
++        f.gs.onVsync(0u);
++        f.gs.onVsync(1u); // publishes the previous vsync's picture
++        f.gs.latchHostPresentationFrame();
++
++        std::vector<uint8_t> frame;
++        Presented presented;
++        if (!f.gs.copyLatchedHostPresentationFrame(frame, presented.width, presented.height))
++        {
++            t.Fail("no frame presented");
++            return {};
++        }
++        for (size_t i = 0; i + 3u < frame.size(); i += 4u)
++            if (frame[i + 1u] > 0x18u && frame[i + 1u] < 0xA8u)
++                ++presented.partlyCoveredPixels;
++        presented.centreGreen = frame[(static_cast<size_t>(presented.height / 4u) * presented.width + presented.width / 4u) * 4u + 1u];
++        return presented;
++    }
++
+     void runSignalFinishLabel(TestCase &t, bool gpu)
+     {
+         GsFixture f;
+@@ -149,6 +229,38 @@ void register_ps2_gs_parallel_tests()
+             t.IsTrue(std::memcmp(packet.data() + 12, pixels, 32) == 0, "the pixel qwords follow the IMAGE tag");
+         });
+ 
++        tc.Run("PS2_GS_SSAA values parse to a supported sample count", [](TestCase &t)
++        {
++            t.IsTrue(gsParseSuperSampling("1") == 1u, "1 is no super-sampling");
++            t.IsFalse(gsParseSuperSampling("2").has_value(), "2 samples cannot be scanned out at a higher resolution");
++            t.IsTrue(gsParseSuperSampling("4") == 4u, "4 samples");
++            t.IsTrue(gsParseSuperSampling("16") == 16u, "16 samples is the most paraLLEl-GS supports");
++            t.IsFalse(gsParseSuperSampling("3").has_value(), "3 is not a supported rate");
++            t.IsFalse(gsParseSuperSampling("32").has_value(), "32 is not a supported rate");
++            t.IsFalse(gsParseSuperSampling("4x").has_value(), "trailing text is rejected");
++            t.IsFalse(gsParseSuperSampling("").has_value(), "an empty value is rejected");
++        });
++
++        tc.Run("without super-sampling the blitted frame is presented as the display buffer (GPU GS)", [](TestCase &t)
++        {
++            const Presented presented = presentBlittedFrame(t, 1u);
++            t.Equals(presented.width, 512u, "the display buffer's width");
++            t.Equals(presented.height, 512u, "the display buffer's height");
++            t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen & 0xF8u,
++                     "the triangle reaches the screen through the 16-bit display buffer");
++        });
++
++        tc.Run("with super-sampling the blit's source is presented at twice the resolution (GPU GS)", [](TestCase &t)
++        {
++            const Presented four = presentBlittedFrame(t, 4u);
++            t.Equals(four.width, 1024u, "twice the display's width");
++            t.Equals(four.height, 1024u, "twice the display's height");
++            t.Equals(static_cast<uint32_t>(four.centreGreen), kTriangleGreen,
++                     "the blit's 32-bit source buffer is scanned out instead of the 16-bit display buffer");
++            const Presented eight = presentBlittedFrame(t, 8u);
++            t.IsTrue(eight.partlyCoveredPixels > 100u, "8x super-sampling blends the pixels on the edge");
++        });
++
+         tc.Run("the GIF arbiter reports the path each packet came on", [](TestCase &t)
+         {
+             std::vector<GifPathId> paths;
+-- 
+2.54.0 (Apple Git-157)
+

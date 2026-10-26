@@ -1,8 +1,8 @@
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index a38501b..fe5c8b4 100644
+index 89194c4..bcbb9fc 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
-@@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
+@@ -385,6 +385,7 @@ add_library(ps2_runtime STATIC
      src/lib/gs/gs_frontend.cpp
      src/lib/gs/gs_cpu_backend.cpp
      src/lib/gs/gs_priv_registers.cpp
@@ -45,7 +45,7 @@ index 0000000..b0c0861
 +    void onVsync(const GSRegisters &priv, uint64_t vsyncTick);
 +}
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index e270af3..ac8e638 100644
+index 56e8515..74e0bb0 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -2,6 +2,7 @@
@@ -56,7 +56,7 @@ index e270af3..ac8e638 100644
  
  #include <algorithm>
  #include <cassert>
-@@ -1946,6 +1947,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1965,6 +1966,7 @@ void EeScheduler::processEvent(const EeEvent &event)
          m_vblankHostTime = std::chrono::steady_clock::now();
          ++m_vsyncTick;
          m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
@@ -432,7 +432,7 @@ index 0000000..879170a
 +}
 +}
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 2aa0c92..73d94a2 100644
+index b3a02d1..9cbd85c 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 @@ -1,5 +1,6 @@
@@ -442,7 +442,7 @@ index 2aa0c92..73d94a2 100644
  #include "ps2_log.h"
  #include "runtime/ps2_memory.h"
  #include <atomic>
-@@ -671,6 +672,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
+@@ -688,6 +689,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
      if (!data || sizeBytes < 16 || !m_backend)
          return;
  
@@ -450,7 +450,7 @@ index 2aa0c92..73d94a2 100644
      if (m_parallel)
      {
          m_parallel->transfer(path, data, sizeBytes);
-@@ -776,6 +778,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -793,6 +795,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  
      if (!validatePackedGifPacket(data, sizeBytes))
          return false;
@@ -458,7 +458,7 @@ index 2aa0c92..73d94a2 100644
      if (m_parallel)
      {
          m_parallel->transfer(3u, data, sizeBytes);
-@@ -822,6 +825,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+@@ -839,6 +842,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                             uint32_t sizeBytes)
  {
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -466,7 +466,7 @@ index 2aa0c92..73d94a2 100644
      if (m_parallel)
      {
          if (!data || sizeBytes == 0u)
-@@ -1112,6 +1116,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+@@ -1129,6 +1133,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
      std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
      if (m_parallel)
      {
@@ -474,7 +474,7 @@ index 2aa0c92..73d94a2 100644
          m_parallel->writeRegister(regAddr, value);
          return;
      }
-@@ -1120,6 +1125,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+@@ -1137,6 +1142,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
  
  void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
  {
@@ -483,16 +483,15 @@ index 2aa0c92..73d94a2 100644
          regAddr == GS_REG_PRIM ||
          regAddr == GS_REG_RGBAQ ||
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..21c5405 100644
+index 91bccb5..56c8e56 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -1,4 +1,5 @@
+@@ -1,3 +1,4 @@
 +#include <cstdlib>
  #include "runtime/ps2_pad.h"
  #include "ps2_host_backend.h"
  #include <algorithm>
- #include <cstring>
-@@ -132,6 +133,12 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size, int port, int slot)
+@@ -141,6 +142,12 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size,
          if (input.isKeyDown(KEY_RIGHT_CONTROL)) clearBit(PAD_SELECT);
      }
  
@@ -506,12 +505,12 @@ index 8590f14..21c5405 100644
      data[3] = static_cast<uint8_t>(btns >> 8);
      return true;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 086473b..da56845 100644
+index 1534013..7dcf663 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -474,6 +474,94 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
-         }
-     }
+@@ -467,6 +467,94 @@ static void UploadFrame(Texture2D &tex, Ps2HostFilter filter, PS2Runtime *rt, ui
+     s_lastWidth = width;
+     s_lastHeight = height;
  
 +    { // TEMP-DEBUG scene change log
 +        static uint32_t s_lastScene = 0xdeadbeefu;
@@ -559,8 +558,8 @@ index 086473b..da56845 100644
 +        if (s_dumpDir && (s_dumpIdx++ % s_dumpEvery) == 0u)
 +        {
 +            uint64_t nonBlack = 0u;
-+            for (size_t i = 0; i + 3 < s_uploadBuffer.size(); i += 4)
-+                nonBlack += (s_uploadBuffer[i] | s_uploadBuffer[i + 1] | s_uploadBuffer[i + 2]) != 0u;
++            for (size_t i = 0; i + 3 < s_scratch.size(); i += 4)
++                nonBlack += (s_scratch[i] | s_scratch[i + 1] | s_scratch[i + 2]) != 0u;
 +            std::cerr << "[TEMP-DEBUG frame] idx=" << s_dumpIdx << " " << width << "x" << height
 +                      << " displayFbp=" << displayFbp << " sourceFbp=" << sourceFbp
 +                      << " nonBlackPixels=" << nonBlack << std::endl;
@@ -593,17 +592,17 @@ index 086473b..da56845 100644
 +                std::cerr << std::dec << std::endl;
 +            }
 +            Image img{};
-+            img.data = s_uploadBuffer.data();
-+            img.width = FB_WIDTH;
-+            img.height = FB_HEIGHT;
++            img.data = s_scratch.data();
++            img.width = static_cast<int>(width);
++            img.height = static_cast<int>(height);
 +            img.mipmaps = 1;
 +            img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
 +            ExportImage(img, (std::string(s_dumpDir) + "/frame_" + std::to_string(s_dumpIdx) + ".png").c_str());
 +        }
 +    }
-     UpdateTexture(tex, s_uploadBuffer.data());
-     outWidth = width;
-     outHeight = height;
+     // copyLatchedHostPresentationFrame packs the rows, so the pixels fill a texture of the picture's size.
+     resizeFrameTexture(tex, width, height, filter);
+     UpdateTexture(tex, s_scratch.data());
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index e4aff22..0c86072 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp

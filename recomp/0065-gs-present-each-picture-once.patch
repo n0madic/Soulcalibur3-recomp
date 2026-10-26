@@ -1,0 +1,321 @@
+From fb74d9f4c6f05df904d15559439292c6724e5406 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 13:34:02 +0200
+Subject: [PATCH] GS: present each published picture once and swap on the
+ display refresh
+
+The host loop latched a new picture whenever the vsync tick changed. The
+paraLLEl-GS renderer publishes a vsync's picture on the next vsync, and the
+scheduler advances the tick before it scans out, so the host thread often
+latched the old picture again and then skipped the next one: in a PAL game
+2-3 of every 50 pictures were shown twice and 2-3 never, which looks like
+doubled images in fast motion.
+
+GS::latchNewHostPresentationFrame latches only when a new picture exists:
+by the renderer's read-back sequence on the GPU path, by the vsync tick on
+the CPU path. The window now swaps on vsync and draws at the monitor's
+refresh rate instead of a fixed 60 FPS cap.
+---
+ ps2xRuntime/include/runtime/gs/gs_frontend.h |  6 +++
+ ps2xRuntime/include/runtime/gs/gs_parallel.h |  9 +++-
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp       | 25 ++++++++-
+ ps2xRuntime/src/lib/gs/gs_parallel.cpp       | 12 ++++-
+ ps2xRuntime/src/lib/ps2_runtime.cpp          | 23 ++++----
+ ps2xTest/src/ps2_gs_parallel_tests.cpp       | 57 ++++++++++++++++++++
+ 6 files changed, 115 insertions(+), 17 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+index 98427cf..bb09d2b 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_frontend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_frontend.h
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <vector>
+ 
+ #include "runtime/gs/gs_backend.h"
+@@ -141,6 +142,9 @@ public:
+     void setDebugHistoryPaused(bool paused);
+     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
+     void latchHostPresentationFrame();
++    // Latches the picture for the host only when one was produced since the last latch: each picture
++    // the GPU renderer reads back, or each vsync on the CPU path. Returns whether it latched.
++    bool latchNewHostPresentationFrame();
+     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+                                           uint32_t &outWidth,
+                                           uint32_t &outHeight,
+@@ -240,6 +244,8 @@ private:
+     uint32_t m_hostPresentationSourceFbp = 0;
+     bool m_hostPresentationUsedPreferred = false;
+     bool m_hasHostPresentationFrame = false;
++    // Which picture was latched last (see latchNewHostPresentationFrame); empty before the first latch.
++    std::optional<uint64_t> m_hostPresentationSequence;
+     uint64_t m_nativeImageUploadCount = 0;
+     uint64_t m_nativePackedGIFPacketCount = 0;
+ 
+diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+index bbd8e49..714325d 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_parallel.h
++++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+@@ -38,8 +38,13 @@ public:
+ 
+     // Scans the display circuits out for this vsync and starts reading the picture back to the host.
+     virtual void vsync(uint32_t field) = 0;
+-    // The most recent picture read back (RGBA8, tightly packed); false before the first one.
+-    virtual bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
++    // The most recent picture read back (RGBA8, tightly packed) and its sequence number; false before
++    // the first one.
++    virtual bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
++                                 uint64_t &sequence) = 0;
++    // Counts the pictures read back so far. Each vsync publishes the previous vsync's picture, so this
++    // lags the vsync tick and advances only once the picture can be copied.
++    virtual uint64_t latestFrameSequence() = 0;
+     // Waits for all submitted GPU work, publishing the pending picture.
+     virtual void finish() = 0;
+ };
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 2aa0c92..d85677b 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -175,6 +175,7 @@ void GS::reset()
+         m_hostPresentationSourceFbp = 0u;
+         m_hostPresentationUsedPreferred = false;
+         m_hasHostPresentationFrame = false;
++        m_hostPresentationSequence.reset();
+     }
+ 
+     m_debugHistoryWrite = 0;
+@@ -534,7 +535,8 @@ void GS::latchHostPresentationFrame()
+         std::vector<uint8_t> rgba;
+         uint32_t width = 0u;
+         uint32_t height = 0u;
+-        const bool hasFrame = m_parallel->copyLatestFrame(rgba, width, height);
++        uint64_t sequence = 0u;
++        const bool hasFrame = m_parallel->copyLatestFrame(rgba, width, height, sequence);
+         const uint32_t keptWidth = std::min(width, kHostFrameWidth);
+         const uint32_t keptHeight = std::min(height, kHostFrameHeight);
+         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+@@ -550,9 +552,11 @@ void GS::latchHostPresentationFrame()
+         m_hostPresentationDisplayFbp = m_hostPresentationSourceFbp = 0u;
+         m_hostPresentationUsedPreferred = false;
+         m_hasHostPresentationFrame = hasFrame;
++        m_hostPresentationSequence = sequence;
+         return;
+     }
+ 
++    const uint64_t vsyncTick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_acquire) : 0u;
+     GSPresentationRequest request{};
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+@@ -593,6 +597,7 @@ void GS::latchHostPresentationFrame()
+         m_hostPresentationSourceFbp = sourceFbp;
+         m_hostPresentationUsedPreferred = usedPreferred;
+         m_hasHostPresentationFrame = hasFrame;
++        m_hostPresentationSequence = vsyncTick;
+     }
+ 
+     if (hasFrame)
+@@ -602,6 +607,24 @@ void GS::latchHostPresentationFrame()
+     }
+ }
+ 
++bool GS::latchNewHostPresentationFrame()
++{
++    // The GPU renderer publishes a vsync's picture one vsync later, and the scheduler advances the tick
++    // before it scans out: going by the tick, the host would present a picture twice and skip the next.
++    uint64_t sequence = 0u;
++    if (m_parallel)
++        sequence = m_parallel->latestFrameSequence();
++    else if (m_privRegs)
++        sequence = m_privRegs->vsyncTick.load(std::memory_order_acquire);
++    {
++        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
++        if (m_hostPresentationSequence == sequence)
++            return false;
++    }
++    latchHostPresentationFrame();
++    return true;
++}
++
+ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+                                           uint32_t &outWidth,
+                                           uint32_t &outHeight,
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+index edd6108..fdf2ee3 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+@@ -176,9 +176,11 @@ namespace
+             m_device.next_frame_context();
+         }
+ 
+-        bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) override
++        bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height,
++                             uint64_t &sequence) override
+         {
+             std::lock_guard<std::mutex> lock(m_frameMutex);
++            sequence = m_frameSequence;
+             if (m_frame.empty())
+                 return false;
+             rgba = m_frame;
+@@ -187,6 +189,12 @@ namespace
+             return true;
+         }
+ 
++        uint64_t latestFrameSequence() override
++        {
++            std::lock_guard<std::mutex> lock(m_frameMutex);
++            return m_frameSequence;
++        }
++
+         void finish() override
+         {
+             bindGraniteThread();
+@@ -241,6 +249,7 @@ namespace
+                     m_frame[i] = 0xFF;
+                 m_frameWidth = m_pending.width;
+                 m_frameHeight = m_pending.height;
++                ++m_frameSequence;
+             }
+             m_device.unmap_host_buffer(*m_pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
+             m_pending = {};
+@@ -258,6 +267,7 @@ namespace
+         std::vector<uint8_t> m_frame;
+         uint32_t m_frameWidth = 0;
+         uint32_t m_frameHeight = 0;
++        uint64_t m_frameSequence = 0;
+     };
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1c868d7..b71aab8 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -382,8 +382,6 @@ namespace
+ 
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+-    static bool s_hasLatchedInitialFrame = false;
+     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
+     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
+     static bool s_lastPreferred = false;
+@@ -393,15 +391,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     static std::vector<uint8_t> s_scratch;
+     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+ 
+-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+-    if (needsLatch)
+-    {
+-        rt->gs().latchHostPresentationFrame();
+-        s_lastPresentationTick = currentTick;
+-        s_hasLatchedInitialFrame = true;
+-    }
+-    else if (s_hasUploadedFrame)
++    if (!rt->gs().latchNewHostPresentationFrame() && s_hasUploadedFrame)
+     {
+         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+@@ -442,7 +432,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+             height != s_lastHeight)
+         {
+             std::cout << "[frame:upload] idx=" << s_uploadDebugCount
+-                      << " tick=" << currentTick
++                      << " tick=" << rt->eeScheduler().currentVSyncTick()
+                       << " displayFbp=" << displayFbp
+                       << " sourceFbp=" << sourceFbp
+                       << " size=" << width << "x" << height
+@@ -775,13 +765,20 @@ bool PS2Runtime::initialize(const char *title)
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
++        // Swap on the display's refresh and draw at its rate, so each picture appears as soon as the
++        // display can show it and never mid-refresh (PAL's 50 pictures/s fit no 60 Hz frame cap).
++        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+         SetExitKey(PSPadBackend::kHostExitKey);
++#if defined(PLATFORM_VITA)
+         SetTargetFPS(60);
++#else
++        const int refreshRate = GetMonitorRefreshRate(GetCurrentMonitor());
++        SetTargetFPS(refreshRate > 0 ? refreshRate : 60);
++#endif
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+index 8473622..e00e87f 100644
+--- a/ps2xTest/src/ps2_gs_parallel_tests.cpp
++++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+@@ -210,5 +210,62 @@ void register_ps2_gs_parallel_tests()
+             t.Equals(static_cast<uint32_t>(pixel[1]), 0xC0u, "green of the sprite");
+             t.Equals(static_cast<uint32_t>(pixel[2]), 0x40u, "blue of the sprite");
+         });
++
++        tc.Run("the host latches each published picture once, not each vsync tick (GPU GS)", [](TestCase &t)
++        {
++            GsFixture f;
++            if (!requireGpuGs(t, f.gs))
++                return;
++
++            f.regs->pmode = 0x1u | (1u << 2) | (1u << 5) | (0xFFu << 8);
++            f.regs->smode1 = (32ull << 3) | (3ull << 13);
++            f.regs->smode2 = 0x1u;
++            f.regs->dispfb1 = 8ull << 9;
++            f.regs->display1 = 0x1FE9FF0204B296ull;
++            auto fill = [&](uint32_t red)
++            {
++                send(f.gs, adPacket({{kRegFrame1, 8ull << 16},
++                                     {kRegTest1, 0u},
++                                     {kRegXyoffset1, 0u},
++                                     {kRegScissor1, (511ull << 16) | (511ull << 48)},
++                                     {kRegPrim, 6u},
++                                     {kRegRgbaq, red | (0x80ull << 24)},
++                                     {kRegXyz2, 0u},
++                                     {kRegXyz2, (512ull << 4) | ((512ull << 4) << 16)}}));
++            };
++            // The scheduler advances the tick before it scans out; the host may look in between.
++            auto vsync = [&]()
++            {
++                const uint64_t tick = f.regs->vsyncTick.load() + 1u;
++                f.regs->vsyncTick.store(tick);
++                f.gs.onVsync(static_cast<uint32_t>(tick & 1u));
++            };
++            auto latchedRed = [&]() -> int
++            {
++                std::vector<uint8_t> frame;
++                uint32_t width = 0;
++                uint32_t height = 0;
++                if (!f.gs.copyLatchedHostPresentationFrame(frame, width, height) || width == 0u || height == 0u)
++                    return -1;
++                return frame[(static_cast<size_t>(height / 2u) * width + width / 2u) * 4u];
++            };
++
++            fill(0x30u);
++            vsync();
++            vsync(); // publishes the first vsync's picture
++            t.IsTrue(f.gs.latchNewHostPresentationFrame(), "the first published picture is new");
++            t.Equals(latchedRed(), 0x30, "the first picture is latched");
++            t.IsFalse(f.gs.latchNewHostPresentationFrame(), "nothing new without a vsync");
++
++            fill(0x90u);
++            f.regs->vsyncTick.store(f.regs->vsyncTick.load() + 1u); // the tick moved, the scanout did not yet
++            t.IsFalse(f.gs.latchNewHostPresentationFrame(),
++                      "a vsync tick without a published picture must not present the old picture again");
++            f.gs.onVsync(static_cast<uint32_t>(f.regs->vsyncTick.load() & 1u));
++            t.IsTrue(f.gs.latchNewHostPresentationFrame(), "the published picture is new");
++            vsync();
++            t.IsTrue(f.gs.latchNewHostPresentationFrame(), "every published picture is presented");
++            t.Equals(latchedRed(), 0x90, "the second picture is latched");
++        });
+     });
+ }
+-- 
+2.54.0 (Apple Git-157)
+
