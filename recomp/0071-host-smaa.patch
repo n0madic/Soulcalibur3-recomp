@@ -1,0 +1,823 @@
+From bd2b2efed0f9d0823f03d45069789fdc6b0bfea9 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:01:39 +0200
+Subject: [PATCH] Runtime: SMAA on the picture, the default anti-aliasing
+
+FXAA blends across every edge it finds, which dims the short horizontal
+strokes of small text. SMAA 1x (preset HIGH) finds the shape of each edge
+and leaves straight edges and one-pixel lines alone. It is built from the
+reference SMAA.hlsl and the precomputed area and search textures in the
+paraLLEl-GS checkout's Granite (MIT); the shader is embedded by CMake.
+PS2_HOST_AA selects smaa (default), fxaa or off; SMAA falls back to FXAA
+when it is not built in or does not compile.
+
+Both filters now take their texture coordinate from the output pixel, so
+their render textures keep the picture's row order and SMAA's passes read
+each other the same way up. The intermediate passes draw without alpha
+blending, since the edges and weights carry data in their alpha channel.
+---
+ ps2xRuntime/CMakeLists.txt                    |  18 ++
+ .../include/runtime/gs/ps2_host_filter.h      |  25 ++
+ .../include/runtime/gs/ps2_host_fxaa.h        |  28 +--
+ .../include/runtime/gs/ps2_host_smaa.h        |  38 +++
+ ps2xRuntime/src/lib/gs/ps2_host_fxaa.cpp      |  24 +-
+ ps2xRuntime/src/lib/gs/ps2_host_pass.h        |  36 +++
+ ps2xRuntime/src/lib/gs/ps2_host_smaa.cpp      | 228 ++++++++++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  26 +-
+ ps2xTest/src/ps2_gs_tests.cpp                 | 111 ++++++---
+ 9 files changed, 448 insertions(+), 86 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/gs/ps2_host_smaa.h
+ create mode 100644 ps2xRuntime/src/lib/gs/ps2_host_pass.h
+ create mode 100644 ps2xRuntime/src/lib/gs/ps2_host_smaa.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index ddc6d9e..56c2df8 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -379,6 +379,7 @@ add_library(ps2_runtime STATIC
+     src/lib/game_overrides.cpp
+     src/lib/gs/ps2_gif_arbiter.cpp
+     src/lib/gs/ps2_host_fxaa.cpp
++    src/lib/gs/ps2_host_smaa.cpp
+     src/lib/ps2_audio.cpp
+     src/lib/ps2_pcm_queue.cpp
+     src/lib/ps2_audio_vag.cpp
+@@ -569,6 +570,23 @@ if(PS2X_PARALLEL_GS_DIR)
+     target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_PARALLEL_GS=1)
+     target_link_libraries(ps2_runtime PRIVATE parallel-gs)
+     message(STATUS "GS renderer: paraLLEl-GS from ${PS2X_PARALLEL_GS_DIR}")
++
++    # SMAA for the host picture (ps2_host_smaa.cpp) comes from the reference SMAA.hlsl and its
++    # precomputed textures in Granite (MIT). The shader is embedded as bytes, with its carriage
++    # returns and the Latin-1 letters in its comments turned into spaces for the GLSL compiler.
++    set(PS2X_SMAA_HLSL "${PS2X_PARALLEL_GS_DIR}/Granite/assets/shaders/post/SMAA.hlsl")
++    set(PS2X_SMAA_TEXTURES "${PS2X_PARALLEL_GS_DIR}/Granite/tools/smaa")
++    if(EXISTS "${PS2X_SMAA_HLSL}" AND EXISTS "${PS2X_SMAA_TEXTURES}/AreaTex.h")
++        file(READ "${PS2X_SMAA_HLSL}" ps2x_smaa_hex HEX)
++        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," ps2x_smaa_bytes "${ps2x_smaa_hex}")
++        string(REGEX REPLACE "0x(0d|[89a-f][0-9a-f])," "0x20," ps2x_smaa_bytes "${ps2x_smaa_bytes}")
++        set(PS2X_SMAA_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated")
++        file(WRITE "${PS2X_SMAA_GENERATED}/ps2_smaa_hlsl.h.in" "static const char kSmaaHlsl[] = {${ps2x_smaa_bytes}0x00};\n")
++        configure_file("${PS2X_SMAA_GENERATED}/ps2_smaa_hlsl.h.in" "${PS2X_SMAA_GENERATED}/ps2_smaa_hlsl.h" COPYONLY)
++        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS2X_SMAA_HLSL}")
++        target_include_directories(ps2_runtime PRIVATE "${PS2X_SMAA_GENERATED}" "${PS2X_SMAA_TEXTURES}")
++        target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_SMAA=1)
++    endif()
+ else()
+     target_sources(ps2_runtime PRIVATE src/lib/gs/gs_parallel_stub.cpp)
+     message(STATUS "GS renderer: CPU only (PS2X_PARALLEL_GS_DIR not set)")
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_host_filter.h b/ps2xRuntime/include/runtime/gs/ps2_host_filter.h
+index 69e0d28..d3b05af 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_host_filter.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_host_filter.h
+@@ -26,6 +26,31 @@ inline std::optional<Ps2HostFilter> ps2ParseHostFilter(const char *value)
+     return std::nullopt;
+ }
+ 
++// Anti-aliasing of the PS2 picture by the host (PS2_HOST_AA), before the window scales it.
++// Super-sampling in paraLLEl-GS shades every sample of the scene; these filters only look at the
++// finished picture, so they cost a fraction of a millisecond and smooth polygon edges, though not
++// detail thinner than a pixel. SMAA finds the shape of each edge and leaves straight edges and
++// one-pixel lines (text) alone; FXAA blends across any edge it finds.
++enum class Ps2HostAntiAliasing
++{
++    Off,
++    Fxaa,
++    Smaa,
++};
++
++inline std::optional<Ps2HostAntiAliasing> ps2ParseHostAntiAliasing(const char *value)
++{
++    if (!value)
++        return std::nullopt;
++    if (std::strcmp(value, "smaa") == 0)
++        return Ps2HostAntiAliasing::Smaa;
++    if (std::strcmp(value, "fxaa") == 0)
++        return Ps2HostAntiAliasing::Fxaa;
++    if (std::strcmp(value, "off") == 0)
++        return Ps2HostAntiAliasing::Off;
++    return std::nullopt;
++}
++
+ // Catmull-Rom bicubic filter for raylib's default vertex shader (GLSL 330) and a bilinear-filtered,
+ // edge-clamped texture: the 4x4 taps are folded into 9 bilinear fetches. textureSize is the texture's
+ // size in texels.
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_host_fxaa.h b/ps2xRuntime/include/runtime/gs/ps2_host_fxaa.h
+index 18603cb..ae0c002 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_host_fxaa.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_host_fxaa.h
+@@ -2,29 +2,6 @@
+ 
+ #include "raylib.h"
+ 
+-#include <cstring>
+-#include <optional>
+-
+-// Anti-aliasing of the PS2 picture by the host (PS2_HOST_AA). Super-sampling in paraLLEl-GS shades
+-// every sample of the scene; FXAA only looks at the finished picture, so it costs a fraction of a
+-// millisecond and smooths polygon edges, though not detail thinner than a pixel.
+-enum class Ps2HostAntiAliasing
+-{
+-    Off,
+-    Fxaa,
+-};
+-
+-inline std::optional<Ps2HostAntiAliasing> ps2ParseHostAntiAliasing(const char *value)
+-{
+-    if (!value)
+-        return std::nullopt;
+-    if (std::strcmp(value, "fxaa") == 0)
+-        return Ps2HostAntiAliasing::Fxaa;
+-    if (std::strcmp(value, "off") == 0)
+-        return Ps2HostAntiAliasing::Off;
+-    return std::nullopt;
+-}
+-
+ // FXAA 3.11 (quality variant) at the picture's own resolution, before the window scales it.
+ // Needs a window (an OpenGL context).
+ class Ps2HostFxaa
+@@ -34,9 +11,8 @@ public:
+     bool load();
+     void unload();
+ 
+-    // Renders the picture through FXAA into a texture of its size and returns that texture. Like
+-    // every raylib render texture it is stored upside down: draw it with a negative source height.
+-    // The source must be sampled with bilinear filtering and clamped edges.
++    // Renders the picture through FXAA into a texture of its size, the same way up, and returns that
++    // texture. The source must be sampled with bilinear filtering and clamped edges.
+     const Texture2D &apply(const Texture2D &picture);
+ 
+ private:
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_host_smaa.h b/ps2xRuntime/include/runtime/gs/ps2_host_smaa.h
+new file mode 100644
+index 0000000..049724b
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/ps2_host_smaa.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include "raylib.h"
++
++// SMAA 1x (Jimenez et al., preset HIGH) at the picture's own resolution, before the window scales
++// it. Built from the reference SMAA.hlsl and its precomputed area and search textures in the
++// paraLLEl-GS checkout's Granite; without paraLLEl-GS load() fails. Needs a window (an OpenGL context).
++class Ps2HostSmaa
++{
++public:
++    // False when SMAA was not built in or a shader does not compile.
++    bool load();
++    void unload();
++
++    // Renders the picture through SMAA's three passes (edge detection, blending weights,
++    // neighbourhood blending) into a texture of its size, the same way up, and returns that texture.
++    // The source must be sampled with bilinear filtering and clamped edges.
++    const Texture2D &apply(const Texture2D &picture);
++
++private:
++    struct Pass
++    {
++        Shader shader{};
++        int rtMetricsLocation = -1;
++    };
++
++    Pass m_edges;
++    Pass m_weights;
++    Pass m_blend;
++    int m_areaLocation = -1;
++    int m_searchLocation = -1;
++    int m_blendWeightsLocation = -1;
++    Texture2D m_area{};
++    Texture2D m_search{};
++    RenderTexture2D m_edgesTarget{};
++    RenderTexture2D m_weightsTarget{};
++    RenderTexture2D m_output{};
++};
+diff --git a/ps2xRuntime/src/lib/gs/ps2_host_fxaa.cpp b/ps2xRuntime/src/lib/gs/ps2_host_fxaa.cpp
+index 1fce137..3f95d28 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_host_fxaa.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_host_fxaa.cpp
+@@ -1,17 +1,17 @@
+ #include "runtime/gs/ps2_host_fxaa.h"
+ 
++#include "ps2_host_pass.h"
++
+ namespace
+ {
+-    // FXAA 3.11 quality algorithm (Timothy Lottes) for raylib's default vertex shader (GLSL 330):
++    // FXAA 3.11 quality algorithm (Timothy Lottes) for kPs2HostPassVertexShader (GLSL 330):
+     // find the edge through the pixel and its direction, walk along it to both ends, and blend the
+     // pixel with its neighbour across the edge by its position on the edge. Edges of less contrast
+     // than kEdgeThreshold of the local maximum are left alone; kSubpixel sets how much single-pixel
+     // detail is softened (0.75 is FXAA's default, lower keeps text and texture detail sharper).
+     constexpr const char *kFxaaFragmentShader = R"glsl(#version 330
+ in vec2 fragTexCoord;
+-in vec4 fragColor;
+ uniform sampler2D texture0;
+-uniform vec4 colDiffuse;
+ uniform vec2 texelSize;
+ out vec4 finalColor;
+ 
+@@ -41,7 +41,7 @@ void main()
+     float range = lumaMax - lumaMin;
+     if (range < max(kEdgeThresholdMin, lumaMax * kEdgeThreshold))
+     {
+-        finalColor = colorM * colDiffuse * fragColor;
++        finalColor = colorM;
+         return;
+     }
+ 
+@@ -118,14 +118,14 @@ void main()
+         finalUv.y += offset * stepAcross;
+     else
+         finalUv.x += offset * stepAcross;
+-    finalColor = vec4(texture(texture0, finalUv).rgb, colorM.a) * colDiffuse * fragColor;
++    finalColor = vec4(texture(texture0, finalUv).rgb, colorM.a);
+ }
+ )glsl";
+ }
+ 
+ bool Ps2HostFxaa::load()
+ {
+-    m_shader = LoadShaderFromMemory(nullptr, kFxaaFragmentShader);
++    m_shader = LoadShaderFromMemory(kPs2HostPassVertexShader, kFxaaFragmentShader);
+     m_texelSizeLocation = GetShaderLocation(m_shader, "texelSize");
+     // raylib substitutes its default shader, which has no texelSize, when compiling fails.
+     if (m_texelSizeLocation < 0)
+@@ -139,9 +139,7 @@ bool Ps2HostFxaa::load()
+ 
+ void Ps2HostFxaa::unload()
+ {
+-    if (m_target.id != 0)
+-        UnloadRenderTexture(m_target);
+-    m_target = {};
++    ps2UnloadHostPassTarget(m_target);
+     if (m_texelSizeLocation >= 0)
+         UnloadShader(m_shader);
+     m_shader = {};
+@@ -150,13 +148,7 @@ void Ps2HostFxaa::unload()
+ 
+ const Texture2D &Ps2HostFxaa::apply(const Texture2D &picture)
+ {
+-    if (m_target.texture.width != picture.width || m_target.texture.height != picture.height)
+-    {
+-        if (m_target.id != 0)
+-            UnloadRenderTexture(m_target);
+-        m_target = LoadRenderTexture(picture.width, picture.height);
+-        SetTextureWrap(m_target.texture, TEXTURE_WRAP_CLAMP);
+-    }
++    ps2EnsureHostPassTarget(m_target, picture.width, picture.height);
+ 
+     const float texelSize[2] = {1.0f / static_cast<float>(picture.width), 1.0f / static_cast<float>(picture.height)};
+     SetShaderValue(m_shader, m_texelSizeLocation, texelSize, SHADER_UNIFORM_VEC2);
+diff --git a/ps2xRuntime/src/lib/gs/ps2_host_pass.h b/ps2xRuntime/src/lib/gs/ps2_host_pass.h
+new file mode 100644
+index 0000000..6519890
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/ps2_host_pass.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include "raylib.h"
++
++// Vertex shader of the host's picture passes. The texture coordinate follows the output pixel, so a
++// pass rendered into a raylib render texture keeps its input's row order (raylib's own coordinates
++// would turn it upside down), and the passes read each other's output the same way up.
++inline constexpr const char *kPs2HostPassVertexShader = R"glsl(#version 330
++in vec3 vertexPosition;
++uniform mat4 mvp;
++out vec2 fragTexCoord;
++void main()
++{
++    gl_Position = mvp * vec4(vertexPosition, 1.0);
++    fragTexCoord = gl_Position.xy * 0.5 + 0.5;
++}
++)glsl";
++
++// Makes `target` a render texture of the given size, sampled bilinearly with clamped edges.
++inline void ps2EnsureHostPassTarget(RenderTexture2D &target, int width, int height)
++{
++    if (target.id != 0 && target.texture.width == width && target.texture.height == height)
++        return;
++    if (target.id != 0)
++        UnloadRenderTexture(target);
++    target = LoadRenderTexture(width, height);
++    SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
++    SetTextureWrap(target.texture, TEXTURE_WRAP_CLAMP);
++}
++
++inline void ps2UnloadHostPassTarget(RenderTexture2D &target)
++{
++    if (target.id != 0)
++        UnloadRenderTexture(target);
++    target = {};
++}
+diff --git a/ps2xRuntime/src/lib/gs/ps2_host_smaa.cpp b/ps2xRuntime/src/lib/gs/ps2_host_smaa.cpp
+new file mode 100644
+index 0000000..8495da7
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/ps2_host_smaa.cpp
+@@ -0,0 +1,228 @@
++#include "runtime/gs/ps2_host_smaa.h"
++
++#include "ps2_host_pass.h"
++#include "rlgl.h"
++
++#include <string>
++#include <vector>
++
++#if defined(PS2X_HAS_SMAA)
++#include "AreaTex.h"
++#include "SearchTex.h"
++#include "ps2_smaa_hlsl.h" // kSmaaHlsl: SMAA.hlsl, generated by CMake
++#endif
++
++namespace
++{
++#if defined(PS2X_HAS_SMAA)
++    // The passes' entry points around SMAA.hlsl, as Granite's smaa_*.vert/frag do it. The texture
++    // coordinate follows the output pixel (see kPs2HostPassVertexShader).
++    constexpr const char *kEdgesVertex = R"glsl(
++in vec3 vertexPosition;
++uniform mat4 mvp;
++out vec2 texcoord;
++out vec4 offset0;
++out vec4 offset1;
++out vec4 offset2;
++void main()
++{
++    gl_Position = mvp * vec4(vertexPosition, 1.0);
++    texcoord = gl_Position.xy * 0.5 + 0.5;
++    vec4 offset[3];
++    SMAAEdgeDetectionVS(texcoord, offset);
++    offset0 = offset[0];
++    offset1 = offset[1];
++    offset2 = offset[2];
++}
++)glsl";
++
++    constexpr const char *kEdgesFragment = R"glsl(
++in vec2 texcoord;
++in vec4 offset0;
++in vec4 offset1;
++in vec4 offset2;
++uniform sampler2D texture0;
++out vec4 finalColor;
++void main()
++{
++    finalColor = vec4(SMAALumaEdgeDetectionPS(texcoord, vec4[](offset0, offset1, offset2), texture0), 0.0, 0.0);
++}
++)glsl";
++
++    constexpr const char *kWeightsVertex = R"glsl(
++in vec3 vertexPosition;
++uniform mat4 mvp;
++out vec2 texcoord;
++out vec2 pixcoord;
++out vec4 offset0;
++out vec4 offset1;
++out vec4 offset2;
++void main()
++{
++    gl_Position = mvp * vec4(vertexPosition, 1.0);
++    texcoord = gl_Position.xy * 0.5 + 0.5;
++    vec4 offset[3];
++    SMAABlendingWeightCalculationVS(texcoord, pixcoord, offset);
++    offset0 = offset[0];
++    offset1 = offset[1];
++    offset2 = offset[2];
++}
++)glsl";
++
++    constexpr const char *kWeightsFragment = R"glsl(
++in vec2 texcoord;
++in vec2 pixcoord;
++in vec4 offset0;
++in vec4 offset1;
++in vec4 offset2;
++uniform sampler2D texture0;
++uniform sampler2D areaTex;
++uniform sampler2D searchTex;
++out vec4 finalColor;
++void main()
++{
++    finalColor = SMAABlendingWeightCalculationPS(texcoord, pixcoord, vec4[](offset0, offset1, offset2),
++                                                 texture0, areaTex, searchTex, vec4(0.0));
++}
++)glsl";
++
++    constexpr const char *kBlendVertex = R"glsl(
++in vec3 vertexPosition;
++uniform mat4 mvp;
++out vec2 texcoord;
++out vec4 offset;
++void main()
++{
++    gl_Position = mvp * vec4(vertexPosition, 1.0);
++    texcoord = gl_Position.xy * 0.5 + 0.5;
++    SMAANeighborhoodBlendingVS(texcoord, offset);
++}
++)glsl";
++
++    constexpr const char *kBlendFragment = R"glsl(
++in vec2 texcoord;
++in vec4 offset;
++uniform sampler2D texture0;
++uniform sampler2D blendTex;
++out vec4 finalColor;
++void main()
++{
++    finalColor = SMAANeighborhoodBlendingPS(texcoord, offset, texture0, blendTex);
++}
++)glsl";
++
++    std::string smaaStage(bool vertex, const char *entryPoint)
++    {
++        std::string source = "#version 330\n"
++                             "#define SMAA_GLSL_3\n"
++                             "#define SMAA_PRESET_HIGH\n"
++                             "#define SMAA_RT_METRICS rtMetrics\n";
++        source += vertex ? "#define SMAA_INCLUDE_VS 1\n#define SMAA_INCLUDE_PS 0\n"
++                         : "#define SMAA_INCLUDE_VS 0\n#define SMAA_INCLUDE_PS 1\n";
++        source += "uniform vec4 rtMetrics;\n";
++        source += kSmaaHlsl;
++        source += entryPoint;
++        return source;
++    }
++#endif
++
++    void unloadShader(Shader &shader, int &location)
++    {
++        if (location >= 0)
++            UnloadShader(shader);
++        shader = {};
++        location = -1;
++    }
++}
++
++bool Ps2HostSmaa::load()
++{
++#if defined(PS2X_HAS_SMAA)
++    const auto loadPass = [](Pass &pass, const char *vertex, const char *fragment) {
++        pass.shader = LoadShaderFromMemory(smaaStage(true, vertex).c_str(), smaaStage(false, fragment).c_str());
++        pass.rtMetricsLocation = GetShaderLocation(pass.shader, "rtMetrics");
++        // raylib substitutes its default shader, which has no rtMetrics, when compiling fails.
++        return pass.rtMetricsLocation >= 0;
++    };
++    if (!loadPass(m_edges, kEdgesVertex, kEdgesFragment) ||
++        !loadPass(m_weights, kWeightsVertex, kWeightsFragment) ||
++        !loadPass(m_blend, kBlendVertex, kBlendFragment))
++    {
++        unload();
++        return false;
++    }
++    m_areaLocation = GetShaderLocation(m_weights.shader, "areaTex");
++    m_searchLocation = GetShaderLocation(m_weights.shader, "searchTex");
++    m_blendWeightsLocation = GetShaderLocation(m_blend.shader, "blendTex");
++
++    // The area texture is two channels; raylib shows a two-channel texture as gray and alpha, so it
++    // is uploaded as RGBA with the channels in red and green.
++    std::vector<unsigned char> area(static_cast<size_t>(AREATEX_WIDTH) * AREATEX_HEIGHT * 4u);
++    for (size_t i = 0; i < static_cast<size_t>(AREATEX_WIDTH) * AREATEX_HEIGHT; ++i)
++    {
++        area[i * 4u] = areaTexBytes[i * 2u];
++        area[i * 4u + 1u] = areaTexBytes[i * 2u + 1u];
++        area[i * 4u + 3u] = 0xFFu;
++    }
++    m_area = LoadTextureFromImage(Image{area.data(), AREATEX_WIDTH, AREATEX_HEIGHT, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8});
++    std::vector<unsigned char> search(searchTexBytes, searchTexBytes + SEARCHTEX_SIZE);
++    m_search = LoadTextureFromImage(Image{search.data(), SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 1, PIXELFORMAT_UNCOMPRESSED_GRAYSCALE});
++    for (const Texture2D &texture : {m_area, m_search})
++    {
++        SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
++        SetTextureWrap(texture, TEXTURE_WRAP_CLAMP);
++    }
++    return true;
++#else
++    return false;
++#endif
++}
++
++void Ps2HostSmaa::unload()
++{
++    ps2UnloadHostPassTarget(m_edgesTarget);
++    ps2UnloadHostPassTarget(m_weightsTarget);
++    ps2UnloadHostPassTarget(m_output);
++    if (m_area.id != 0)
++        UnloadTexture(m_area);
++    if (m_search.id != 0)
++        UnloadTexture(m_search);
++    m_area = {};
++    m_search = {};
++    for (Pass *pass : {&m_edges, &m_weights, &m_blend})
++        unloadShader(pass->shader, pass->rtMetricsLocation);
++}
++
++const Texture2D &Ps2HostSmaa::apply(const Texture2D &picture)
++{
++    ps2EnsureHostPassTarget(m_edgesTarget, picture.width, picture.height);
++    ps2EnsureHostPassTarget(m_weightsTarget, picture.width, picture.height);
++    ps2EnsureHostPassTarget(m_output, picture.width, picture.height);
++
++    const float rtMetrics[4] = {1.0f / static_cast<float>(picture.width), 1.0f / static_cast<float>(picture.height),
++                                static_cast<float>(picture.width), static_cast<float>(picture.height)};
++    // Each pass draws `input` over its whole target, replacing what is there: the edges and weights
++    // carry data in their alpha channel, which raylib's alpha blending would mix away.
++    const auto runPass = [&](RenderTexture2D &target, const Pass &pass, const Texture2D &input, auto bindExtra) {
++        SetShaderValue(pass.shader, pass.rtMetricsLocation, rtMetrics, SHADER_UNIFORM_VEC4);
++        BeginTextureMode(target);
++        ClearBackground(BLANK);
++        rlSetBlendFactors(RL_ONE, RL_ZERO, RL_FUNC_ADD);
++        BeginBlendMode(BLEND_CUSTOM);
++        BeginShaderMode(pass.shader);
++        bindExtra();
++        DrawTexture(input, 0, 0, WHITE);
++        EndShaderMode();
++        EndBlendMode();
++        EndTextureMode();
++    };
++    runPass(m_edgesTarget, m_edges, picture, [] {});
++    runPass(m_weightsTarget, m_weights, m_edgesTarget.texture, [&] {
++        SetShaderValueTexture(m_weights.shader, m_areaLocation, m_area);
++        SetShaderValueTexture(m_weights.shader, m_searchLocation, m_search);
++    });
++    runPass(m_output, m_blend, picture, [&] {
++        SetShaderValueTexture(m_blend.shader, m_blendWeightsLocation, m_weightsTarget.texture);
++    });
++    return m_output.texture;
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 590a2ec..5808483 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/gs/ps2_display_rect.h"
+ #include "runtime/gs/ps2_host_filter.h"
+ #include "runtime/gs/ps2_host_fxaa.h"
++#include "runtime/gs/ps2_host_smaa.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -2453,23 +2454,30 @@ void PS2Runtime::run()
+         }
+     }
+ 
+-    Ps2HostAntiAliasing antiAliasing = Ps2HostAntiAliasing::Fxaa;
++    Ps2HostAntiAliasing antiAliasing = Ps2HostAntiAliasing::Smaa;
+     if (const char *name = std::getenv("PS2_HOST_AA"))
+     {
+         if (const std::optional<Ps2HostAntiAliasing> parsed = ps2ParseHostAntiAliasing(name))
+             antiAliasing = *parsed;
+         else
+-            std::cerr << "[host] unknown PS2_HOST_AA '" << name << "' (expected fxaa or off), using fxaa" << std::endl;
++            std::cerr << "[host] unknown PS2_HOST_AA '" << name << "' (expected smaa, fxaa or off), using smaa" << std::endl;
+     }
++    Ps2HostSmaa smaa;
+     Ps2HostFxaa fxaa;
++    if (antiAliasing == Ps2HostAntiAliasing::Smaa && !smaa.load())
++    {
++        std::cerr << "[host] SMAA is unavailable (not built in or its shaders did not compile), using FXAA" << std::endl;
++        antiAliasing = Ps2HostAntiAliasing::Fxaa;
++    }
+     if (antiAliasing == Ps2HostAntiAliasing::Fxaa && !fxaa.load())
+     {
+         std::cerr << "[host] the FXAA shader did not compile, no anti-aliasing" << std::endl;
+         antiAliasing = Ps2HostAntiAliasing::Off;
+     }
+-    const bool useFxaa = antiAliasing == Ps2HostAntiAliasing::Fxaa;
+-    // FXAA reads the picture through bilinear fetches; the window's filter then applies to its output.
+-    const Ps2HostFilter uploadFilter = (useFxaa && hostFilter == Ps2HostFilter::Nearest) ? Ps2HostFilter::Bilinear : hostFilter;
++    const bool useAntiAliasing = antiAliasing != Ps2HostAntiAliasing::Off;
++    // The filters read the picture through bilinear fetches; the window's filter then applies to their output.
++    const Ps2HostFilter uploadFilter =
++        (useAntiAliasing && hostFilter == Ps2HostFilter::Nearest) ? Ps2HostFilter::Bilinear : hostFilter;
+     Texture2D shownTex = frameTex;
+     setFrameTextureFilter(frameTex, uploadFilter);
+     UnloadImage(blank);
+@@ -2535,13 +2543,13 @@ void PS2Runtime::run()
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         const bool uploaded = UploadFrame(frameTex, uploadFilter, this, presentWidth, presentHeight);
+-        if (!useFxaa)
++        if (!useAntiAliasing)
+         {
+             shownTex = frameTex;
+         }
+         else if (uploaded)
+         {
+-            shownTex = fxaa.apply(frameTex);
++            shownTex = antiAliasing == Ps2HostAntiAliasing::Smaa ? smaa.apply(frameTex) : fxaa.apply(frameTex);
+             setFrameTextureFilter(shownTex, hostFilter);
+         }
+ 
+@@ -2551,8 +2559,7 @@ void PS2Runtime::run()
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+         const Ps2HostRect picture = ps2FitDisplayRect(static_cast<float>(GetScreenWidth()),
+                                                       static_cast<float>(GetScreenHeight()));
+-        // FXAA's output is a render texture, stored upside down.
+-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, useFxaa ? -srcHeight : srcHeight};
++        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+         const Rectangle dstRect{picture.x, picture.y, picture.width, picture.height};
+         if (hostFilter == Ps2HostFilter::Bicubic)
+         {
+@@ -2589,6 +2596,7 @@ void PS2Runtime::run()
+         m_debugUiInitialized = false;
+     }
+     UnloadTexture(frameTex);
++    smaa.unload();
+     fxaa.unload();
+     if (hostFilter == Ps2HostFilter::Bicubic)
+         UnloadShader(bicubicShader);
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 306c782..f1f9462 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -10,6 +10,7 @@
+ #include "runtime/gs/ps2_display_rect.h"
+ #include "runtime/gs/ps2_host_filter.h"
+ #include "runtime/gs/ps2_host_fxaa.h"
++#include "runtime/gs/ps2_host_smaa.h"
+ #include "runtime/gs/ps2_gs_psmct32.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
+@@ -31,29 +32,33 @@ using namespace ps2_syscalls;
+ 
+ namespace
+ {
+-    constexpr int kFxaaSize = 32;
++    constexpr int kAaSize = 32;
+ 
+-    // Draws a black and white picture (white where `white(x, y)`) through FXAA in a hidden window and
+-    // returns the result's red channel, row 0 at the top. Empty when no window can be opened.
+-    template <typename White>
+-    std::optional<std::vector<uint8_t>> renderThroughFxaa(TestCase &t, White white)
++    // Draws a black and white picture (white where `white(x, y)`) through an anti-aliasing filter
++    // (Ps2HostFxaa or Ps2HostSmaa) in a hidden window and returns the result's red channel, row 0 at
++    // the top. Empty when no window can be opened.
++    template <typename Filter, typename White>
++    std::optional<std::vector<uint8_t>> renderThrough(TestCase &t, White white)
+     {
+         SetTraceLogLevel(LOG_WARNING);
+         SetConfigFlags(FLAG_WINDOW_HIDDEN);
+-        InitWindow(kFxaaSize, kFxaaSize, "fxaa test");
+-        if (!IsWindowReady())
+-        {
++        const auto unavailable = [&t](const char *what) {
+             const char *required = std::getenv("PS2_TEST_REQUIRE_GPU");
+             if (required && std::string(required) == "1")
+-                t.Fail("a window is required (PS2_TEST_REQUIRE_GPU=1) but cannot be opened");
++                t.Fail(std::string(what) + " (PS2_TEST_REQUIRE_GPU=1)");
+             else
+-                std::cout << "    skipped: no window" << std::endl;
++                std::cout << "    skipped: " << what << std::endl;
++        };
++        InitWindow(kAaSize, kAaSize, "anti-aliasing test");
++        if (!IsWindowReady())
++        {
++            unavailable("no window can be opened");
+             return std::nullopt;
+         }
+ 
+-        Image image = GenImageColor(kFxaaSize, kFxaaSize, BLACK);
+-        for (int y = 0; y < kFxaaSize; ++y)
+-            for (int x = 0; x < kFxaaSize; ++x)
++        Image image = GenImageColor(kAaSize, kAaSize, BLACK);
++        for (int y = 0; y < kAaSize; ++y)
++            for (int x = 0; x < kAaSize; ++x)
+                 if (white(x, y))
+                     ImageDrawPixel(&image, x, y, WHITE);
+         Texture2D picture = LoadTextureFromImage(image);
+@@ -62,22 +67,22 @@ namespace
+         SetTextureWrap(picture, TEXTURE_WRAP_CLAMP);
+ 
+         std::optional<std::vector<uint8_t>> result;
+-        Ps2HostFxaa fxaa;
+-        if (!fxaa.load())
++        Filter filter;
++        if (!filter.load())
+         {
+-            t.Fail("the FXAA shader does not compile");
++            // SMAA is built only with paraLLEl-GS, whose checkout provides it.
++            unavailable("the filter is not built in or its shaders do not compile");
+         }
+         else
+         {
+-            Image out = LoadImageFromTexture(fxaa.apply(picture));
+-            ImageFlipVertical(&out);
++            Image out = LoadImageFromTexture(filter.apply(picture));
+             ImageFormat(&out, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+             const auto *pixels = static_cast<const uint8_t *>(out.data);
+-            result.emplace(static_cast<size_t>(kFxaaSize * kFxaaSize));
++            result.emplace(static_cast<size_t>(kAaSize * kAaSize));
+             for (size_t i = 0; i < result->size(); ++i)
+                 (*result)[i] = pixels[i * 4u];
+             UnloadImage(out);
+-            fxaa.unload();
++            filter.unload();
+         }
+         UnloadTexture(picture);
+         CloseWindow();
+@@ -527,50 +532,86 @@ void register_ps2_gs_tests()
+             t.IsFalse(ps2ParseHostFilter("").has_value(), "an empty value is rejected");
+         });
+ 
+-        tc.Run("PS2_HOST_AA selects FXAA or none", [](TestCase &t)
++        tc.Run("PS2_HOST_AA selects SMAA, FXAA or none", [](TestCase &t)
+         {
++            t.IsTrue(ps2ParseHostAntiAliasing("smaa") == Ps2HostAntiAliasing::Smaa, "smaa");
+             t.IsTrue(ps2ParseHostAntiAliasing("fxaa") == Ps2HostAntiAliasing::Fxaa, "fxaa");
+             t.IsTrue(ps2ParseHostAntiAliasing("off") == Ps2HostAntiAliasing::Off, "off");
+-            t.IsFalse(ps2ParseHostAntiAliasing("smaa").has_value(), "an unknown method is rejected");
++            t.IsFalse(ps2ParseHostAntiAliasing("msaa").has_value(), "an unknown method is rejected");
+             t.IsFalse(ps2ParseHostAntiAliasing("").has_value(), "an empty value is rejected");
+         });
+ 
+         tc.Run("FXAA smooths a staircase edge and leaves flat areas alone (GPU)", [](TestCase &t)
+         {
+-            const std::optional<std::vector<uint8_t>> staircase = renderThroughFxaa(t, [](int x, int y) { return x > y; });
++            const std::optional<std::vector<uint8_t>> staircase = renderThrough<Ps2HostFxaa>(t, [](int x, int y) { return x > y; });
+             if (!staircase)
+                 return;
+             uint32_t blended = 0u;
+-            for (int y = 0; y < kFxaaSize; ++y)
+-                for (int x = 0; x < kFxaaSize; ++x)
++            for (int y = 0; y < kAaSize; ++y)
++                for (int x = 0; x < kAaSize; ++x)
+                 {
+-                    const uint8_t value = (*staircase)[static_cast<size_t>(y * kFxaaSize + x)];
++                    const uint8_t value = (*staircase)[static_cast<size_t>(y * kAaSize + x)];
+                     if (value > 16u && value < 239u)
+                         ++blended;
+                 }
+-            t.IsTrue(blended >= kFxaaSize, "the pixels along the diagonal are blended");
+-            t.Equals(static_cast<uint32_t>((*staircase)[kFxaaSize - 2]), 255u, "far above the edge stays white");
+-            t.Equals(static_cast<uint32_t>((*staircase)[(kFxaaSize - 2) * kFxaaSize + 1]), 0u, "far below the edge stays black");
++            t.IsTrue(blended >= kAaSize, "the pixels along the diagonal are blended");
++            t.Equals(static_cast<uint32_t>((*staircase)[kAaSize - 2]), 255u, "far above the edge stays white");
++            t.Equals(static_cast<uint32_t>((*staircase)[(kAaSize - 2) * kAaSize + 1]), 0u, "far below the edge stays black");
+ 
+-            const std::optional<std::vector<uint8_t>> straight = renderThroughFxaa(t, [](int x, int) { return x >= kFxaaSize / 2; });
++            const std::optional<std::vector<uint8_t>> straight = renderThrough<Ps2HostFxaa>(t, [](int x, int) { return x >= kAaSize / 2; });
+             if (!straight)
+                 return;
+             uint32_t softened = 0u;
+             uint32_t changedAway = 0u;
+-            for (int y = 0; y < kFxaaSize; ++y)
+-                for (int x = 0; x < kFxaaSize; ++x)
++            for (int y = 0; y < kAaSize; ++y)
++                for (int x = 0; x < kAaSize; ++x)
+                 {
+-                    const int value = (*straight)[static_cast<size_t>(y * kFxaaSize + x)];
+-                    const int difference = std::abs(value - (x >= kFxaaSize / 2 ? 255 : 0));
++                    const int value = (*straight)[static_cast<size_t>(y * kAaSize + x)];
++                    const int difference = std::abs(value - (x >= kAaSize / 2 ? 255 : 0));
+                     if (difference > 16)
+                         ++softened;
+-                    if (difference != 0 && std::abs(2 * x + 1 - kFxaaSize) > 2)
++                    if (difference != 0 && std::abs(2 * x + 1 - kAaSize) > 2)
+                         ++changedAway;
+                 }
+             t.Equals(softened, 0u, "an edge along the pixel grid stays sharp");
+             t.Equals(changedAway, 0u, "only the two columns beside the edge are touched");
+         });
+ 
++        tc.Run("SMAA smooths a staircase edge and leaves straight edges and flat areas alone (GPU)", [](TestCase &t)
++        {
++            const std::optional<std::vector<uint8_t>> staircase = renderThrough<Ps2HostSmaa>(t, [](int x, int y) { return x > y; });
++            if (!staircase)
++                return;
++            uint32_t blended = 0u;
++            for (int y = 0; y < kAaSize; ++y)
++                for (int x = 0; x < kAaSize; ++x)
++                {
++                    const uint8_t value = (*staircase)[static_cast<size_t>(y * kAaSize + x)];
++                    if (value > 16u && value < 239u)
++                        ++blended;
++                }
++            t.IsTrue(blended >= kAaSize, "the pixels along the diagonal are blended");
++            t.Equals(static_cast<uint32_t>((*staircase)[kAaSize - 2]), 255u, "far above the edge stays white");
++            t.Equals(static_cast<uint32_t>((*staircase)[(kAaSize - 2) * kAaSize + 1]), 0u, "far below the edge stays black");
++
++            // A straight edge and a one-pixel line, like a letter's stroke: neither has steps.
++            const auto edge = [](int x, int) { return x >= kAaSize / 2; };
++            const auto line = [](int, int y) { return y == kAaSize / 4; };
++            for (const bool isLine : {false, true})
++            {
++                const std::optional<std::vector<uint8_t>> result =
++                    isLine ? renderThrough<Ps2HostSmaa>(t, line) : renderThrough<Ps2HostSmaa>(t, edge);
++                if (!result)
++                    return;
++                uint32_t changed = 0u;
++                for (int y = 0; y < kAaSize; ++y)
++                    for (int x = 0; x < kAaSize; ++x)
++                        if ((*result)[static_cast<size_t>(y * kAaSize + x)] != ((isLine ? line(x, y) : edge(x, y)) ? 255u : 0u))
++                            ++changed;
++                t.Equals(changed, 0u, isLine ? "a one-pixel line is left as it is" : "a straight edge is left as it is");
++            }
++        });
++
+         tc.Run("GS interrupt line follows CSR events unmasked by IMR", [](TestCase &t)
+         {
+             PS2Memory mem;
+-- 
+2.54.0 (Apple Git-157)
+
