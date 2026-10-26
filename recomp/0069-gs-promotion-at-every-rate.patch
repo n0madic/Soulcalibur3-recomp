@@ -1,0 +1,116 @@
+From d3af0ae4e253923a3fa4fb85a775ab5f8b530774 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 21:27:25 +0200
+Subject: [PATCH] GS: scan out the blit's source at every rate, no
+ super-sampling by default
+
+With 4 samples paraLLEl-GS takes longer than a 60 Hz frame to shade
+Soulcalibur III's battles on an M1 Pro: the game falls to 48-55 vsyncs
+per second and the audio underruns. Without super-sampling the battles
+hold 60, and replacing the final blit by its source keeps the picture
+free of the game's 16-bit line stripes and its motion trail.
+---
+ ps2xRuntime/include/runtime/gs/gs_parallel.h |  9 ++++-----
+ ps2xRuntime/src/lib/gs/gs_parallel.cpp       | 11 +++++------
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |  7 +++----
+ ps2xTest/src/ps2_gs_parallel_tests.cpp       | 14 +++++++++++---
+ 4 files changed, 23 insertions(+), 18 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+index 7a8e0fa..e6ff148 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_parallel.h
++++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+@@ -23,11 +23,10 @@ std::vector<uint64_t> gsBuildImageUploadPacket(uint64_t bitbltbuf, uint64_t trxp
+ // Image quality settings of the GPU renderer.
+ struct GSParallelOptions
+ {
+-    // Samples per pixel: 1, 4, 8 or 16. 1 scans out exactly what the game displays. With 4 or more the
+-    // picture is scanned out at twice its resolution from the samples (4: one per output pixel, 8 and
+-    // 16: averaged, which smooths polygon edges); a game's final blit of its frame into the display
+-    // buffer (often scaled down, 16-bit, or blended with the previous picture) is replaced by the
+-    // blit's source buffer, so that the samples reach the screen.
++    // Samples per pixel: 1, 4, 8 or 16. With 4 or more the picture is scanned out at twice its
++    // resolution from the samples (4: one per output pixel, 8 and 16: averaged, which smooths polygon
++    // edges). At every rate a game's final blit of its frame into the display buffer (often scaled
++    // down, 16-bit, or blended with the previous picture) is replaced by the blit's source buffer.
+     uint32_t superSampling = 1u;
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+index 5704361..1eb9268 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+@@ -128,12 +128,11 @@ namespace
+                 return false;
+             }
+             m_gs.set_signal_interface(&m_signals);
+-            if (m_highResolution)
+-            {
+-                ParallelGS::Hacks hacks;
+-                hacks.backbuffer_promotion = true;
+-                m_gs.set_hacks(hacks);
+-            }
++            // The blit's source is scanned out at every rate: the display buffer it replaces is often 16-bit
++            // or blended with the previous picture.
++            ParallelGS::Hacks hacks;
++            hacks.backbuffer_promotion = true;
++            m_gs.set_hacks(hacks);
+             m_ready = true;
+             return true;
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1534013..a09e006 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -731,16 +731,15 @@ bool PS2Runtime::selectGsRenderer()
+         return false;
+     }
+ 
+-    // 8x super-sampling by default: twice the resolution with smoothed edges, at no cost to the frame
+-    // rate on an M1 Pro. PS2_GS_SSAA=1 shows exactly what the game displays.
++    // No super-sampling by default: with 4 samples an M1 Pro takes longer than a 60 Hz frame to shade
++    // Soulcalibur III's battles. PS2_GS_SSAA=4 or more doubles the resolution on a faster GPU.
+     GSParallelOptions options;
+-    options.superSampling = 8u;
+     if (const char *ssaa = std::getenv("PS2_GS_SSAA"))
+     {
+         const std::optional<uint32_t> rate = gsParseSuperSampling(ssaa);
+         if (!rate)
+         {
+-            std::cerr << "[gs] unsupported PS2_GS_SSAA '" << ssaa << "' (expected 1, 2, 4, 8 or 16)" << std::endl;
++            std::cerr << "[gs] unsupported PS2_GS_SSAA '" << ssaa << "' (expected 1, 4, 8 or 16)" << std::endl;
+             return false;
+         }
+         options.superSampling = *rate;
+diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+index 2e75115..3f3ca1e 100644
+--- a/ps2xTest/src/ps2_gs_parallel_tests.cpp
++++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+@@ -258,13 +258,21 @@ void register_ps2_gs_parallel_tests()
+             t.IsFalse(gsParseSuperSampling("").has_value(), "an empty value is rejected");
+         });
+ 
+-        tc.Run("without super-sampling the blitted frame is presented as the display buffer (GPU GS)", [](TestCase &t)
++        tc.Run("without super-sampling the blit's source is presented at the display's resolution (GPU GS)", [](TestCase &t)
+         {
+             const Presented presented = presentBlittedFrame(t, 1u);
++            t.Equals(presented.width, 512u, "the display's width");
++            t.Equals(presented.height, 512u, "the display's height");
++            t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen,
++                     "the blit's 32-bit source buffer is scanned out instead of the 16-bit display buffer");
++        });
++
++        tc.Run("without super-sampling a render pass of edge lines alone presents the display buffer (GPU GS)", [](TestCase &t)
++        {
++            const Presented presented = presentBlittedFrame(t, 1u, EdgeLines::OwnPass);
+             t.Equals(presented.width, 512u, "the display buffer's width");
+-            t.Equals(presented.height, 512u, "the display buffer's height");
+             t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen & 0xF8u,
+-                     "the triangle reaches the screen through the 16-bit display buffer");
++                     "with no blit in the pass the 16-bit display buffer is scanned out");
+         });
+ 
+         tc.Run("with super-sampling the blit's source is presented at twice the resolution (GPU GS)", [](TestCase &t)
+-- 
+2.54.0 (Apple Git-157)
+
