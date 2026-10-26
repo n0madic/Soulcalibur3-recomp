@@ -1,4 +1,4 @@
-From a0f3d65339f4806ad5b1b7f23a99af29eb1a3a5f Mon Sep 17 00:00:00 2001
+From f3bcd9678c39ced42bd3e58b87be3a071ef3ac4b Mon Sep 17 00:00:00 2001
 From: n0madic <800462+n0madic@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 23:50:45 +0300
 Subject: [PATCH] MPEG: route native IPU transfers by their source ring
@@ -18,23 +18,24 @@ backpressured DMA, and the small output buffer's red zone. It fails with
 the previous runtime. The CPU-GS suite runs 530 tests, with 528 passing
 and the two previously recorded VIF packet/MPEG callback failures.
 ---
- ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp    |  49 ++++++++-
+ ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp    |  50 ++++++++-
  ps2xTest/src/mpeg_ipu_fixture_m2v.h          |  19 ++++
  ps2xTest/src/ps2_runtime_expansion_tests.cpp | 109 +++++++++++++++++++
- 3 files changed, 176 insertions(+), 1 deletion(-)
+ 3 files changed, 177 insertions(+), 1 deletion(-)
 
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index 8da6d28..8e01877 100644
+index 6983e0b..689c9b5 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-@@ -1594,6 +1594,51 @@ namespace ps2_stubs
+@@ -1594,6 +1594,52 @@ namespace ps2_stubs
              return accepting;
          }
  
-+        // Sofdec keeps the native ES ring in the libmpeg context: data at
-+        // +0x48, its adjacent DMA-tag array at +0x4c and its byte length at
-+        // +0x60. Validate that layout before using it; feeders without a
-+        // recognized native ring retain the GetPicture-selected fallback.
++        // Soulcalibur III's Sofdec (CRI MPV) keeps its ES ring descriptor right
++        // after the sceMpeg struct it passes to libmpeg: data at mp+0x48, the
++        // adjacent DMA-tag array at +0x4c and the byte length at +0x60. This is
++        // the game's layout, not libmpeg's, so it is validated before use;
++        // feeders without such a ring keep the GetPicture-selected fallback.
 +        // Called with g_mpeg_stub_mutex held.
 +        uint32_t nativeIpuInputOwner(PS2Runtime *runtime, uint32_t fallback)
 +        {
@@ -79,7 +80,7 @@ index 8da6d28..8e01877 100644
          void installIpuInputSink(PS2Runtime *runtime)
          {
              runtime->memory().setIpuInputSink([runtime](const uint8_t *data, size_t size)
-@@ -1601,7 +1646,9 @@ namespace ps2_stubs
+@@ -1601,7 +1647,9 @@ namespace ps2_stubs
                  uint32_t active;
                  {
                      std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
@@ -118,10 +119,10 @@ index 999feea..75a1b5f 100644
 +    0x03, 0x12, 0x74, 0x70, 0x00, 0x00, 0x01, 0x04, 0x12, 0x74, 0x70,
 +};
 diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-index c68bcc0..167635e 100644
+index c9d191f..6bfd836 100644
 --- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
 +++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
-@@ -333,6 +333,52 @@ namespace
+@@ -483,6 +483,52 @@ namespace
          ctx->pc = 0u;
          runtime->requestStop();
      }
@@ -174,7 +175,7 @@ index c68bcc0..167635e 100644
  #endif
  
  }
-@@ -908,6 +954,69 @@ void register_ps2_runtime_expansion_tests()
+@@ -1141,6 +1187,69 @@ void register_ps2_runtime_expansion_tests()
              t.Equals(Ps2FastRead32(rdram, kMultiMpeg + 0x1000u), 0u, "idle second player stays unused");
              t.Equals(mem.readIORegister(0x1000b420u), 0u, "selected decoder drains pending DMA");
          });

@@ -1,0 +1,111 @@
+From b42ba4d3b704ad79f670ff2be8be058b238efb74 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:11:15 +0200
+Subject: [PATCH] Kernel: SuspendThread, ResumeThread and WakeupThread return
+ the thread id
+
+The EE kernel returns the thread id from these calls on success, and
+games compare against it. Soulcalibur III's ADX manager resumes its idle
+thread (which runs the Sofdec and ADX file servers) only when
+ResumeThread(id) == id; with 0 that thread slept forever after its first
+pass, so movie data was never read and Sofdec never asked for a picture.
+---
+ .../src/lib/Kernel/Syscalls/Thread.cpp        | 25 +++++++++++++-----
+ ps2xTest/src/ps2_runtime_kernel_tests.cpp     | 26 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 6 deletions(-)
+
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 76b8a92..1edf5cb 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -129,14 +129,21 @@ namespace ps2_syscalls
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
++        // The EE kernel's thread calls return the thread id on success, and games compare against it.
++        int idOnSuccess(int result, int id)
++        {
++            return result == KE_OK ? id : result;
++        }
++
+         void wakeupThreadImpl(uint8_t *rdram,
+                               R5900Context *ctx,
+                               PS2Runtime *runtime,
+                               bool interruptSafe)
+         {
+             EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-            const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+-            setReturnS32(ctx, result);
++            const int id = static_cast<int>(getRegU32(ctx, 4));
++            const int result = ee.wakeupThread(id, interruptSafe);
++            setReturnS32(ctx, idOnSuccess(result, id));
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
+@@ -315,16 +322,22 @@ namespace ps2_syscalls
+     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-        const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
+-        setReturnS32(ctx, result);
++        int id = static_cast<int>(getRegU32(ctx, 4));
++        if (id == 0)
++        {
++            id = ee.currentThreadId();
++        }
++        const int result = ee.suspendThread(id, false);
++        setReturnS32(ctx, idOnSuccess(result, id));
+         ee.transferIfRequested(false);
+     }
+ 
+     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+-        const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
+-        setReturnS32(ctx, result);
++        const int id = static_cast<int>(getRegU32(ctx, 4));
++        const int result = ee.resumeThread(id, false);
++        setReturnS32(ctx, idOnSuccess(result, id));
+         ee.transferIfRequested(false);
+     }
+ 
+diff --git a/ps2xTest/src/ps2_runtime_kernel_tests.cpp b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+index 8ca7593..5a7fb07 100644
+--- a/ps2xTest/src/ps2_runtime_kernel_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_kernel_tests.cpp
+@@ -781,6 +781,32 @@ void register_ps2_runtime_kernel_tests()
+                      "the resumed waiter should re-enter its priority queue once");
+         });
+ 
++        tc.Run("SuspendThread, ResumeThread and WakeupThread return the thread id", [](TestCase &t)
++        {
++            // Soulcalibur III's ADX manager wakes its idle thread (which runs the Sofdec and ADX file
++            // servers) only when ResumeThread(id) == id; with 0 the thread never ran again.
++            TestEnv env;
++            EeScheduler &ee = env.runtime.eeScheduler();
++            ee.reset(env.rdram.data(), env.ctx);
++            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
++            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u, 0u, 20, 0u});
++            t.Equals(ee.startThread(id, 0u, env.ctx, false), KE_OK, "StartThread should make the thread ready");
++
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
++            ps2_syscalls::SuspendThread(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(static_cast<int>(getRegU32(&env.ctx, 2)), id, "SuspendThread should return the thread id");
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
++            ps2_syscalls::ResumeThread(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(static_cast<int>(getRegU32(&env.ctx, 2)), id, "ResumeThread should return the thread id");
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
++            ps2_syscalls::WakeupThread(env.rdram.data(), &env.ctx, &env.runtime);
++            t.Equals(static_cast<int>(getRegU32(&env.ctx, 2)), id, "WakeupThread should return the thread id");
++
++            setRegU32(env.ctx, 4, static_cast<uint32_t>(id));
++            ps2_syscalls::ResumeThread(env.rdram.data(), &env.ctx, &env.runtime);
++            t.IsTrue(static_cast<int32_t>(getRegU32(&env.ctx, 2)) < 0, "resuming a thread that is not suspended should stay an error");
++        });
++
+         tc.Run("semaphore signal, delete, and release complete blocked contexts with exact results", [](TestCase &t)
+         {
+             const auto blockMain = [](TestEnv &env, int &semaId)
+-- 
+2.54.0 (Apple Git-157)
+

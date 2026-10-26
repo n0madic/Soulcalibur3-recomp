@@ -1,4 +1,4 @@
-From fc985c1528838f8f4d5fbb276f694c8f52e9ce2b Mon Sep 17 00:00:00 2001
+From e9b809d05c3d8f9ba97710d5aa5292277800dfed Mon Sep 17 00:00:00 2001
 From: n0madic <800462+n0madic@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 11:04:44 +0300
 Subject: [PATCH] MPEG: let native IPU users schedule presentation
@@ -6,15 +6,18 @@ Subject: [PATCH] MPEG: let native IPU users schedule presentation
 Sofdec already gates display frames on the ADX clock. Throttling low-level GetPicture to two assumed NTSC fields on a PAL 50 Hz scheduler decodes 29.97 fps video at 25 fps, stalls its shared SFD demux and starves the audio mixer. Its filled SPU2 queue contains silent 256-sample PCM blocks, which empty-buffer counters do not detect.
 
 Skip the HLE presentation wait only for the active native toIPU input. Preserve pacing for sceMpegAddBs/PSS input. In a manual capture, 25 silent spans in the affected 2.8-second THX passage disappear and the waveform remains aligned to the source ADX.
+
+Test: two queued native pictures requested in a row are both served in the same VBlank (fails without this change).
 ---
- ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
+ ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp    |  7 +++-
+ ps2xTest/src/ps2_runtime_expansion_tests.cpp | 43 +++++++++++++++++++-
+ 2 files changed, 47 insertions(+), 3 deletions(-)
 
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-index bfa26f5..2164afe 100644
+index df5db4e..36373d1 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
-@@ -2498,7 +2498,12 @@ namespace ps2_stubs
+@@ -2500,7 +2500,12 @@ namespace ps2_stubs
                      playback.nextPictureTickQ32 = currentTickQ32;
                  }
  
@@ -28,6 +31,75 @@ index bfa26f5..2164afe 100644
                  {
                      const uint64_t eligibleTick = (presentationTargetQ32 + kPictureClockOne - 1u) >> 32u;
                      lock.unlock();
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index c0b3f39..2941f87 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -396,8 +396,29 @@ namespace
+         runtime->requestStop();
+     }
+ 
++    // Two pictures in a row in the same VBlank, as Sofdec asks when it is behind.
++    constexpr uint32_t kIpuSecondResumePc = 0x00125240u;
++    std::atomic<uint32_t> gIpuPicturesTaken{0u};
++
++    void testIpuMainTwice(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        setRegU32(*ctx, 4, kIpuMpeg);
++        setRegU32(*ctx, 5, kIpuImage);
++        ctx->pc = kIpuSecondResumePc;
++        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
++    }
++
++    void testIpuSecondResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        gIpuPicturesTaken.fetch_add(1u, std::memory_order_acq_rel);
++        setRegU32(*ctx, 4, kIpuMpeg);
++        setRegU32(*ctx, 5, kIpuImage);
++        ctx->pc = kIpuResumePc;
++        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
++    }
++
+     // Creates the decoder, registers the Nodata callback and runs one sceMpegGetPicture.
+-    void runIpuGetPicture(PS2Runtime &runtime, IpuNodataAction action, bool recreated = false)
++    void runIpuGetPicture(PS2Runtime &runtime, IpuNodataAction action, bool recreated = false, int queuedPictures = 0)
+     {
+         uint8_t *rdram = runtime.memory().getRDRAM();
+         ps2_stubs::resetMpegStubState();
+@@ -424,7 +445,11 @@ namespace
+             ps2_stubs::sceMpegAddCallback(rdram, &callbackCtx, &runtime);
+         }
+ 
+-        runtime.registerFunction(kIpuMainPc, testIpuMain);
++        for (int i = 0; i < queuedPictures; ++i)
++            ps2_stubs::enqueueMpegDecodedFrameForTesting(kIpuMpeg);
++        gIpuPicturesTaken.store(0u, std::memory_order_release);
++        runtime.registerFunction(kIpuMainPc, queuedPictures > 1 ? testIpuMainTwice : testIpuMain);
++        runtime.registerFunction(kIpuSecondResumePc, testIpuSecondResume);
+         runtime.registerFunction(kIpuResumePc, testIpuResume);
+         runtime.registerFunction(kIpuNodataPc, testIpuNodata);
+         runtime.registerFunction(kIpuWatchdogPc, testIpuWatchdog);
+@@ -958,6 +983,20 @@ void register_ps2_runtime_expansion_tests()
+                      "the callback should get the data of the latest registration");
+         });
+ 
++        tc.Run("sceMpegGetPicture leaves the pacing of native IPU input to the game", [](TestCase &t)
++        {
++            // Sofdec times its pictures by the ADX clock. Holding the second of two queued pictures for an
++            // assumed 29.97 fps field pair slowed its shared demux and starved the movie's audio.
++            PS2Runtime runtime;
++            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
++            runIpuGetPicture(runtime, IpuNodataAction::QueuePicture, false, 2);
++
++            t.Equals(gIpuPicturesTaken.load(std::memory_order_acquire), 1u, "the first picture should be served");
++            t.Equals(gIpuGetPictureResult.load(std::memory_order_acquire), 0,
++                     "the second picture should be served in the same VBlank, not after a wait");
++            t.Equals(gIpuNodataCalls.load(std::memory_order_acquire), 0u, "queued pictures need no Nodata call");
++        });
++
+         tc.Run("sceMpegGetPicture returns once the Nodata callback reports the input used up", [](TestCase &t)
+         {
+             PS2Runtime runtime;
 -- 
 2.54.0 (Apple Git-157)
 

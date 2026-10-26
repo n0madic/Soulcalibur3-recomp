@@ -1,4 +1,4 @@
-From bfb18b9aa2479d050ab1fe536fb75bcfd68f432e Mon Sep 17 00:00:00 2001
+From f0e78822c46b4a3a0f8f74338dab50a037b85d74 Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Sat, 24 Oct 2026 09:32:18 +0300
 Subject: [PATCH] IOP: pass IRX argc/argv and implement sysclib ctype
@@ -14,12 +14,15 @@ ABI and zero digit classification made both options disappear. CRI then
 routed the movie to core 0, which the normal audio manager stops, leaving
 ADXT_GetTime at 512/48000 and blocking Sofdec video frame delivery.
 
-Build: standalone ps2_iop and the local FFmpeg-enabled ps2EntryRunner.
+The argv block is allocated before the image is loaded, so a failed allocation leaves the module arena untouched.
+
+Test: a synthetic IRX records argc/argv for CRI ADX-style options (with an empty argument) and the sysclib ctype answers for '5', 'a', ' ' and the table itself, also after an IOP reset; it fails on the previous runtime.
 ---
- ps2xIOP/src/emulator/imports/iop_sysclib.cpp | 56 ++++++++++++++++-
- ps2xIOP/src/emulator/imports/iop_sysclib.h   |  5 ++
- ps2xIOP/src/emulator/iop_emulator.cpp        | 65 ++++++++++++++++----
- 3 files changed, 112 insertions(+), 14 deletions(-)
+ ps2xIOP/src/emulator/imports/iop_sysclib.cpp |  56 +++++++-
+ ps2xIOP/src/emulator/imports/iop_sysclib.h   |   5 +
+ ps2xIOP/src/emulator/iop_emulator.cpp        |  66 +++++++--
+ ps2xIOP/tests/iop_emulator_tests.cpp         | 139 +++++++++++++++++++
+ 4 files changed, 252 insertions(+), 14 deletions(-)
 
 diff --git a/ps2xIOP/src/emulator/imports/iop_sysclib.cpp b/ps2xIOP/src/emulator/imports/iop_sysclib.cpp
 index 0517478..e94cebe 100644
@@ -120,7 +123,7 @@ index a462a6e..9b0d02a 100644
      };
  }
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index ee1239a..9ce3747 100644
+index ee1239a..d448acd 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -24,7 +24,9 @@
@@ -141,7 +144,7 @@ index ee1239a..9ce3747 100644
              kernel.reset();
              modules.clear();
              imports.reset();
-@@ -642,6 +645,35 @@ namespace ps2x::iop::detail
+@@ -642,6 +645,49 @@ namespace ps2x::iop::detail
          ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
          {
              ModuleLoadResult result{true, -1, -1};
@@ -174,24 +177,10 @@ index ee1239a..9ce3747 100644
 +                return result;
 +            }
 +
-             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
-             moduleCursor = loaded.nextModuleCursor;
-             if (!loaded)
-@@ -665,19 +697,30 @@ namespace ps2x::iop::detail
-             module.entry = loaded.entry;
-             module.gp = loaded.gp;
- 
--            uint32_t args = 0u;
--            if (arguments && argumentSize)
++            // Before the image, so a failed allocation leaves the module arena untouched.
 +            const uint32_t argv = allocate(static_cast<uint32_t>(packedSize), 16u);
 +            if (argv == 0u)
-             {
--                args = allocate(argumentSize + 1u, 16u);
--                if (args)
--                {
--                    writeRam(args, arguments, argumentSize);
--                    write8(args + argumentSize, 0u);
--                }
++            {
 +                log(LogLevel::Error, "[IOP] cannot allocate IRX argc/argv");
 +                return result;
 +            }
@@ -202,10 +191,25 @@ index ee1239a..9ce3747 100644
 +                ~ArgumentAllocation() { (void)memory.freeAllocation(address); }
 +            } argumentAllocation{memory, argv};
 +
+             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
+             moduleCursor = loaded.nextModuleCursor;
+             if (!loaded)
+@@ -665,19 +711,17 @@ namespace ps2x::iop::detail
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
+ 
+-            uint32_t args = 0u;
+-            if (arguments && argumentSize)
 +            const uint32_t argc = static_cast<uint32_t>(argumentStrings.size());
 +            uint32_t stringAddress = argv + (argc + 1u) * sizeof(uint32_t);
 +            for (uint32_t i = 0u; i < argc; ++i)
-+            {
+             {
+-                args = allocate(argumentSize + 1u, 16u);
+-                if (args)
+-                {
+-                    writeRam(args, arguments, argumentSize);
+-                    write8(args + argumentSize, 0u);
+-                }
 +                memory.write32(argv + i * sizeof(uint32_t), stringAddress);
 +                const std::string &argument = argumentStrings[i];
 +                (void)writeRam(stringAddress, argument.c_str(), argument.size() + 1u);
@@ -219,6 +223,162 @@ index ee1239a..9ce3747 100644
              module.resident = startResult == 0u || startResult == 2u;
              result.moduleId = module.id;
              result.startResult = static_cast<int32_t>(startResult);
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index 3700ffb..b1f00db 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -883,6 +883,113 @@ namespace
+         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+     }
+ 
++    // Stores its argc/argv at 0x10200/0x10204 and asks sysclib (ordinals 8 and 9) to classify '5', 'a'
++    // and ' ' (results at 0x10208..0x10210) and for the ctype table itself (0x10214).
++    void writeArgvCtypeIrx(TestHost &host, uint32_t address)
++    {
++        constexpr uint32_t codeOffset = 0x100u;
++        constexpr uint32_t loadAddress = 0x00010000u;
++        constexpr uint32_t importTableOffset = 0x100u;
++        constexpr uint32_t lookStub = loadAddress + importTableOffset + 20u;
++        constexpr uint32_t tableStub = lookStub + 8u;
++        auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
++
++        ElfHeader header{};
++        header.ident[0] = 0x7Fu;
++        header.ident[1] = 'E';
++        header.ident[2] = 'L';
++        header.ident[3] = 'F';
++        header.ident[4] = 1u;
++        header.ident[5] = 1u;
++        header.ident[6] = 1u;
++        header.type = 2u;
++        header.machine = 8u;
++        header.version = 1u;
++        header.entry = loadAddress;
++        header.phoff = sizeof(ElfHeader);
++        header.ehsize = sizeof(ElfHeader);
++        header.phentsize = sizeof(ProgramHeader);
++        header.phnum = 1u;
++
++        const uint32_t code[] = {
++            0x27BDFFE0u, // addiu sp, sp, -0x20
++            0xAFBF001Cu, // sw    ra, 0x1c(sp)
++            0x3C080001u, // lui   t0, 1
++            0x35080200u, // ori   t0, t0, 0x200
++            0xAD040000u, // sw    a0, 0(t0)
++            0xAD050004u, // sw    a1, 4(t0)
++            0x24040035u, // addiu a0, zero, '5'
++            jal(lookStub),
++            0x00000000u,
++            0x3C080001u, 0x35080200u,
++            0xAD020008u, // sw    v0, 8(t0)
++            0x24040061u, // addiu a0, zero, 'a'
++            jal(lookStub),
++            0x00000000u,
++            0x3C080001u, 0x35080200u,
++            0xAD02000Cu, // sw    v0, 12(t0)
++            0x24040020u, // addiu a0, zero, ' '
++            jal(lookStub),
++            0x00000000u,
++            0x3C080001u, 0x35080200u,
++            0xAD020010u, // sw    v0, 16(t0)
++            jal(tableStub),
++            0x00000000u,
++            0x3C080001u, 0x35080200u,
++            0xAD020014u, // sw    v0, 20(t0)
++            0x8FBF001Cu, // lw    ra, 0x1c(sp)
++            0x00001021u, // addu  v0, zero, zero
++            0x27BD0020u, // addiu sp, sp, 0x20
++            0x03E00008u, // jr    ra
++            0x00000000u, // nop
++        };
++        static_assert(sizeof(code) <= importTableOffset);
++        const uint32_t importTable[] = {
++            0x41E00000u, // IRX import magic
++            0x00000000u,
++            0x00000101u,
++            0x63737973u, // "sysc"
++            0x0062696Cu, // "lib"
++            0x03E00008u, // jr ra
++            0x24000008u, // look_ctype_table
++            0x03E00008u, // jr ra
++            0x24000009u, // get_ctype_table
++            0x00000000u,
++            0x00000000u,
++        };
++
++        ProgramHeader program{};
++        program.type = 1u;
++        program.offset = codeOffset;
++        program.vaddr = loadAddress;
++        program.paddr = loadAddress;
++        program.filesz = importTableOffset + sizeof(importTable);
++        program.memsz = 0x300u;
++        program.flags = 7u;
++        program.align = 4u;
++
++        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
++        std::memcpy(host.guest.data() + address, &header, sizeof(header));
++        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
++        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
++        std::memcpy(host.guest.data() + address + codeOffset + importTableOffset, importTable, sizeof(importTable));
++    }
++
++    uint32_t readIop32(const IopSubsystem &iop, uint32_t address)
++    {
++        uint32_t value = 0u;
++        (void)iop.readMemory(address, &value, sizeof(value));
++        return value;
++    }
++
++    std::string readIopString(const IopSubsystem &iop, uint32_t address)
++    {
++        std::string text;
++        for (char c = 0; iop.readMemory(address, &c, 1u) && c != '\0'; ++address)
++            text.push_back(c);
++        return text;
++    }
++
+     bool expect(bool value, const char *message)
+     {
+         if (!value)
+@@ -1180,5 +1287,37 @@ int main()
+                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+ 
+     std::cout << "ps2xIOP emulator smoke tests passed\n";
++    // Loadfile passes NUL-separated bytes; the IRX entry gets argc/argv with the module name first, empty
++    // arguments kept and a null pointer last. Soulcalibur III starts CRI ADX with "thpri=39" and "spucore=2",
++    // which its option parser reads through sysclib's ctype table.
++    iop.reset();
++    writeArgvCtypeIrx(host, 0x100u);
++    const char adxArguments[] = "thpri=39\0\0spucore=2"; // the second argument is empty
++    const ModuleLoadResult argvModule = iop.loadModuleBuffer(0x100u, adxArguments, sizeof(adxArguments));
++    if (!expect(argvModule.handled && argvModule.startResult == 0, "argc/argv IRX did not start")) return 1;
++    const uint32_t argc = readIop32(iop, 0x10200u);
++    const uint32_t argv = readIop32(iop, 0x10204u);
++    if (!expect(argc == 4u, "argc should count the module name, both options and the empty argument")) return 1;
++    if (!expect(!readIopString(iop, readIop32(iop, argv)).empty(), "argv[0] should name the module")) return 1;
++    if (!expect(readIopString(iop, readIop32(iop, argv + 4u)) == "thpri=39", "argv[1] mismatch")) return 1;
++    if (!expect(readIopString(iop, readIop32(iop, argv + 8u)).empty(), "argv[2] should be the empty argument")) return 1;
++    if (!expect(readIopString(iop, readIop32(iop, argv + 12u)) == "spucore=2", "argv[3] mismatch")) return 1;
++    if (!expect(readIop32(iop, argv + 16u) == 0u, "argv[argc] should be a null pointer")) return 1;
++    if (!expect(readIop32(iop, 0x10208u) == 0x04u, "look_ctype_table('5') should report a digit")) return 1;
++    if (!expect(readIop32(iop, 0x1020Cu) == 0x42u, "look_ctype_table('a') should report lower case and hex")) return 1;
++    if (!expect(readIop32(iop, 0x10210u) == 0x18u, "look_ctype_table(' ') should report space")) return 1;
++    uint8_t upperA = 0u;
++    if (!expect(iop.readMemory(readIop32(iop, 0x10214u) + 'A', &upperA, 1u) && upperA == 0x41u,
++                "get_ctype_table should return the guest table")) return 1;
++
++    iop.reset();
++    writeArgvCtypeIrx(host, 0x100u);
++    const ModuleLoadResult argvAfterReset = iop.loadModuleBuffer(0x100u);
++    if (!expect(argvAfterReset.handled && argvAfterReset.startResult == 0, "argc/argv IRX did not restart")) return 1;
++    if (!expect(readIop32(iop, 0x10200u) == 1u, "with no arguments argc should be 1")) return 1;
++    uint8_t digitZero = 0u;
++    if (!expect(iop.readMemory(readIop32(iop, 0x10214u) + '0', &digitZero, 1u) && digitZero == 0x04u,
++                "the ctype table should be rebuilt after an IOP reset")) return 1;
++
+     return 0;
+ }
 -- 
 2.54.0 (Apple Git-157)
 

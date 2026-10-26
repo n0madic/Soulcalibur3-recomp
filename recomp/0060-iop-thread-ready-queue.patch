@@ -1,0 +1,216 @@
+From 721cb8377c8cb6c53a5685eecaaec8761ee03356 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:50:20 +0300
+Subject: [PATCH] IOP: keep a FIFO ready queue per thread priority
+
+The IOP scheduler picked the lowest thread id among ready threads of the best priority at every host instruction budget. An older ready thread could therefore take over from a running thread of equal priority, also between the two channels of CRI's PCM queue operations: the EE then got unequal left/right free-space acknowledgements, and its stereo decoder overwrote right-channel samples before SIF sent them.
+
+Ready threads now keep a position within their priority, as on the IOP: a thread that becomes ready (start, wakeup, signal, delay end, priority change) joins the tail; a thread still running at the end of a host slice keeps the head, also when a higher-priority thread runs first; RotateThreadReadyQueue/YieldThread sends it to the tail. While interrupts are suspended the last thread keeps running.
+
+Test: two priority-39 threads and a priority-30 one through IopKernel: a host slice boundary does not switch to the waiting equal-priority thread, the thread preempted by the higher-priority one resumes ahead of it once that sleeps, and a yield goes to the tail. It fails before this change and with the previous fix, which remembered only the last selected thread.
+---
+ ps2xIOP/src/emulator/core/iop_kernel.cpp | 29 +++++++++-
+ ps2xIOP/src/emulator/core/iop_kernel.h   |  8 +++
+ ps2xIOP/tests/iop_import_tests.cpp       | 68 +++++++++++++++++++++++-
+ 3 files changed, 103 insertions(+), 2 deletions(-)
+
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..9f797d3 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -32,6 +32,9 @@ namespace ps2x::iop::detail
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
+         m_currentThread = nullptr;
++        m_lastRunThreadId = 0;
++        m_queueHead = 0;
++        m_queueTail = 0;
+     }
+ 
+     bool IopKernel::dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle)
+@@ -99,6 +102,7 @@ namespace ps2x::iop::detail
+             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+             thread.cpu.gpr[31] = kThreadReturnSentinel;
+             thread.state = IopThreadState::Ready;
++            thread.queued = false;
+             setV0(0);
+             return true;
+         }
+@@ -143,6 +147,7 @@ namespace ps2x::iop::detail
+                 return true;
+             }
+             it->second.priority = std::clamp<uint32_t>(cpu.gpr[5], 1u, 126u);
++            it->second.queued = false; // to the tail of its new priority
+             setV0(0);
+             return true;
+         }
+@@ -675,6 +680,14 @@ namespace ps2x::iop::detail
+         {
+             if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
+                 thread.state = IopThreadState::Ready;
++            // A thread that became ready since the last pass joins the tail of its priority.
++            if (thread.state != IopThreadState::Ready)
++                thread.queued = false;
++            else if (!thread.queued)
++            {
++                thread.queued = true;
++                thread.readyOrder = ++m_queueTail;
++            }
+         }
+ 
+         IopThread *next = nullptr;
+@@ -683,12 +696,18 @@ namespace ps2x::iop::detail
+             if (thread.state != IopThreadState::Ready)
+                 continue;
+             if (next == nullptr || thread.priority < next->priority ||
+-                (thread.priority == next->priority && thread.id < next->id))
++                (thread.priority == next->priority && thread.readyOrder < next->readyOrder))
+                 next = &thread;
+         }
+         if (next == nullptr)
+             return nullptr;
+ 
++        // Interrupt suspension protects the running thread from preemption until the critical section ends.
++        const auto last = m_threads.find(m_lastRunThreadId);
++        if (m_memory.interruptControl() == 0u && last != m_threads.end() && last->second.state == IopThreadState::Ready)
++            next = &last->second;
++
++        m_lastRunThreadId = next->id;
+         m_currentThread = next;
+         next->state = IopThreadState::Running;
+         next->cpu.stopped = false;
+@@ -712,7 +731,15 @@ namespace ps2x::iop::detail
+         if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+             thread.state = IopThreadState::Dormant;
+         else if (thread.state == IopThreadState::Running)
++        {
++            // A thread still running at the end of a host slice was not descheduled by the guest: it stays
++            // at the head of its priority, also when a higher-priority thread now runs first. Only
++            // RotateThreadReadyQueue/YieldThread (the one way to yield while running) sends it to the tail.
+             thread.state = IopThreadState::Ready;
++            thread.queued = !thread.cpu.yielded;
++            if (thread.queued)
++                thread.readyOrder = --m_queueHead;
++        }
+         m_currentThread = nullptr;
+         cleanupDeadThreads();
+     }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..24e1728 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -41,6 +41,10 @@ namespace ps2x::iop::detail
+         uint32_t waitMode = 0;
+         uint32_t waitResultAddress = 0;
+         int wakeupCount = 0;
++        // Position in the ready queue of its priority (FIFO); smaller runs first. A thread that was
++        // running keeps its place at the head unless it yielded.
++        bool queued = false;
++        int64_t readyOrder = 0;
+     };
+ 
+     class IopKernel
+@@ -99,5 +103,9 @@ namespace ps2x::iop::detail
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+         IopThread *m_currentThread = nullptr;
++        // The thread that ran last, which keeps running while interrupts are suspended.
++        int m_lastRunThreadId = 0;
++        int64_t m_queueHead = 0;
++        int64_t m_queueTail = 0;
+     };
+ }
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 3035618..fda8343 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -1,6 +1,7 @@
+ #include "emulator/core/iop_cpu.h"
+ #include "emulator/core/iop_kernel.h"
+ #include "emulator/core/iop_memory.h"
++#include "emulator/iop_emulator_const.h"
+ #include "emulator/imports/iop_cdvd.h"
+ #include "emulator/imports/iop_imports.h"
+ #include "emulator/imports/iop_loadcore.h"
+@@ -326,12 +327,77 @@ namespace
+                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
+                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
+     }
++    // The IOP runs the highest-priority ready thread, first in first out within a priority. The emulator
++    // splits execution into host slices: the end of one is not a reschedule for the guest. CRI's PCM feeder
++    // threads (priority 39) must not swap between the left and right halves of a queue operation.
++    bool testThreadReadyQueue()
++    {
++        IopMemory memory;
++        IopKernel kernel(memory);
++        kernel.reset();
++        constexpr uint32_t descriptor = 0x3000u;
++        const auto create = [&](uint32_t priority)
++        {
++            memory.write32(descriptor + 0u, 0x02000000u);
++            memory.write32(descriptor + 4u, 0u);
++            memory.write32(descriptor + 8u, 0x4000u);
++            memory.write32(descriptor + 12u, 0x400u);
++            memory.write32(descriptor + 16u, priority);
++            IopCpuState cpu{};
++            cpu.gpr[4] = descriptor;
++            (void)kernel.dispatchThreadImport(4u, cpu, 0u);
++            return static_cast<int>(cpu.gpr[2]);
++        };
++        const auto start = [&](int id)
++        {
++            IopCpuState cpu{};
++            cpu.gpr[4] = static_cast<uint32_t>(id);
++            (void)kernel.dispatchThreadImport(6u, cpu, 0u);
++        };
++        // Runs one host slice that ends with the thread still running, and returns its id.
++        const auto slice = [&]()
++        {
++            IopThread *thread = kernel.beginNextReady(0u);
++            if (thread == nullptr)
++                return 0;
++            const int id = thread->id;
++            kernel.endTimeslice(*thread, kThreadReturnSentinel);
++            return id;
++        };
++
++        const int older = create(39u);
++        const int feeder = create(39u);
++        const int high = create(30u);
++        start(feeder);
++        if (!expect(slice() == feeder, "the only ready thread should run"))
++            return false;
++        start(older);
++        if (!expect(slice() == feeder, "a host slice boundary should not let an equal-priority thread in"))
++            return false;
++
++        start(high);
++        if (!expect(slice() == high, "a higher-priority thread should run first"))
++            return false;
++        IopThread *running = kernel.beginNextReady(0u);
++        if (!expect(running != nullptr && running->id == high, "the higher-priority thread should still run"))
++            return false;
++        kernel.sleepCurrent(running->cpu);
++        kernel.endTimeslice(*running, kThreadReturnSentinel);
++        if (!expect(slice() == feeder, "the preempted thread should resume ahead of the one that waited behind it"))
++            return false;
++
++        running = kernel.beginNextReady(0u);
++        IopCpuState &cpu = running->cpu;
++        (void)kernel.dispatchThreadImport(16u, cpu, 0u); // RotateThreadReadyQueue
++        kernel.endTimeslice(*running, kThreadReturnSentinel);
++        return expect(slice() == older, "a thread that yields should go behind its equal-priority peers");
++    }
+ }
+ 
+ int main()
+ {
+     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+-        !testTimrmanPeriodicCallback())
++        !testTimrmanPeriodicCallback() || !testThreadReadyQueue())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+     return 0;
+-- 
+2.54.0 (Apple Git-157)
+

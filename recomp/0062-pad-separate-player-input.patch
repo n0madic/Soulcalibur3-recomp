@@ -1,14 +1,15 @@
-From c1d42eada933d73d498e195f1aa7707e3d545079 Mon Sep 17 00:00:00 2001
+From 86a9c092d7ce006e89e76c168424654f5197a3e1 Mon Sep 17 00:00:00 2001
 From: n0madic <800462+n0madic@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 22:44:19 +0300
 Subject: [PATCH] Pad: separate keyboard layouts and gamepads by player port
 
+Stick axes are clamped to [-1, 1] (NaN reads as centred) before the float-to-byte conversion, which was undefined for values outside the range; tested with out-of-range and NaN axes.
 ---
  ps2xRuntime/include/runtime/ps2_pad.h    |   2 +-
  ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp | 142 +++--------------------
- ps2xRuntime/src/lib/ps2_pad.cpp          |  75 ++++++------
- ps2xTest/src/pad_input_tests.cpp         |  88 ++++++++++++++
- 4 files changed, 144 insertions(+), 163 deletions(-)
+ ps2xRuntime/src/lib/ps2_pad.cpp          |  93 +++++++++------
+ ps2xTest/src/pad_input_tests.cpp         | 110 ++++++++++++++++++
+ 4 files changed, 180 insertions(+), 167 deletions(-)
 
 diff --git a/ps2xRuntime/include/runtime/ps2_pad.h b/ps2xRuntime/include/runtime/ps2_pad.h
 index f44281a..067b682 100644
@@ -191,11 +192,29 @@ index b50a4cf..f115352 100644
                      (gamepad >= 0) && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT);
                  const bool startPressed = (data[2] != 0xFFu || data[3] != 0xFFu ||
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index a8e3db3..4a4e3fd 100644
+index a8e3db3..91bccb5 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -25,15 +25,15 @@ namespace
+@@ -1,5 +1,6 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <algorithm>
+ #include <cstring>
+ 
+ namespace
+@@ -23,17 +24,26 @@ namespace
+     constexpr uint16_t PAD_L1 = 0x0400u;
+     constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
++
++    // A host axis in [-1, 1] as a PS2 stick byte (0x80 is centred). Values outside that range, or NaN
++    // from a misbehaving driver, must not reach the float-to-integer conversion.
++    uint8_t stickByte(float axis)
++    {
++        if (!(axis == axis))
++            return kPadStickCenter;
++        return static_cast<uint8_t>(128.0f + std::clamp(axis, -1.0f, 1.0f) * 127.0f);
++    }
  }
  
 -bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -214,7 +233,7 @@ index a8e3db3..4a4e3fd 100644
          return false;
  
      std::memset(data, 0, 32);
-@@ -44,7 +44,7 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size)
+@@ -44,7 +54,7 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size)
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
  
      uint16_t btns = 0xFFFFu;
@@ -223,8 +242,18 @@ index a8e3db3..4a4e3fd 100644
      const bool useGamepad = input.isGamepadAvailable(kGamepad);
      auto clearBit = [&btns](uint16_t mask)
      { btns &= ~mask; };
-@@ -94,35 +94,42 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size)
-         data[5] = static_cast<uint8_t>(128 + ry * 127);
+@@ -88,41 +98,48 @@ bool PSPadBackend::readState(const HostInput &input, uint8_t *data, size_t size)
+         float ly = input.getGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+         float rx = input.getGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+         float ry = input.getGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
++        data[6] = stickByte(lx);
++        data[7] = stickByte(ly);
++        data[4] = stickByte(rx);
++        data[5] = stickByte(ry);
      }
  
 -    // The keyboard always works, also with a gamepad connected.
@@ -296,10 +325,18 @@ index a8e3db3..4a4e3fd 100644
      data[2] = static_cast<uint8_t>(btns & 0xFF);
      data[3] = static_cast<uint8_t>(btns >> 8);
 diff --git a/ps2xTest/src/pad_input_tests.cpp b/ps2xTest/src/pad_input_tests.cpp
-index 508e5bc..eba63bc 100644
+index 508e5bc..12f0087 100644
 --- a/ps2xTest/src/pad_input_tests.cpp
 +++ b/ps2xTest/src/pad_input_tests.cpp
-@@ -91,6 +91,24 @@ namespace
+@@ -5,6 +5,7 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
+ 
++#include <limits>
+ #include <vector>
+ #include <cstdint>
+ #include <string>
+@@ -91,10 +92,36 @@ namespace
          return key == KEY_ESCAPE;
      }
  
@@ -324,7 +361,19 @@ index 508e5bc..eba63bc 100644
      bool fakeNoGamepad(int /*gamepad*/)
      {
          return false;
-@@ -121,6 +139,76 @@ void register_pad_input_tests()
+     }
++
++    float wildAxis(int /*pad*/, int axis)
++    {
++        if (axis == GAMEPAD_AXIS_LEFT_X) return 3.0f;
++        if (axis == GAMEPAD_AXIS_LEFT_Y) return -5.0f;
++        if (axis == GAMEPAD_AXIS_RIGHT_X) return std::numeric_limits<float>::quiet_NaN();
++        return 0.0f;
++    }
+ }
+ 
+ void register_pad_input_tests()
+@@ -121,6 +148,89 @@ void register_pad_input_tests()
              t.Equals(PSPadBackend::kHostExitKey, static_cast<int>(KEY_NULL), "no key may close the window");
          });
  
@@ -387,6 +436,19 @@ index 508e5bc..eba63bc 100644
 +                    t.Equals(static_cast<int>(data[5]), connected ? (port == 0 ? 255 : 1) : 128, "own right stick Y only");
 +                }
 +            }
++        });
++
++        tc.Run("stick values outside the axis range are clamped", [](TestCase &t)
++               {
++            connectedPads = 1;
++            heldKey = -1;
++            const PSPadBackend::HostInput input{routedKey, routedAvailable, routedButton, wildAxis};
++            uint8_t data[32]{};
++            t.IsTrue(PSPadBackend::readState(input, data, sizeof(data), 0, 0), "port 0 should read");
++            t.Equals(static_cast<int>(data[6]), 255, "an axis above 1 should read as full right");
++            t.Equals(static_cast<int>(data[7]), 1, "an axis below -1 should read as full up");
++            t.Equals(static_cast<int>(data[4]), 128, "a NaN axis should read as centred");
++            connectedPads = 3;
 +        });
 +
 +        tc.Run("pad backend rejects unsupported ports and slots", [](TestCase &t)
