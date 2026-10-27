@@ -15,7 +15,7 @@ Former patches of the series, merged:
  4 files changed, 131 insertions(+), 25 deletions(-)
 
 diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
-index 7a8e0fa..e6ff148 100644
+index 500f049..01a9c8f 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_parallel.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
 @@ -23,11 +23,10 @@ std::vector<uint64_t> gsBuildImageUploadPacket(uint64_t bitbltbuf, uint64_t trxp
@@ -35,10 +35,10 @@ index 7a8e0fa..e6ff148 100644
  };
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
-index 5704361..1eb9268 100644
+index dc1bfd1..06db30d 100644
 --- a/ps2xRuntime/src/lib/gs/gs_parallel.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
-@@ -128,12 +128,11 @@ namespace
+@@ -135,12 +135,11 @@ namespace
                  return false;
              }
              m_gs.set_signal_interface(&m_signals);
@@ -81,10 +81,10 @@ index 5635abb..31a0be1 100644
          }
          options.superSampling = *rate;
 diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
-index 35fb620..83c521c 100644
+index 836d7b4..9213ac8 100644
 --- a/ps2xTest/src/ps2_gs_parallel_tests.cpp
 +++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
-@@ -82,13 +82,41 @@ namespace
+@@ -84,13 +84,41 @@ namespace
          uint32_t height = 0u;
          uint32_t partlyCoveredPixels = 0u; // neither the triangle's green nor the black around it
          uint8_t centreGreen = 0u;
@@ -128,7 +128,7 @@ index 35fb620..83c521c 100644
      {
          GsFixture f;
          if (!requireGpuGs(t, f.gs, GSParallelOptions{superSampling}))
-@@ -112,16 +140,51 @@ namespace
+@@ -114,16 +142,51 @@ namespace
                               {kRegXyz2, (440ull << 4) << 16}}));
          f.gs.onVsync(1u); // the game blits a finished frame at the start of the next one
          // TEX0: page 0, 640 wide, PSMCT24, 1024x512, TCC, DECAL. PRIM: sprite, TME, FST.
@@ -185,7 +185,7 @@ index 35fb620..83c521c 100644
          f.gs.onVsync(0u);
          f.gs.onVsync(1u); // publishes the previous vsync's picture
          f.gs.latchHostPresentationFrame();
-@@ -137,6 +200,8 @@ namespace
+@@ -139,6 +202,8 @@ namespace
              if (frame[i + 1u] > 0x18u && frame[i + 1u] < 0xA8u)
                  ++presented.partlyCoveredPixels;
          presented.centreGreen = frame[(static_cast<size_t>(presented.height / 4u) * presented.width + presented.width / 4u) * 4u + 1u];
@@ -194,7 +194,7 @@ index 35fb620..83c521c 100644
          return presented;
      }
  
-@@ -241,13 +306,21 @@ void register_ps2_gs_parallel_tests()
+@@ -243,13 +308,21 @@ void register_ps2_gs_parallel_tests()
              t.IsFalse(gsParseSuperSampling("").has_value(), "an empty value is rejected");
          });
  
@@ -219,7 +219,7 @@ index 35fb620..83c521c 100644
          });
  
          tc.Run("with super-sampling the blit's source is presented at twice the resolution (GPU GS)", [](TestCase &t)
-@@ -261,6 +334,42 @@ void register_ps2_gs_parallel_tests()
+@@ -263,6 +336,42 @@ void register_ps2_gs_parallel_tests()
              t.IsTrue(eight.partlyCoveredPixels > 100u, "8x super-sampling blends the pixels on the edge");
          });
  

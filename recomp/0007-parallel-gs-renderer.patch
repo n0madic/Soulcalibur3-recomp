@@ -9,16 +9,16 @@ Former patches of the series, merged:
  ps2xRuntime/CMakeLists.txt                    |  18 ++
  ps2xRuntime/include/ps2_runtime.h             |   1 +
  ps2xRuntime/include/runtime/gs/gs_frontend.h  |  14 +-
- ps2xRuntime/include/runtime/gs/gs_parallel.h  |  45 +++
+ ps2xRuntime/include/runtime/gs/gs_parallel.h  |  48 +++
  .../include/runtime/gs/ps2_gif_arbiter.h      |   2 +-
  ps2xRuntime/include/runtime/ps2_memory.h      |   6 +
  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |   1 +
  ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp       |  50 +---
  .../src/lib/Kernel/Syscalls/System.cpp        |   9 +-
  ps2xRuntime/src/lib/gs/gs_frontend.cpp        | 133 ++++++++-
- ps2xRuntime/src/lib/gs/gs_parallel.cpp        | 270 ++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_parallel.cpp        | 282 ++++++++++++++++++
  ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp   |   7 +
- ps2xRuntime/src/lib/gs/gs_priv_registers.cpp  |  80 ++++++
+ ps2xRuntime/src/lib/gs/gs_priv_registers.cpp  |  80 +++++
  ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    |   2 +-
  ps2xRuntime/src/lib/ps2_memory.cpp            |  40 ---
  ps2xRuntime/src/lib/ps2_runtime.cpp           |  40 ++-
@@ -27,12 +27,12 @@ Former patches of the series, merged:
  ps2xTest/gs_cache/CMakeLists.txt              |   2 +
  ps2xTest/src/gpu_gs_test_support.h            |  23 ++
  ps2xTest/src/main.cpp                         |   2 +
- ps2xTest/src/ps2_gs_parallel_tests.cpp        | 214 ++++++++++++++
+ ps2xTest/src/ps2_gs_parallel_tests.cpp        | 234 +++++++++++++++
  ps2xTest/src/ps2_gs_tests.cpp                 |  60 +++-
  ps2xTest/src/ps2_memory_tests.cpp             |  10 +-
  ps2xTest/src/ps2_runtime_interrupt_tests.cpp  |  13 +-
  ps2xTest/src/ps2_vu1_tests.cpp                |   2 +-
- 26 files changed, 929 insertions(+), 118 deletions(-)
+ 26 files changed, 964 insertions(+), 118 deletions(-)
  create mode 100644 ps2xRuntime/include/runtime/gs/gs_parallel.h
  create mode 100644 ps2xRuntime/src/lib/gs/gs_parallel.cpp
  create mode 100644 ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
@@ -129,10 +129,10 @@ index 4c3f641..98427cf 100644
  #endif
 diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
 new file mode 100644
-index 0000000..bbd8e49
+index 0000000..53fe291
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,48 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -177,6 +177,9 @@ index 0000000..bbd8e49
 +    virtual bool copyLatestFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height) = 0;
 +    // Waits for all submitted GPU work, publishing the pending picture.
 +    virtual void finish() = 0;
++    // The Vulkan device's frame contexts: how many flushes of GPU work the renderer lets the game
++    // thread queue before it must wait for the oldest one (see kFrameContexts in gs_parallel.cpp).
++    virtual unsigned frameContexts() const = 0;
 +};
 diff --git a/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h b/ps2xRuntime/include/runtime/gs/ps2_gif_arbiter.h
 index 2012083..c17aace 100644
@@ -532,10 +535,10 @@ index 1d4ae16..2aa0c92 100644
      if (!backend)
 diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
 new file mode 100644
-index 0000000..edd6108
+index 0000000..39fa3ac
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,282 @@
 +#include "runtime/gs/gs_parallel.h"
 +#include "runtime/ps2_memory.h"
 +
@@ -614,6 +617,13 @@ index 0000000..edd6108
 +        GSRegisters &m_regs;
 +    };
 +
++    // paraLLEl-GS ends a Granite frame context in every flush it submits (GSRenderer::flush_submit), not
++    // only at a vsync, and Granite then waits for the GPU work of the context it takes next. A battle
++    // frame is many flushes, so with 4 contexts the game thread sat in that wait for about a sixth of its
++    // time (4-5 ms per vsync, 40 game ticks/s instead of 60) although the GPU needs only a few ms per
++    // frame. With 16 the wait is gone (0.6 ms per vsync, 52-60 ticks/s); 64 were not measurably better.
++    constexpr unsigned kFrameContexts = 16;
++
 +    // Granite keys per-thread command pools by a registered thread index. The GS frontend serialises
 +    // all calls, which come from the game thread and (in tests) the main thread, so all share index 0.
 +    void bindGraniteThread()
@@ -653,7 +663,7 @@ index 0000000..edd6108
 +                return false;
 +            }
 +            m_device.set_context(m_context);
-+            m_device.init_frame_contexts(4);
++            m_device.init_frame_contexts(kFrameContexts);
 +
 +            ParallelGS::GSOptions options = {};
 +            if (!m_gs.init(&m_device, options))
@@ -731,6 +741,11 @@ index 0000000..edd6108
 +            m_gs.flush();
 +            m_device.wait_idle();
 +            publishPendingReadback();
++        }
++
++        unsigned frameContexts() const override
++        {
++            return m_device.get_num_frame_contexts();
 +        }
 +
 +    private:
@@ -1130,10 +1145,10 @@ index 2b4ed08..4d3b6de 100644
      std::cerr.flush();
 diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
 new file mode 100644
-index 0000000..8473622
+index 0000000..408e5db
 --- /dev/null
 +++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,234 @@
 +#include "MiniTest.h"
 +#include "gpu_gs_test_support.h"
 +#include "runtime/gs/gs_frontend.h"
@@ -1144,7 +1159,9 @@ index 0000000..8473622
 +#include <cstdint>
 +#include <cstdlib>
 +#include <cstring>
++#include <iostream>
 +#include <memory>
++#include <string>
 +#include <vector>
 +
 +// The GPU GS (paraLLEl-GS) path: the layout helpers it shares with the dump recorder, and the GS
@@ -1307,6 +1324,24 @@ index 0000000..8473622
 +        tc.Run("local->host transfer reads back uploaded pixels (GPU GS)", [](TestCase &t)
 +               { runLocalToHost(t, true); });
 +
++        tc.Run("the GPU renderer keeps a frame context ring deeper than a frame's flushes", [](TestCase &t)
++        {
++            auto regs = std::make_unique<GSRegisters>();
++            std::string error;
++            const std::unique_ptr<GSParallelRenderer> renderer = GSParallelRenderer::create(*regs, error);
++            if (!renderer)
++            {
++                const char *required = std::getenv("PS2_TEST_REQUIRE_GPU");
++                if (required && std::string(required) == "1")
++                    t.Fail("GPU GS required (PS2_TEST_REQUIRE_GPU=1) but unavailable: " + error);
++                else
++                    std::cout << "    skipped: GPU GS unavailable (" << error << ")" << std::endl;
++                return;
++            }
++            // paraLLEl-GS takes the next frame context at every flush it submits; with 4 the game thread
++            // waited for the GPU every fourth flush and a battle ran at two thirds of its speed.
++            t.IsTrue(renderer->frameContexts() >= 16u, "at least 16 frame contexts");
++        });
 +        tc.Run("a sprite drawn into the display buffer is presented (GPU GS)", [](TestCase &t)
 +        {
 +            GsFixture f;

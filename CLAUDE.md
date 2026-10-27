@@ -88,6 +88,7 @@ PS2_TEST_REQUIRE_GPU=1 PS2_VU_PROGRAM_FIXTURES=<fixture dir> PS2_VU_REQUIRE_PROG
 ## Measuring and debugging
 
 - **Speed.** Measure speed as VSyncs (displayed frames) per second. The game's counter at `0x4f3814` counts logic steps and is not a speed measure. Measure on mains power; macOS Low Power Mode cuts speed by about 25%. Compare builds with alternating A/B runs, because run-to-run noise is several percent.
+- **Keep your hands off the game window.** It takes the keyboard focus, and the keyboard is the pad (Enter = Start, Space = Cross, most letters). Keys typed while it is in front skip the movies and change the attract loop, which looks like speed or movie bugs. Runs that must not be disturbed can be made so by testing a build that ignores the keyboard (TEMP-DEBUG).
 - **One instance at a time.** Run one game instance at a time; parallel runs slow each other down.
 - **Profiling.** Use `sample <pid> 15` and read the "GameThread" section.
 - **Temporary instrumentation.** Mark temporary code with `// TEMP-DEBUG` and remove it before producing a patch.

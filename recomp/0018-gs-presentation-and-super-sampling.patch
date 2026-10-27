@@ -14,8 +14,8 @@ Former patches of the series, merged:
  ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp  |   2 +-
  ps2xRuntime/src/lib/ps2_runtime.cpp          |  80 ++++-----
  ps2xTest/src/gpu_gs_test_support.h           |   4 +-
- ps2xTest/src/ps2_gs_parallel_tests.cpp       | 169 +++++++++++++++++++
- 8 files changed, 319 insertions(+), 67 deletions(-)
+ ps2xTest/src/ps2_gs_parallel_tests.cpp       | 171 ++++++++++++++++++-
+ 8 files changed, 320 insertions(+), 68 deletions(-)
 
 diff --git a/ps2xRuntime/include/runtime/gs/gs_frontend.h b/ps2xRuntime/include/runtime/gs/gs_frontend.h
 index 98427cf..2210056 100644
@@ -65,7 +65,7 @@ index 98427cf..2210056 100644
      uint64_t m_nativePackedGIFPacketCount = 0;
  
 diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
-index bbd8e49..7a8e0fa 100644
+index 53fe291..500f049 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_parallel.h
 +++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
 @@ -3,6 +3,7 @@
@@ -123,7 +123,7 @@ index bbd8e49..7a8e0fa 100644
 +    virtual uint64_t latestFrameSequence() = 0;
      // Waits for all submitted GPU work, publishing the pending picture.
      virtual void finish() = 0;
- };
+     // The Vulkan device's frame contexts: how many flushes of GPU work the renderer lets the game
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 index 2aa0c92..b3a02d1 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
@@ -272,10 +272,10 @@ index 2aa0c92..b3a02d1 100644
  {
      std::memset(out, 0, sizeof(out));
 diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
-index edd6108..5704361 100644
+index 39fa3ac..dc1bfd1 100644
 --- a/ps2xRuntime/src/lib/gs/gs_parallel.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
-@@ -95,7 +95,7 @@ namespace
+@@ -102,7 +102,7 @@ namespace
                  m_device.wait_idle();
          }
  
@@ -284,8 +284,8 @@ index edd6108..5704361 100644
          {
              bindGraniteThread();
              PFN_vkGetInstanceProcAddr addr = loadVulkan(error);
-@@ -118,12 +118,22 @@ namespace
-             m_device.init_frame_contexts(4);
+@@ -125,12 +125,22 @@ namespace
+             m_device.init_frame_contexts(kFrameContexts);
  
              ParallelGS::GSOptions options = {};
 +            options.super_sampling = static_cast<ParallelGS::SuperSampling>(settings.superSampling);
@@ -307,7 +307,7 @@ index edd6108..5704361 100644
              m_ready = true;
              return true;
          }
-@@ -165,6 +175,7 @@ namespace
+@@ -172,6 +182,7 @@ namespace
              info.force_progressive = true;
              info.anti_blur = true;
              info.adapt_to_internal_horizontal_resolution = true;
@@ -315,7 +315,7 @@ index edd6108..5704361 100644
  
              m_gs.flush();
              ParallelGS::ScanoutResult result = m_gs.vsync(info);
-@@ -176,9 +187,11 @@ namespace
+@@ -183,9 +194,11 @@ namespace
              m_device.next_frame_context();
          }
  
@@ -328,7 +328,7 @@ index edd6108..5704361 100644
              if (m_frame.empty())
                  return false;
              rgba = m_frame;
-@@ -187,6 +200,12 @@ namespace
+@@ -194,6 +207,12 @@ namespace
              return true;
          }
  
@@ -341,7 +341,7 @@ index edd6108..5704361 100644
          void finish() override
          {
              bindGraniteThread();
-@@ -241,6 +260,7 @@ namespace
+@@ -253,6 +272,7 @@ namespace
                      m_frame[i] = 0xFF;
                  m_frameWidth = m_pending.width;
                  m_frameHeight = m_pending.height;
@@ -349,7 +349,7 @@ index edd6108..5704361 100644
              }
              m_device.unmap_host_buffer(*m_pending.buffer, Vulkan::MEMORY_ACCESS_READ_BIT);
              m_pending = {};
-@@ -258,13 +278,16 @@ namespace
+@@ -270,13 +290,16 @@ namespace
          std::vector<uint8_t> m_frame;
          uint32_t m_frameWidth = 0;
          uint32_t m_frameHeight = 0;
@@ -542,10 +542,10 @@ index ae295df..aa9d568 100644
      const char *required = std::getenv("PS2_TEST_REQUIRE_GPU");
      if (required && std::string(required) == "1")
 diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
-index 8473622..35fb620 100644
+index 408e5db..836d7b4 100644
 --- a/ps2xTest/src/ps2_gs_parallel_tests.cpp
 +++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
-@@ -18,8 +18,11 @@ namespace
+@@ -20,8 +20,11 @@ namespace
  {
      constexpr uint8_t kRegPrim = 0x00;
      constexpr uint8_t kRegRgbaq = 0x01;
@@ -557,7 +557,7 @@ index 8473622..35fb620 100644
      constexpr uint8_t kRegScissor1 = 0x40;
      constexpr uint8_t kRegTest1 = 0x47;
      constexpr uint8_t kRegFrame1 = 0x4C;
-@@ -60,6 +63,83 @@ namespace
+@@ -62,6 +65,83 @@ namespace
                              static_cast<uint32_t>(packet.size() * sizeof(uint64_t)));
      }
  
@@ -641,7 +641,7 @@ index 8473622..35fb620 100644
      void runSignalFinishLabel(TestCase &t, bool gpu)
      {
          GsFixture f;
-@@ -149,6 +229,38 @@ void register_ps2_gs_parallel_tests()
+@@ -151,6 +231,38 @@ void register_ps2_gs_parallel_tests()
              t.IsTrue(std::memcmp(packet.data() + 12, pixels, 32) == 0, "the pixel qwords follow the IMAGE tag");
          });
  
@@ -680,7 +680,16 @@ index 8473622..35fb620 100644
          tc.Run("the GIF arbiter reports the path each packet came on", [](TestCase &t)
          {
              std::vector<GifPathId> paths;
-@@ -210,5 +322,62 @@ void register_ps2_gs_parallel_tests()
+@@ -177,7 +289,7 @@ void register_ps2_gs_parallel_tests()
+         {
+             auto regs = std::make_unique<GSRegisters>();
+             std::string error;
+-            const std::unique_ptr<GSParallelRenderer> renderer = GSParallelRenderer::create(*regs, error);
++            const std::unique_ptr<GSParallelRenderer> renderer = GSParallelRenderer::create(*regs, GSParallelOptions{}, error);
+             if (!renderer)
+             {
+                 const char *required = std::getenv("PS2_TEST_REQUIRE_GPU");
+@@ -230,5 +342,62 @@ void register_ps2_gs_parallel_tests()
              t.Equals(static_cast<uint32_t>(pixel[1]), 0xC0u, "green of the sprite");
              t.Equals(static_cast<uint32_t>(pixel[2]), 0x40u, "blue of the sprite");
          });
