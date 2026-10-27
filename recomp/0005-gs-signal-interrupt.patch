@@ -1,0 +1,535 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:28:14 +0200
+Subject: [PATCH] GS: SIGNAL/FINISH interrupt, raised for every new event
+
+Former patches of the series, merged:
+- 0012: GS signal interrupt
+- 0045: Raise the GS interrupt for every new event, not per line edge
+---
+ ps2xRuntime/include/runtime/ee_scheduler.h    |   1 +
+ ps2xRuntime/include/runtime/ps2_memory.h      |  20 ++-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |  12 ++
+ .../src/lib/Kernel/Syscalls/System.cpp        |   1 +
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp        |   9 +-
+ ps2xRuntime/src/lib/ps2_memory.cpp            |  66 ++++++++++
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |   6 +
+ ps2xTest/src/ps2_gs_tests.cpp                 |  99 ++++++++++++++
+ ps2xTest/src/ps2_runtime_interrupt_tests.cpp  | 121 ++++++++++++++++++
+ 9 files changed, 326 insertions(+), 9 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..68ce69b 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -419,6 +419,7 @@ private:
+     int m_dmacHeadOrder = 0;
+     int m_dmacTailOrder = 1000;
+     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
++    uint32_t m_pendingIntcMask = 0u;
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 070d976..723189e 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -210,11 +210,23 @@ struct GSRegisters
+     uint64_t imr;      // Interrupt mask
+     uint64_t busdir;   // Bus direction
+     uint64_t siglblid; // Signal label ID
++    // SIGNAL writes that arrived while CSR.SIGNAL was still pending. The GS stalls
++    // on such a write until the guest acknowledges CSR.SIGNAL; the runtime keeps
++    // them in arrival order and applies one per acknowledgement instead.
++    static constexpr uint32_t kMaxQueuedSignals = 6u;
++    uint64_t queuedSignals[kMaxQueuedSignals];
++    uint64_t queuedSignalCount;
+ };
+-static_assert(sizeof(GSRegisters) == (20u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
++static_assert(sizeof(GSRegisters) == (27u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
+ static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
+ static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
+ 
++// Handles a write to the GS SIGNAL register: merges the id into SIGLBLID under the
++// mask and raises CSR.SIGNAL, or queues the write while CSR.SIGNAL is pending.
++void gsWriteSignal(GSRegisters &regs, uint64_t value);
++// Applies the oldest queued SIGNAL once the guest has acknowledged CSR.SIGNAL.
++void gsApplyQueuedSignal(GSRegisters &regs);
++
+ // PS2 VIF (VPU Interface) registers
+ struct VIFRegisters
+ {
+@@ -351,6 +363,9 @@ public:
+     {
+         return m_completedDmacPending.load(std::memory_order_acquire);
+     }
++    // Returns true when a CSR event bit (SIGNAL, FINISH, HSINT, VSINT, EDWINT) not
++    // masked by IMR has been raised since the last call (INTC cause 0).
++    bool pollGsInterruptEdge();
+ 
+     int pollDmaRegisters();
+ 
+@@ -430,6 +445,9 @@ public:
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
+     std::atomic<bool> m_completedDmacPending{false};
++    uint64_t m_gsInterruptEvents = 0u; // unmasked CSR events already reported
++    // After a CSR write: drops the acknowledged events and applies a queued SIGNAL.
++    void acknowledgeGsEvents();
+ 
+     struct CodeRegion
+     {
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..53e5301 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -105,6 +105,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_dmacHeadOrder = 0;
+     m_dmacTailOrder = 1000;
+     m_enabledIntcMask = 0xFFFFFFFFu;
++    m_pendingIntcMask = 0u;
+     m_enabledDmacMask = 0xFFFFFFFFu;
+     m_currentThreadId = 0;
+     m_rescheduleRequested = false;
+@@ -1243,6 +1244,11 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+         if (enabled)
+         {
+             mask |= 1u << cause;
++            if (!dmac && (m_pendingIntcMask & (1u << cause)) != 0u)
++            {
++                m_pendingIntcMask &= ~(1u << cause);
++                dispatchIrq(false, cause);
++            }
+         }
+         else
+         {
+@@ -1258,6 +1264,12 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
+     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+     if (cause < 32u && (mask & (1u << cause)) == 0u)
+     {
++        // INTC_STAT latches the cause; it is delivered once the cause is enabled
++        // again (handlers that run with their own cause disabled rely on this).
++        if (!dmac)
++        {
++            m_pendingIntcMask |= 1u << cause;
++        }
+         return;
+     }
+     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..a9db7d4 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -66,6 +66,7 @@ namespace ps2_syscalls
+         {
+             oldImr = runtime->memory().gs().imr;
+             runtime->memory().gs().imr = newImr;
++            runtime->drainCompletedDmacHandlers(rdram);
+         }
+         RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << newImr
+                                      << " a0_64=0x" << GPR_U64(ctx, 4)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index bc05655..1d4ae16 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1464,14 +1464,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     case GS_REG_SIGNAL:
+     {
+         if (m_privRegs)
+-        {
+-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
+-            uint32_t mask = static_cast<uint32_t>(value >> 32);
+-            uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
+-            lo = (lo & ~mask) | (id & mask);
+-            m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
+-            m_privRegs->csr.fetch_or(0x1);
+-        }
++            gsWriteSignal(*m_privRegs, value);
+         break;
+     }
+     case GS_REG_FINISH:
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e752455..f3432ed 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -377,6 +377,8 @@ bool PS2Memory::initialize(size_t ramSize)
+         // memset zero-fills std::atomic<uint64_t>::csr's bytes, which is not itself
+         // a guaranteed-valid atomic store; make the zero-initialization explicit.
+         gs_regs.csr.store(0);
++        gs_regs.imr = 0x7F00u; // every GS interrupt source masked, as after a hardware reset
++        m_gsInterruptEvents = 0u;
+         gs_regs.dispfb1 = (0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43);
+         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
+         gs_regs.dispfb2 = gs_regs.dispfb1;
+@@ -976,6 +978,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
+             // Done as a single atomic RMW -- see writeCsrHalf's comment.
+             writeCsrHalf(gs_regs.csr, off, value);
++            acknowledgeGsEvents();
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+         {
+@@ -1035,6 +1038,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
+             // atomic RMW -- see writeCsrFull's comment.
+             writeCsrFull(gs_regs.csr, value);
++            acknowledgeGsEvents();
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+         {
+@@ -1185,6 +1189,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         if (regOff == kGsCsrRegOffset)
+         {
+             writeCsrHalf(gs_regs.csr, off, value);
++            acknowledgeGsEvents();
+         }
+         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
+         {
+@@ -1939,6 +1944,67 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+     return causes;
+ }
+ 
++bool PS2Memory::pollGsInterruptEdge()
++{
++    // CSR bits 0..4 are the event flags; IMR bits 8..12 mask the same sources.
++    constexpr uint64_t kCsrEventMask = 0x1Fu;
++    // The INTC latches every GS event that is raised unmasked, also while another
++    // one is still pending in CSR: FINISH from the last packet of a frame arrives
++    // before the handler has acknowledged the SIGNAL that kicked that packet.
++    const uint64_t events = gs_regs.csr.load(std::memory_order_acquire) & kCsrEventMask & ~(gs_regs.imr >> 8u);
++    const bool raised = (events & ~m_gsInterruptEvents) != 0u;
++    m_gsInterruptEvents = events;
++    return raised;
++}
++
++void PS2Memory::acknowledgeGsEvents()
++{
++    // Forget the acknowledged events first, so that a queued SIGNAL applied by the
++    // same write counts as a new event.
++    m_gsInterruptEvents &= gs_regs.csr.load(std::memory_order_acquire);
++    gsApplyQueuedSignal(gs_regs);
++}
++
++namespace
++{
++    constexpr uint64_t kCsrSignal = 0x1u;
++
++    void applySignal(GSRegisters &regs, uint64_t value)
++    {
++        const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
++        const uint32_t mask = static_cast<uint32_t>(value >> 32);
++        uint32_t lo = static_cast<uint32_t>(regs.siglblid & 0xFFFFFFFFu);
++        lo = (lo & ~mask) | (id & mask);
++        regs.siglblid = (regs.siglblid & 0xFFFFFFFF00000000ull) | lo;
++        regs.csr.fetch_or(kCsrSignal);
++    }
++}
++
++void gsWriteSignal(GSRegisters &regs, uint64_t value)
++{
++    if ((regs.csr.load(std::memory_order_acquire) & kCsrSignal) == 0u)
++    {
++        applySignal(regs, value);
++        return;
++    }
++    if (regs.queuedSignalCount < GSRegisters::kMaxQueuedSignals)
++    {
++        regs.queuedSignals[regs.queuedSignalCount++] = value;
++        return;
++    }
++    RUNTIME_LOG("[gs:signal] queue full, dropping SIGNAL 0x" << std::hex << value << std::dec << std::endl);
++}
++
++void gsApplyQueuedSignal(GSRegisters &regs)
++{
++    if (regs.queuedSignalCount == 0u || (regs.csr.load(std::memory_order_acquire) & kCsrSignal) != 0u)
++        return;
++    const uint64_t value = regs.queuedSignals[0];
++    regs.queuedSignalCount--;
++    std::memmove(regs.queuedSignals, regs.queuedSignals + 1, regs.queuedSignalCount * sizeof(uint64_t));
++    applySignal(regs, value);
++}
++
+ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ {
+     if (m_path3Masked || m_path3MaskedFifo.empty())
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e8e1c88..e28a1b7 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1497,6 +1497,12 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+             ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+         }
+     }
++    // SIGNAL/FINISH arrive through the DMA paths drained above; CSR/IMR writes
++    // can raise the line as well. Games resume their GIF/VIF1 chains from here.
++    if (m_memory.pollGsInterruptEdge())
++    {
++        eeScheduler().dispatchIrq(false, 0u);
++    }
+ }
+ 
+ void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index ce47f4e..e3a4d27 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -441,6 +441,105 @@ void register_ps2_gs_tests()
+             t.Equals(mem.read32(kGsImr + 4u), 0x01234567u, "IMR high dword should match");
+         });
+ 
++        tc.Run("GS interrupt line follows CSR events unmasked by IMR", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            constexpr uint32_t kGsCsr = 0x12001000u;
++            constexpr uint32_t kGsImr = 0x12001010u;
++            constexpr uint64_t kCsrSignal = 0x1u;
++            constexpr uint64_t kCsrFinish = 0x2u;
++
++            t.Equals(mem.read64(kGsImr), 0x7F00ull, "IMR should reset with every GS interrupt source masked");
++            t.IsFalse(mem.pollGsInterruptEdge(), "no GS interrupt should be pending after reset");
++
++            mem.gs().csr.fetch_or(kCsrSignal); // as raised by a SIGNAL register write
++            t.IsFalse(mem.pollGsInterruptEdge(), "a SIGNAL event masked by IMR.SIGMSK must not interrupt");
++
++            mem.write64(kGsImr, 0x7E00u);
++            t.IsTrue(mem.pollGsInterruptEdge(), "unmasking a pending SIGNAL should raise the GS interrupt");
++            t.IsFalse(mem.pollGsInterruptEdge(), "the GS interrupt is edge-triggered while SIGNAL stays pending");
++
++            mem.write64(kGsImr, 0x7F00u);
++            t.IsFalse(mem.pollGsInterruptEdge(), "masking every source should drop the line");
++            mem.write64(kGsImr, 0x7E00u);
++            t.IsTrue(mem.pollGsInterruptEdge(), "masking then unmasking a still-pending event should raise it again");
++
++            mem.write64(kGsCsr, kCsrSignal);
++            t.IsFalse(mem.pollGsInterruptEdge(), "acknowledging SIGNAL through CSR should drop the line");
++
++            mem.gs().csr.fetch_or(kCsrFinish);
++            t.IsFalse(mem.pollGsInterruptEdge(), "FINISH should stay masked by IMR.FINISHMSK");
++            mem.write64(kGsImr, 0x7C00u);
++            t.IsTrue(mem.pollGsInterruptEdge(), "unmasking FINISH should raise the GS interrupt");
++        });
++
++        tc.Run("SIGNAL written while CSR.SIGNAL is pending waits for the acknowledgement", [](TestCase &t)
++        {
++            // A VIF1 and a GIF chain each end with a SIGNAL, both restarted by the GS
++            // interrupt handler before it acknowledges the previous SIGNAL. The GS
++            // stalls on the second write, so neither id may be lost.
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GS gs;
++            gs.init(mem.getGSVRAM(), PS2_GS_VRAM_SIZE, &mem.gs());
++
++            constexpr uint32_t kGsCsr = 0x12001000u;
++            constexpr uint32_t kGsSiglblid = 0x12001080u;
++            constexpr uint64_t kSignalVif1 = 0x0000000200000002ull; // id=2, mask=2
++            constexpr uint64_t kSignalGif = 0x0000000100000001ull;  // id=1, mask=1
++
++            gs.writeRegister(GS_REG_SIGNAL, kSignalVif1);
++            t.Equals(mem.read64(kGsCsr) & 0x1ull, 0x1ull, "the first SIGNAL should raise CSR.SIGNAL");
++            t.Equals(mem.read64(kGsSiglblid) & 0x3ull, 0x2ull, "the first SIGNAL should update SIGLBLID");
++
++            gs.writeRegister(GS_REG_SIGNAL, kSignalGif);
++            gs.writeRegister(GS_REG_SIGNAL, kSignalVif1 & ~0x2ull); // id=0, mask=2
++            t.Equals(mem.read64(kGsSiglblid) & 0x3ull, 0x2ull, "SIGNALs written while one is pending must wait");
++
++            mem.write64(kGsCsr, 0x1u);
++            t.Equals(mem.read64(kGsCsr) & 0x1ull, 0x1ull, "acknowledging should raise CSR.SIGNAL for the queued write");
++            t.Equals(mem.read64(kGsSiglblid) & 0x3ull, 0x3ull, "the oldest queued SIGNAL should be applied first");
++
++            mem.write64(kGsCsr, 0x1u);
++            t.Equals(mem.read64(kGsSiglblid) & 0x3ull, 0x1ull, "the next acknowledgement should apply the next SIGNAL");
++            mem.write64(kGsCsr, 0x1u);
++            t.Equals(mem.read64(kGsCsr) & 0x1ull, 0x0ull, "with the queue drained CSR.SIGNAL should stay clear");
++        });
++
++        tc.Run("every GS event raises the interrupt, also while another one is pending", [](TestCase &t)
++        {
++            // Soulcalibur III kicks the last packet of a frame from its SIGNAL handler.
++            // The packet's FINISH arrives before the handler acknowledges that SIGNAL,
++            // and the handler writes back every CSR bit it sees, FINISH included.
++            // The frame counts as drawn only when the FINISH interrupt is delivered.
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GS gs;
++            gs.init(mem.getGSVRAM(), PS2_GS_VRAM_SIZE, &mem.gs());
++
++            constexpr uint32_t kGsCsr = 0x12001000u;
++            constexpr uint32_t kGsImr = 0x12001010u;
++            mem.write64(kGsImr, 0x7C00u); // SIGNAL and FINISH unmasked
++
++            gs.writeRegister(GS_REG_SIGNAL, 0x0000000100000001ull);
++            t.IsTrue(mem.pollGsInterruptEdge(), "SIGNAL should raise the GS interrupt");
++            gs.writeRegister(GS_REG_FINISH, 0u);
++            t.IsTrue(mem.pollGsInterruptEdge(), "FINISH should raise the GS interrupt while SIGNAL is pending");
++            t.IsFalse(mem.pollGsInterruptEdge(), "each event should interrupt once");
++            mem.write64(kGsCsr, 0x3u);
++            t.IsFalse(mem.pollGsInterruptEdge(), "acknowledging both events should raise nothing");
++
++            // A SIGNAL that waited for the acknowledgement is a new event as well.
++            gs.writeRegister(GS_REG_SIGNAL, 0x0000000100000001ull);
++            gs.writeRegister(GS_REG_SIGNAL, 0x0000000200000002ull);
++            t.IsTrue(mem.pollGsInterruptEdge(), "the first SIGNAL should raise the GS interrupt");
++            mem.write64(kGsCsr, 0x1u);
++            t.Equals(mem.read64(kGsCsr) & 0x1ull, 0x1ull, "the queued SIGNAL should be applied by the acknowledgement");
++            t.IsTrue(mem.pollGsInterruptEdge(), "the queued SIGNAL should raise the GS interrupt again");
++        });
++
+         tc.Run("unknown GS privileged offsets are no-op and read as zero", [](TestCase &t)
+         {
+             PS2Memory mem;
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 1707644..4634aaa 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -84,6 +84,18 @@ namespace
+     constexpr uint32_t kToSprQwc = 0x1000D420u;
+     constexpr uint32_t kToSprSadr = 0x1000D480u;
+     constexpr uint32_t kToSprCause = 9u;
++    constexpr uint32_t kGsSignalKickPc = 0x00160800u;
++    constexpr uint32_t kGsSignalResumePc = 0x00160810u;
++    constexpr uint32_t kGsSignalHandlerPc = 0x00160820u;
++    constexpr uint32_t kMaskedIrqPc = 0x00160900u;
++    constexpr uint32_t kMaskedIrqResumePc = 0x00160910u;
++    constexpr uint32_t kMaskedIrqHandlerPc = 0x00160920u;
++
++    constexpr uint32_t kGsImr = 0x12001010u;
++    constexpr uint32_t kGifChcr = 0x1000A000u;
++    constexpr uint32_t kGifMadr = 0x1000A010u;
++    constexpr uint32_t kGifQwc = 0x1000A020u;
++    constexpr uint32_t kGsSignalPacketAddr = 0x00020000u;
+ 
+     constexpr uint32_t kTimer2Count = 0x10001000u;
+     constexpr uint32_t kTimer2Mode = 0x10001010u;
+@@ -112,6 +124,7 @@ namespace
+     uint32_t g_storeKickWidth = 0u;
+     bool g_storeKickHandlerRan = false;
+     bool g_storeKickHandledBeforeResume = false;
++    uint64_t g_gsHandlerSiglblid = 0u;
+ 
+     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
+     {
+@@ -431,6 +444,69 @@ namespace
+         ctx->pc = 0u;
+         runtime->requestStop();
+     }
++
++    void schedulerMaskedIrqHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        g_dispatchTrace.push_back(3);
++        ctx->pc = 0u;
++    }
++
++    // An INTC cause raised while disabled (e.g. from inside its own handler, which
++    // runs with the cause disabled) must fire once the cause is enabled again.
++    void schedulerMaskedIrq(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        EeScheduler &scheduler = runtime->eeScheduler();
++        scheduler.addIrqHandler(false, 0u, kMaskedIrqHandlerPc, true, 0u, 0u, 0u);
++        scheduler.setIrqCauseEnabled(false, 0u, false);
++        g_dispatchTrace.push_back(1);
++        scheduler.dispatchIrq(false, 0u);
++        scheduler.dispatchIrq(false, 0u);
++        g_dispatchTrace.push_back(2);
++        scheduler.setIrqCauseEnabled(false, 0u, true);
++        ctx->pc = kMaskedIrqResumePc;
++    }
++
++    void schedulerMaskedIrqResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_dispatchTrace.push_back(4);
++        runtime->eeScheduler().setIrqCauseEnabled(false, 0u, false);
++        runtime->eeScheduler().setIrqCauseEnabled(false, 0u, true);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
++
++    void schedulerGsSignalHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_dispatchTrace.push_back(2);
++        g_lastIntcArg.store(getRegU32(ctx, 5), std::memory_order_relaxed);
++        g_gsHandlerSiglblid = runtime->memory().gs().siglblid;
++        ctx->pc = 0u;
++    }
++
++    // Mirrors the frame kick of games that end a GIF/VIF1 chain with a SIGNAL and
++    // continue the chain from the GS interrupt handler.
++    void schedulerGsSignalKick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_dispatchTrace.push_back(1);
++        runtime->eeScheduler().addIrqHandler(false, 0u, kGsSignalHandlerPc, true, 0x6510u, 0u, 0u);
++        runtime->Store64(rdram, ctx, kGsImr, 0x7E00u); // unmask SIGNAL only
++
++        // PACKED GIFtag (NLOOP=1, EOP=1, NREG=1, REGS=A+D) followed by SIGNAL(id=2, mask=2).
++        const uint64_t packet[4] = {0x0000000000008001ull | (1ull << 60), 0xEull,
++                                    0x0000000200000002ull, 0x60ull};
++        std::memcpy(rdram + kGsSignalPacketAddr, packet, sizeof(packet));
++        runtime->Store32(rdram, ctx, kGifMadr, kGsSignalPacketAddr);
++        runtime->Store32(rdram, ctx, kGifQwc, 2u);
++        ctx->pc = kGsSignalResumePc;
++        runtime->Store32(rdram, ctx, kGifChcr, 0x100u);
++    }
++
++    void schedulerGsSignalResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_dispatchTrace.push_back(3);
++        ctx->pc = 0u;
++        runtime->requestStop();
++    }
+ }
+ 
+ void register_ps2_runtime_interrupt_tests()
+@@ -684,6 +760,51 @@ void register_ps2_runtime_interrupt_tests()
+             t.IsFalse(g_invocationQueueSpChanged, "sequential callbacks should reuse the same stack depth");
+         });
+ 
++        tc.Run("GS SIGNAL from a GIF DMA dispatches the INTC GS handler", [](TestCase &t)
++        {
++            TestEnv env;
++            t.IsTrue(env.runtime.memory().initialize(), "runtime memory initialize should succeed");
++            t.IsTrue(env.runtime.syncCoreSubsystems(), "runtime core subsystems should bind");
++            env.runtime.registerFunction(kGsSignalKickPc, schedulerGsSignalKick);
++            env.runtime.registerFunction(kGsSignalResumePc, schedulerGsSignalResume);
++            env.runtime.registerFunction(kGsSignalHandlerPc, schedulerGsSignalHandler);
++
++            g_dispatchTrace.clear();
++            g_lastIntcArg.store(0u, std::memory_order_relaxed);
++            g_gsHandlerSiglblid = 0u;
++            R5900Context mainContext{};
++            mainContext.pc = kGsSignalKickPc;
++            uint8_t *rdram = env.runtime.memory().getRDRAM();
++            env.runtime.eeScheduler().reset(rdram, mainContext);
++            env.runtime.eeScheduler().run();
++
++            const std::vector<int> expected{1, 2, 3};
++            t.IsTrue(g_dispatchTrace == expected,
++                     "the GS interrupt raised by SIGNAL should run before the kicking thread resumes");
++            t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0x6510u,
++                     "the GS handler should receive its registered argument");
++            t.Equals(g_gsHandlerSiglblid & 0xFFFFFFFFull, 0x2ull,
++                     "the GS handler should observe the SIGNAL id in SIGLBLID");
++        });
++
++        tc.Run("INTC cause raised while disabled is delivered once on enable", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kMaskedIrqPc, schedulerMaskedIrq);
++            env.runtime.registerFunction(kMaskedIrqResumePc, schedulerMaskedIrqResume);
++            env.runtime.registerFunction(kMaskedIrqHandlerPc, schedulerMaskedIrqHandler);
++
++            g_dispatchTrace.clear();
++            R5900Context mainContext{};
++            mainContext.pc = kMaskedIrqPc;
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++
++            const std::vector<int> expected{1, 2, 3, 4};
++            t.IsTrue(g_dispatchTrace == expected,
++                     "a latched cause should run its handler exactly once after EnableIntc, and not again on re-enable");
++        });
++
+         tc.Run("iSignalSema defers selection until IRQ return", [](TestCase &t)
+         {
+             TestEnv env;

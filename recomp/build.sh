@@ -22,7 +22,12 @@ fi
 if [ ! -d PS2Recomp ]; then
   git clone --recurse-submodules https://github.com/ran-j/PS2Recomp.git
   git -C PS2Recomp checkout "$COMMIT"
-  git -C PS2Recomp apply "$HERE"/[0-9][0-9][0-9][0-9]-*.patch
+  # recomp/series lists the patches in the order they apply; the upstream/ ones are interleaved with the local ones.
+  PATCHES=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && PATCHES+=("$HERE/$p")
+  done <"$HERE/series"
+  git -C PS2Recomp apply "${PATCHES[@]}"
 fi
 # Pre-fetch dependencies with shallow clones: FetchContent's full clones of github.com repos failed
 # intermittently ("HTTP 400 ... expected 'packfile'"), also for toml11's test submodule.
@@ -67,7 +72,7 @@ if command -v ccache >/dev/null 2>&1; then
 fi
 
 # 3. Build recompiler + runtime. ENABLE_FFMPEG=ON enables movies; the ImGui debug UI is disabled. LTO is off
-#    (patch 0005): the thin-LTO link of ~2100 generated objects took over an hour per iteration.
+#    (patch 0004): the thin-LTO link of ~2100 generated objects took over an hour per iteration.
 cd PS2Recomp
 cmake -S . -B out/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DPS2X_BUILD_STUDIO=OFF -DPS2X_BUILD_TEST=OFF \

@@ -1,0 +1,4361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:28:17 +0200
+Subject: [PATCH] VU: compiled VU1 and VU0 microprograms
+
+Former patches of the series, merged:
+- 0034: Compiled VU1 microprogram runtime
+- 0035: VU program compiler and tests
+- 0036: Compile VU0 microprograms with the VU1 program compiler
+- 0037: Test compiled VU0 programs against the interpreter
+- 0038: Hand in-flight VU results back in the interpreter's own view
+- 0039: Record VU0 register jump targets while profiling
+- 0040: Make a VU0 macro call cheaper: no reset, clear only what is in use
+- 0041: Commit compiled-routine flags without a branch per result
+---
+ ps2xRuntime/CMakeLists.txt                 |   47 +
+ ps2xRuntime/include/runtime/ps2_vu1.h      |   18 +
+ ps2xRuntime/src/lib/ps2_runtime.cpp        |    3 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp    |   54 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_decode.h    |    6 -
+ ps2xRuntime/src/lib/vu/ps2_vu1_detail.h    |   20 +
+ ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp   |    7 +-
+ ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp |  547 +++++++
+ ps2xRuntime/src/lib/vu/ps2_vu1_program.h   | 1580 ++++++++++++++++++++
+ ps2xTest/CMakeLists.txt                    |    1 +
+ ps2xTest/data/vu_programs.py               |  452 ++++++
+ ps2xTest/src/main.cpp                      |    2 +
+ ps2xTest/src/ps2_vu1_program_tests.cpp     |  440 ++++++
+ ps2xTest/src/ps2_vu1_tests.cpp             |   54 +
+ tools/compile_vu_programs.py               |  600 ++++++++
+ tools/tests/test_compile_vu_programs.py    |  264 ++++
+ 16 files changed, 4075 insertions(+), 20 deletions(-)
+ create mode 100644 ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+ create mode 100644 ps2xRuntime/src/lib/vu/ps2_vu1_program.h
+ create mode 100644 ps2xTest/data/vu_programs.py
+ create mode 100644 ps2xTest/src/ps2_vu1_program_tests.cpp
+ create mode 100644 tools/compile_vu_programs.py
+ create mode 100644 tools/tests/test_compile_vu_programs.py
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 024ffcb..a38501b 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -394,9 +394,56 @@ add_library(ps2_runtime STATIC
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+     src/lib/vu/ps2_vu1_lower.cpp
++    src/lib/vu/ps2_vu1_program.cpp
+     src/lib/games_database.cpp
+ )
+ 
++# Whole VU1 routines, compiled from PS2_VU_PROGRAM_PROFILE recordings.
++set(PS2X_VU_PROGRAM_PROFILES "" CACHE STRING "Local VU1 program profile directories to compile; never distributed")
++set(PS2X_VU_PROGRAM_SHARDS "8" CACHE STRING "Number of compilation units for compiled VU1 routines")
++set(PS2X_VU_PROGRAM_MAX_PAIRS "256" CACHE STRING
++    "Pairs of a compiled VU1 routine built as one function; longer routines are split, as optimizers slow down sharply on long functions")
++if(PS2X_VU_PROGRAM_PROFILES)
++    find_package(Python3 COMPONENTS Interpreter REQUIRED)
++    if(NOT PS2X_VU_PROGRAM_SHARDS MATCHES "^[1-9][0-9]*$")
++        message(FATAL_ERROR "PS2X_VU_PROGRAM_SHARDS must be a positive integer")
++    endif()
++    if(NOT PS2X_VU_PROGRAM_MAX_PAIRS MATCHES "^[0-9]+$" OR PS2X_VU_PROGRAM_MAX_PAIRS LESS 128)
++        message(FATAL_ERROR "PS2X_VU_PROGRAM_MAX_PAIRS must be at least 128, the longest block")
++    endif()
++    set(PS2X_VU_PROGRAM_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/vu_programs.inc")
++    set(PS2X_VU_PROGRAM_EXTERN_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/generated/vu_programs_extern.inc")
++    set(PS2X_VU_PROGRAM_SOURCES)
++    math(EXPR PS2X_VU_PROGRAM_LAST_SHARD "${PS2X_VU_PROGRAM_SHARDS} - 1")
++    foreach(SHARD RANGE ${PS2X_VU_PROGRAM_LAST_SHARD})
++        list(APPEND PS2X_VU_PROGRAM_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/generated/vu_programs_${SHARD}.cpp")
++    endforeach()
++    set(PS2X_VU_PROGRAM_LISTS)
++    foreach(PROFILE ${PS2X_VU_PROGRAM_PROFILES})
++        list(APPEND PS2X_VU_PROGRAM_LISTS "${PROFILE}/entries.txt")
++    endforeach()
++    add_custom_command(
++        OUTPUT "${PS2X_VU_PROGRAM_INCLUDE}" "${PS2X_VU_PROGRAM_EXTERN_INCLUDE}" ${PS2X_VU_PROGRAM_SOURCES}
++        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/compile_vu_programs.py"
++                --output "${PS2X_VU_PROGRAM_INCLUDE}" --shards ${PS2X_VU_PROGRAM_SHARDS}
++                --max-routine-pairs ${PS2X_VU_PROGRAM_MAX_PAIRS}
++                ${PS2X_VU_PROGRAM_PROFILES}
++        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/compile_vu_programs.py" ${PS2X_VU_PROGRAM_LISTS}
++        VERBATIM)
++    add_custom_target(ps2_vu_programs DEPENDS "${PS2X_VU_PROGRAM_INCLUDE}"
++                      "${PS2X_VU_PROGRAM_EXTERN_INCLUDE}" ${PS2X_VU_PROGRAM_SOURCES})
++    add_dependencies(ps2_runtime ps2_vu_programs)
++    target_sources(ps2_runtime PRIVATE ${PS2X_VU_PROGRAM_SOURCES})
++    set_source_files_properties(src/lib/vu/ps2_vu1_program.cpp PROPERTIES COMPILE_DEFINITIONS
++        "PS2X_VU_PROGRAM_INCLUDE=\"${PS2X_VU_PROGRAM_INCLUDE}\";PS2X_VU_PROGRAM_EXTERN_INCLUDE=\"${PS2X_VU_PROGRAM_EXTERN_INCLUDE}\"")
++    set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES
++        SKIP_UNITY_BUILD_INCLUSION ON
++        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
++    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
++        set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES COMPILE_OPTIONS "-g0")
++    endif()
++endif()
++
+ if(PS2X_ENABLE_RUNTIME_LOGS)
+     target_compile_definitions(ps2_runtime PUBLIC
+         PS2_RUNTIME_LOGS=1
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 613f84e..083f36b 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -9,6 +9,11 @@
+ class GS;
+ class PS2Memory;
+ 
++namespace ps2_vu_program
++{
++    struct Access;
++}
++
+ struct VU1State
+ {
+     float vf[32][4];
+@@ -64,7 +69,16 @@ public:
+     VU1State &state() { return m_state; }
+     const VU1State &state() const { return m_state; }
+ 
++    // VU1 programs compiled ahead of time (ps2_vu1_program.h) run instead of
++    // the interpreter when one matches the microcode; PS2_VU_EXECUTION=interpreter
++    // turns them off.
++    void setCompiledExecutionEnabled(bool enabled) { m_useCompiledExecution = enabled; }
++    uint64_t compiledPairsExecuted() const { return m_compiledPairsExecuted; }
++
+ private:
++    // Compiled programs read and publish the interpreter's state.
++    friend struct ps2_vu_program::Access;
++
+     enum Pipeline : uint8_t
+     {
+         PipelineNone = 0,
+@@ -240,6 +254,8 @@ private:
+     // Cycle at which each VF lane / VI register / ACC lane write becomes
+     // readable by a following instruction.
+     std::array<uint64_t, kReadySlotCount> m_ready{};
++    // The latest cycle in m_ready, so a reset only clears it when one is still ahead.
++    uint64_t m_readyHorizon = 0;
+     std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
+     std::array<uint64_t, 16> m_viLatestWrite{};
+     std::array<uint64_t, 4> m_accLatestWrite{};
+@@ -270,6 +286,8 @@ private:
+     bool m_stopRequested = false;
+     bool m_pendingHaltD = false;
+     bool m_pendingHaltT = false;
++    bool m_useCompiledExecution = true;
++    uint64_t m_compiledPairsExecuted = 0;
+ 
+     void run(uint8_t *vuCode, uint32_t codeSize,
+              uint8_t *vuData, uint32_t dataSize,
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 40b500e..39897ec 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1476,7 +1476,8 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+         return;
+     }
+ 
+-    m_vu0->reset();
++    // The context holds all of VU0's state, and execute() starts the
++    // pipelines empty, so the unit needs no reset per call.
+     copyVu0ContextToState(ctx, m_vu0->state());
+     m_vu0->execute(vu0Code, PS2_VU0_CODE_SIZE,
+                   vu0Data, PS2_VU0_DATA_SIZE,
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index a6edaf2..1491e86 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -5,6 +5,7 @@
+ #include "ps2_vu1_detail.h"
+ #include "ps2_vu1_upper_engine.h"
+ #include "ps2_vu1_decode.h"
++#include "ps2_vu1_program.h"
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -45,19 +46,20 @@ namespace
+ 
+ void VU1Interpreter::resetScheduler()
+ {
+-    m_flagPipeline = {};
++    // Runs on every VU0 macro call, so it only clears what is in use. Pipeline
++    // entries are read only while their mask bit is set, and claiming one
++    // fills it in, so clearing the masks empties the pipelines.
++    // A ready cycle that has passed reads like a cleared one.
++    if (m_readyHorizon > m_cycle)
++    {
++        m_ready = {};
++        m_readyHorizon = 0;
++    }
++    // The latest-write sequences stay: a write that lands compares them with
++    // its own, which it set when it queued.
+     m_fdiv = {};
+     m_efu = {};
+-    m_storePipeline = {};
+     m_xgkick = {};
+-    m_vfWritePipeline = {};
+-    m_viWritePipeline = {};
+-    m_accWritePipeline = {};
+-    m_ready = {};
+-    m_vfLatestWrite = {};
+-    m_viLatestWrite = {};
+-    m_accLatestWrite = {};
+-    m_nextWriteSequence = 0;
+     m_efuResourceReady = 0;
+     m_nextCommitCycle = std::numeric_limits<uint64_t>::max();
+     m_flagMask = 0;
+@@ -75,8 +77,19 @@ void VU1Interpreter::resetScheduler()
+     m_pendingHaltT = false;
+ }
+ 
++VU1Interpreter::VU1Interpreter(Unit unit)
++    : m_unit(unit)
++{
++    const char *execution = std::getenv("PS2_VU_EXECUTION");
++    m_useCompiledExecution = execution == nullptr || std::strcmp(execution, "interpreter") != 0;
++    reset();
++}
++
+ void VU1Interpreter::reset()
+ {
++    // A new VU1 may reuse an old one's code address and generation.
++    if (m_unit == Unit::VU1)
++        ps2_vu_program::forgetRoutines();
+     std::memset(&m_state, 0, sizeof(m_state));
+     m_state.vf[0][3] = 1.0f;
+     m_state.q = 1.0f;
+@@ -663,7 +676,11 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+ {
+     for (uint32_t index = 0; index < decoded.writeSlotCount; ++index)
+-        m_ready[decoded.writeSlots[index]] = m_cycle + decoded.writeLatencies[index];
++    {
++        const uint64_t ready = m_cycle + decoded.writeLatencies[index];
++        m_ready[decoded.writeSlots[index]] = ready;
++        m_readyHorizon = std::max(m_readyHorizon, ready);
++    }
+ }
+ 
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const
+@@ -785,7 +802,20 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
+     const uint64_t budgetEnd = m_cycle + maxCycles;
+     bool programEnded = false;
+-    while (m_cycle < budgetEnd && !m_stopRequested)
++
++    // A drained VU at the entry of a compiled program runs it whole.
++    commitReadyPipelines();
++    const bool ownCode = memory != nullptr && vuCode == (m_unit == Unit::VU1 ? memory->getVU1Code() : memory->getVU0Code());
++    if (ownCode && budgetEnd - m_cycle >= ps2_vu_program::kMinimumBudget && ps2_vu_program::Access::drained(*this))
++    {
++        const uint64_t generation = m_unit == Unit::VU1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
++        if (const auto routine = ps2_vu_program::find(vuCode, codeSize, m_state.pc, generation))
++            programEnded = ps2_vu_program::run(*this, vuCode, codeSize, budgetEnd, routine);
++        else
++            ps2_vu_program::recordMissing(vuCode, codeSize, m_state.pc);
++    }
++
++    while (!programEnded && m_cycle < budgetEnd && !m_stopRequested)
+     {
+         commitReadyPipelines();
+         if (m_state.pc + 8u > codeSize)
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_decode.h b/ps2xRuntime/src/lib/vu/ps2_vu1_decode.h
+index 21963ad..6e9fd52 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_decode.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_decode.h
+@@ -47,12 +47,6 @@ constexpr uint8_t VU1Interpreter::vfReadLanes(const InstructionUsage &usage, uin
+     return 0u;
+ }
+ 
+-VU1Interpreter::VU1Interpreter(Unit unit)
+-    : m_unit(unit)
+-{
+-    reset();
+-}
+-
+ constexpr VU1Interpreter::InstructionUsage VU1Interpreter::decodeUpperUsage(uint32_t upper)
+ {
+     InstructionUsage usage;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index 6c037a2..97cda90 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -1,8 +1,28 @@
+ #ifndef PS2_VU1_DETAIL_H
+ #define PS2_VU1_DETAIL_H
+ 
++#include "runtime/ps2_vu1.h"
++
+ #include <cstdint>
+ 
++class PS2Memory;
++
++namespace ps2_vu_detail
++{
++    // EFU polynomials, shared by the interpreter and compiled VU1 programs.
++    float vuEatan(float value);
++    float vuEsin(float value);
++    float vuEexp(float value);
++}
++
++namespace ps2_vu_program
++{
++    // While a program profile is recorded, saves where a register jump lands:
++    // compiled routines end at register jumps, so a first recording would not
++    // otherwise see the target.
++    void noteJump(VU1Interpreter::Unit unit, PS2Memory *memory, uint32_t target);
++}
++
+ // Instruction field extraction helpers
+ static constexpr uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+ static constexpr uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index 9adb2c5..35c59f3 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -11,8 +11,11 @@
+ 
+ using ps2_vu_detail::upper::normalizeOperand;
+ using ps2_vu_detail::upper::normalizeResult;
++using ps2_vu_detail::vuEatan;
++using ps2_vu_detail::vuEexp;
++using ps2_vu_detail::vuEsin;
+ 
+-namespace
++namespace ps2_vu_detail
+ {
+     float vuEatan(float value)
+     {
+@@ -290,6 +293,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+         uint8_t is = VIS(instr);
+         // Register jumps do not use conditional branches' delayed VI operand.
+         uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
++        ps2_vu_program::noteJump(m_unit, memory, target);
+         m_state.branchPending = true;
+         m_state.branchTarget = target;
+         m_state.branchDelay = 1;
+@@ -300,6 +304,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+         uint32_t target = ((uint32_t)(uint16_t)m_state.vi[is] * 8u) & pcMask;
++        ps2_vu_program::noteJump(m_unit, memory, target);
+         if (it != 0)
+             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+         m_state.branchPending = true;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+new file mode 100644
+index 0000000..ca357ee
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_program.cpp
+@@ -0,0 +1,547 @@
++#include "ps2_vu1_program.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <bit>
++#include <limits>
++#include <bitset>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <mutex>
++#include <set>
++#include <string>
++#include <tuple>
++#include <utility>
++
++#ifdef PS2X_VU_PROGRAM_EXTERN_INCLUDE
++#include PS2X_VU_PROGRAM_EXTERN_INCLUDE
++#endif
++
++namespace ps2_vu_program
++{
++namespace
++{
++// Sorted by entry PC; the last element only terminates the table.
++const Entry kEntries[] = {
++#ifdef PS2X_VU_PROGRAM_INCLUDE
++#include PS2X_VU_PROGRAM_INCLUDE
++#endif
++    {0xFFFFFFFFu, 0u, 0u, nullptr, nullptr, nullptr},
++};
++
++bool matches(const Entry &entry, const uint8_t *code, uint32_t codeSize)
++{
++    for (uint32_t index = 0; index < entry.footprintPairs; ++index)
++    {
++        const uint32_t offset = static_cast<uint32_t>(entry.footprint[index]) * 8u;
++        uint64_t word;
++        if (offset + 8u > codeSize)
++            return false;
++        std::memcpy(&word, code + offset, sizeof(word));
++        if (word != entry.words[index])
++            return false;
++    }
++    return true;
++}
++
++struct CacheSlot
++{
++    const uint8_t *code = nullptr;
++    uint64_t generation = 0u;
++    uint64_t epoch = 0u;
++    Routine run = nullptr;
++    bool valid = false;
++};
++
++std::atomic<uint64_t> g_epoch{0u};
++}
++
++void forgetRoutines()
++{
++    g_epoch.fetch_add(1u, std::memory_order_relaxed);
++}
++
++Routine find(const uint8_t *code, uint32_t codeSize, uint32_t pc, uint64_t generation)
++{
++    // Microcode changes far less often than routines are entered, so each
++    // answer stands until the code generation moves on.
++    thread_local std::array<CacheSlot, 2048> cache{};
++    CacheSlot &slot = cache[(pc / 8u) & 2047u];
++    const uint64_t epoch = g_epoch.load(std::memory_order_relaxed);
++    if (slot.valid && slot.code == code && slot.generation == generation && slot.epoch == epoch)
++        return slot.run;
++
++    Routine routine = nullptr;
++    const Entry *const begin = std::begin(kEntries);
++    const Entry *const end = std::end(kEntries) - 1;
++    const Entry *entry = std::lower_bound(begin, end, pc,
++                                          [](const Entry &candidate, uint32_t value) { return candidate.pc < value; });
++    for (; entry != end && entry->pc == pc; ++entry)
++    {
++        if (entry->codeSize == codeSize && matches(*entry, code, codeSize))
++        {
++            routine = entry->run;
++            break;
++        }
++    }
++    slot = {code, generation, epoch, routine, true};
++    return routine;
++}
++
++namespace
++{
++std::string &profileDirectory()
++{
++    static std::string directory = [] {
++        const char *value = std::getenv("PS2_VU_PROGRAM_PROFILE");
++        return std::string(value ? value : "");
++    }();
++    return directory;
++}
++}
++
++void setProfileDirectory(std::string directory)
++{
++    profileDirectory() = std::move(directory);
++}
++
++void recordMissing(const uint8_t *code, uint32_t codeSize, uint32_t pc)
++{
++    const std::string &directory = profileDirectory();
++    if (directory.empty())
++        return;
++    static std::mutex mutex;
++    const std::lock_guard lock(mutex);
++    static std::set<std::tuple<uint64_t, uint32_t, uint32_t>> recorded;
++    uint64_t hash = 14695981039346656037ull;
++    for (uint32_t i = 0; i < codeSize; ++i)
++        hash = (hash ^ code[i]) * 1099511628211ull;
++    if (!recorded.emplace(hash, codeSize, pc).second)
++        return;
++    char name[20];
++    std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(hash));
++    const std::filesystem::path root(directory);
++    const char *unit = codeSize == PS2_VU0_CODE_SIZE ? "vu0-" : "vu1-";
++    const std::filesystem::path image = root / (std::string(unit) + name + ".code");
++    std::error_code error;
++    std::filesystem::create_directories(root, error);
++    if (!std::filesystem::exists(image, error))
++        std::ofstream(image, std::ios::binary).write(reinterpret_cast<const char *>(code), codeSize);
++    std::ofstream(root / "entries.txt", std::ios::app) << name << ' ' << std::hex << pc << '\n';
++}
++
++void noteJump(Unit unit, PS2Memory *memory, uint32_t target)
++{
++    if (!memory || profileDirectory().empty())
++        return;
++    // Once per unit, target and microcode generation, as recordMissing hashes
++    // the whole image.
++    struct Seen
++    {
++        uint64_t generation = ~0ull;
++        std::bitset<PS2_VU1_CODE_SIZE / 8u> pairs;
++    };
++    thread_local std::array<Seen, 2> seenByUnit;
++    const bool vu0 = unit == Unit::VU0;
++    Seen &seen = seenByUnit[vu0 ? 0u : 1u];
++    const uint64_t generation = vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration();
++    if (generation != seen.generation)
++    {
++        seen.pairs.reset();
++        seen.generation = generation;
++    }
++    const uint32_t codeSize = vu0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
++    const uint32_t pair = (target % codeSize) / 8u;
++    if (seen.pairs.test(pair))
++        return;
++    seen.pairs.set(pair);
++    const uint8_t *code = vu0 ? memory->getVU0Code() : memory->getVU1Code();
++    if (!find(code, codeSize, target, generation))
++        recordMissing(code, codeSize, target);
++}
++
++namespace
++{
++// Claims the lowest free slot of an N-entry pipeline, as the interpreter does.
++template <uint32_t N>
++int claimSlot(uint32_t &mask)
++{
++    const uint32_t freeSlots = ~mask & ((1u << N) - 1u);
++    if (freeSlots == 0u)
++        return -1;
++    const int slot = std::countr_zero(freeSlots);
++    mask |= 1u << slot;
++    return slot;
++}
++}
++
++// The entry takes the result from the register file, which handBack then
++// puts back to what the interpreter shows until the entry lands.
++void Access::pendVf(VU1Interpreter &vu, uint8_t reg, uint8_t lanes, uint64_t ready)
++{
++    const int slot = claimSlot<VU1Interpreter::kMaxPendingVfWrites>(vu.m_vfWriteMask);
++    if (slot < 0)
++        return;
++    VU1Interpreter::PendingVfWrite &write = vu.m_vfWritePipeline[static_cast<uint32_t>(slot)];
++    write = {};
++    write.valid = true;
++    write.readyCycle = ready;
++    write.sequence = ++vu.m_nextWriteSequence;
++    write.reg = reg;
++    write.laneMask = lanes;
++    std::memcpy(write.value.data(), vu.m_state.vf[reg], sizeof(write.value));
++    for (uint32_t component = 0; component < 4u; ++component)
++        if ((lanes & lane(component)) != 0u)
++        {
++            vu.m_vfLatestWrite[reg][component] = write.sequence;
++            vu.m_ready[VU1Interpreter::kReadyVfBase + reg * 4u + component] = ready;
++        }
++    vu.m_readyHorizon = std::max(vu.m_readyHorizon, ready);
++}
++
++void Access::pendVi(VU1Interpreter &vu, uint8_t reg, uint64_t ready)
++{
++    const int slot = claimSlot<VU1Interpreter::kMaxPendingViWrites>(vu.m_viWriteMask);
++    if (slot < 0)
++        return;
++    VU1Interpreter::PendingViWrite &write = vu.m_viWritePipeline[static_cast<uint32_t>(slot)];
++    write = {};
++    write.valid = true;
++    write.readyCycle = ready;
++    write.sequence = ++vu.m_nextWriteSequence;
++    write.reg = reg;
++    write.value = vu.m_state.vi[reg];
++    vu.m_viLatestWrite[reg] = write.sequence;
++    vu.m_ready[VU1Interpreter::kReadyViBase + reg] = ready;
++    vu.m_readyHorizon = std::max(vu.m_readyHorizon, ready);
++}
++
++void Access::pendFlags(VU1Interpreter &vu, uint64_t issue, uint32_t mac, uint32_t status,
++                       uint32_t sticky, uint32_t clip, uint8_t writes)
++{
++    const int slot = claimSlot<VU1Interpreter::kMaxFlagEntries>(vu.m_flagMask);
++    if (slot < 0)
++        return;
++    VU1Interpreter::FlagPipelineEntry &entry = vu.m_flagPipeline[static_cast<uint32_t>(slot)];
++    entry = {};
++    entry.valid = true;
++    entry.issueCycle = issue;
++    entry.readyCycle = issue + VU1Interpreter::kFmacLatency;
++    entry.mac = mac;
++    entry.status = status;
++    entry.extraSticky = sticky;
++    entry.clip = clip;
++    entry.writesMac = (writes & 1u) != 0u;
++    entry.writesStatus = (writes & 2u) != 0u;
++    entry.writesSticky = (writes & 4u) != 0u;
++    entry.writesClip = (writes & 8u) != 0u;
++}
++
++void Access::finish(VU1Interpreter &vu, uint64_t cycle, uint32_t workingClip, uint8_t backupReg,
++                    int32_t backupValue, uint64_t pairs)
++{
++    vu.m_cycle = cycle;
++    vu.m_state.cycles = cycle;
++    vu.m_workingClip = workingClip;
++    vu.m_viBranchBackupValid = backupReg != 0u;
++    vu.m_viBranchBackupReg = backupReg;
++    vu.m_viBranchBackupValue = backupValue;
++    vu.m_compiledPairsExecuted += pairs;
++
++    // The compiled code retired Q and P results itself; the earliest commit
++    // the interpreter waits for is that of whatever is still valid.
++    uint64_t next = std::numeric_limits<uint64_t>::max();
++    const auto earliest = [&next](const auto &entries, uint32_t mask) {
++        for (; mask != 0u; mask &= mask - 1u)
++            next = std::min<uint64_t>(next, entries[static_cast<uint32_t>(std::countr_zero(mask))].readyCycle);
++    };
++    earliest(vu.m_flagPipeline, vu.m_flagMask);
++    earliest(vu.m_efu, vu.m_efuMask);
++    earliest(vu.m_storePipeline, vu.m_storeMask);
++    earliest(vu.m_vfWritePipeline, vu.m_vfWriteMask);
++    earliest(vu.m_viWritePipeline, vu.m_viWriteMask);
++    earliest(vu.m_accWritePipeline, vu.m_accWriteMask);
++    if (vu.m_fdiv.valid)
++        next = std::min(next, vu.m_fdiv.readyCycle);
++    vu.m_nextCommitCycle = next;
++}
++
++Run::Run(VU1Interpreter &vu)
++    : m_vu(vu), m_state(Access::state(vu)), m_data(Access::data(vu)),
++      m_base(Access::cycle(vu)), m_generation(Access::codeGeneration(vu))
++{
++    // Drained on entry, so every ready cycle is now.
++    m_backupValue = Access::branchBackup(vu, m_backupReg);
++    m_workingClip = Access::workingClip(vu);
++}
++
++void Run::exactUpper(uint32_t upper)
++{
++    m_upper = ps2_vu_detail::upper::computeUpper(upper, m_state.vf, m_state.acc, m_state.q, m_state.i);
++}
++
++bool Run::progressKick(uint32_t cycle, uint32_t nextPc)
++{
++    // A GIF callback sees the PC and clock the interpreter would show here.
++    m_state.pc = nextPc;
++    m_state.cycles = m_base + cycle;
++    Access::progressXgkick(m_vu);
++    if (Access::xgkickActive(m_vu))
++        return true;
++    if (Access::codeGeneration(m_vu) != m_generation)
++        m_stale = true;
++    return false;
++}
++
++Run::Clock Run::stall(uint32_t cycle, uint32_t target, uint32_t pc, bool untilIdle)
++{
++    bool kicking = true;
++    while (cycle < target || (untilIdle && kicking))
++    {
++        ++cycle;
++        if (kicking)
++            kicking = progressKick(cycle, pc);
++    }
++    return {cycle, kicking};
++}
++
++Run::PendingFlags *Run::commitFlags(PendingFlags *head, PendingFlags *tail, uint32_t upTo)
++{
++    // Results queue in issue order, so the due ones come first and only the
++    // last few cycles' can still be waiting.
++    PendingFlags *end = tail;
++    while (end != head && end[-1].issue + 4u > upTo)
++        --end;
++    if (end == head)
++        return head;
++
++    // Without an FSSET in the queue, the usual case, MAC, CLIP and the current
++    // status bits keep their last writer's value, found from the back, and the
++    // sticky bits collect every FMAC result in a pass that vectorizes. FMAC and
++    // CLIP results interleave, so a pass that branches on each one mispredicts.
++    if (m_fssetQueued == 0u)
++    {
++        uint32_t conditions = 0u, writes = 0u;
++        for (const PendingFlags *entry = head; entry != end; ++entry)
++        {
++            const uint32_t fmac = 0u - ((entry->writes >> 1u) & 1u);
++            conditions |= (entry->value | entry->sticky) & fmac;
++            writes |= entry->writes;
++        }
++        const auto last = [end](uint32_t write)
++        {
++            const PendingFlags *entry = end - 1;
++            while ((entry->writes & write) == 0u)
++                --entry;
++            return entry->value;
++        };
++        if ((writes & 1u) != 0u)
++            m_state.mac = last(1u);
++        if ((writes & 8u) != 0u)
++            m_state.clip = last(8u);
++        if ((writes & 2u) != 0u)
++        {
++            const uint32_t now = statusOf(last(2u));
++            m_state.status = (m_state.status & 0xFF0u) | now | ((now | statusOf(conditions)) << 6u);
++        }
++        return end;
++    }
++
++    // MAC and CLIP keep the last result; the sticky bits collect every FMAC
++    // result until an FSSET, so status is folded once per run of those.
++    uint32_t mac = m_state.mac, status = m_state.status, clip = m_state.clip;
++    uint32_t current = 0u, conditions = 0u;
++    bool pending = false;
++    const auto fold = [&] {
++        const uint32_t now = statusOf(current);
++        status = (status & 0xFF0u) | now | ((now | statusOf(conditions)) << 6u);
++        conditions = 0u;
++        pending = false;
++    };
++    for (; head != end; ++head)
++    {
++        const PendingFlags &entry = *head;
++        if ((entry.writes & 1u) != 0u)
++            mac = entry.value;
++        if ((entry.writes & 2u) != 0u)
++        {
++            current = entry.value;
++            conditions |= entry.value | entry.sticky;
++            pending = true;
++        }
++        if ((entry.writes & 4u) != 0u)
++        {
++            if (pending)
++                fold();
++            status = (status & 0x03Fu) | (entry.value & 0xFC0u);
++            --m_fssetQueued;
++        }
++        if ((entry.writes & 8u) != 0u)
++            clip = entry.value;
++    }
++    if (pending)
++        fold();
++    m_state.mac = mac;
++    m_state.status = status;
++    m_state.clip = clip;
++    return head;
++}
++
++Run::FlagRange Run::makeRoom(PendingFlags *head, PendingFlags *tail, uint32_t cycle)
++{
++    // Only results from the last four cycles can still be pending.
++    head = commitFlags(head, tail, cycle);
++    const std::ptrdiff_t pending = tail - head;
++    std::memmove(m_flags.data(), head, static_cast<size_t>(pending) * sizeof(PendingFlags));
++    return {m_flags.data(), m_flags.data() + pending};
++}
++
++void Run::cancelSameCycle(PendingFlags *head, PendingFlags *tail, uint32_t cycle, uint32_t writes)
++{
++    // A later FSSET or FCSET in the same pair overrides that pair's result.
++    for (; head != tail; ++head)
++        if (head->issue == cycle)
++            head->writes &= ~writes;
++}
++
++Run::PendingFlags *Run::commitQ(PendingFlags *head, PendingFlags *tail, uint32_t cycle)
++{
++    // Q and its D/I bits land after any flag result due in the same cycle.
++    // FMAC results touch other status bits, so only an FSSET, which rewrites
++    // the sticky D and I bits, has to be committed first.
++    auto &fdiv = Access::fdiv(m_vu);
++    if (!fdiv.valid || relative(fdiv.readyCycle) > cycle)
++        return head;
++    if (m_fssetQueued != 0u)
++        head = commitFlags(head, tail, relative(fdiv.readyCycle));
++    m_state.q = fdiv.value;
++    const uint32_t currentDi = fdiv.statusDi & 0x30u;
++    m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6u);
++    Access::clearFdiv(m_vu);
++    return head;
++}
++
++void Run::commitP(uint32_t cycle)
++{
++    // Oldest first. A slot freed early takes the next result, so after three
++    // EFU operations in a row slot order is no longer issue order.
++    auto &efu = Access::efu(m_vu);
++    const bool swap = efu[0].valid && efu[1].valid && efu[1].readyCycle < efu[0].readyCycle;
++    for (const uint32_t slot : {swap ? 1u : 0u, swap ? 0u : 1u})
++        if (efu[slot].valid && relative(efu[slot].readyCycle) <= cycle)
++        {
++            m_state.p = efu[slot].value;
++            Access::clearEfu(m_vu, slot);
++        }
++}
++
++void Run::handBack()
++{
++    m_flagHead = commitQ(m_flagHead, m_flagTail, m_cycle);
++    commitP(m_cycle);
++    m_flagHead = commitFlags(m_flagHead, m_flagTail, m_cycle);
++    for (const PendingFlags *pending = m_flagHead; pending != m_flagTail; ++pending)
++    {
++        // Back into the interpreter's form: status bits and product conditions folded.
++        const PendingFlags &entry = *pending;
++        const bool fmac = (entry.writes & 3u) != 0u;
++        const uint32_t status = fmac ? statusOf(entry.value) : (entry.writes & 4u) != 0u ? entry.value : 0u;
++        Access::pendFlags(m_vu, m_base + entry.issue, fmac ? entry.value : 0u, status,
++                          fmac ? statusOf(entry.sticky) : 0u, (entry.writes & 8u) != 0u ? entry.value : 0u,
++                          static_cast<uint8_t>(entry.writes));
++    }
++    // Few registers have a write in flight, so find those first.
++    uint32_t inFlight = 0u;
++    for (uint32_t reg = 1u; reg < 32u; ++reg)
++    {
++        const auto &ready = m_vfReady[reg];
++        const uint32_t last = std::max(std::max(ready[0], ready[1]), std::max(ready[2], ready[3]));
++        inFlight |= static_cast<uint32_t>(last > m_cycle) << reg;
++    }
++    while (inFlight != 0u)
++    {
++        const auto reg = static_cast<uint8_t>(std::countr_zero(inFlight));
++        inFlight &= inFlight - 1u;
++        // Lanes written by one pair share a result cycle and an entry.
++        uint8_t done = 0u;
++        for (uint32_t component = 0; component < 4u; ++component)
++        {
++            const uint32_t ready = m_vfReady[reg][component];
++            if (ready <= m_cycle || (done & lane(component)) != 0u)
++                continue;
++            uint8_t lanes = 0u;
++            for (uint32_t other = component; other < 4u; ++other)
++                if (m_vfReady[reg][other] == ready)
++                    lanes |= lane(other);
++            done |= lanes;
++            // The entry takes the result; the register goes back to what the
++            // interpreter would show until the entry lands.
++            Access::pendVf(m_vu, reg, lanes, m_base + ready);
++            for (uint32_t other = component; other < 4u; ++other)
++                if ((lanes & lane(other)) != 0u)
++                    m_state.vf[reg][other] = m_vfVisible[reg][other];
++        }
++    }
++    for (uint8_t reg = 1u; reg < 16u; ++reg)
++        if (m_viReady[reg] > m_cycle)
++        {
++            Access::pendVi(m_vu, reg, m_base + m_viReady[reg]);
++            m_state.vi[reg] = m_viVisible[reg];
++        }
++    Access::finish(m_vu, m_base + m_cycle, m_workingClip, static_cast<uint8_t>(m_backupReg), m_backupValue,
++                   m_pairs);
++}
++
++uint32_t Run::leave(uint32_t pc)
++{
++    m_state.pc = pc;
++    handBack();
++    m_finished = true;
++    return pc;
++}
++
++uint32_t Run::leaveStale()
++{
++    // A branch or E bit issued by the last pair still takes effect after its delay slot.
++    m_state.pc = m_stalePc;
++    m_state.branchPending = m_staleBranch;
++    if (m_staleBranch)
++        m_state.branchTarget = m_staleTarget;
++    m_state.branchDelay = 0u;
++    m_state.ebit = m_staleEnding;
++    handBack();
++    m_finished = true;
++    return m_stalePc;
++}
++
++uint32_t Run::end(uint32_t pc)
++{
++    m_state.pc = pc;
++    handBack();
++    m_finished = m_ended = true;
++    return pc;
++}
++
++bool run(VU1Interpreter &vu, const uint8_t *code, uint32_t codeSize, uint64_t budgetEnd, Routine routine)
++{
++    Run program(vu);
++    for (;;)
++    {
++        const uint32_t pc = routine(program, budgetEnd);
++        if (program.finished())
++            return program.ended();
++        routine = find(code, codeSize, pc, program.generation());
++        if (!routine)
++        {
++            recordMissing(code, codeSize, pc);
++            program.leave(pc);
++            return false;
++        }
++    }
++}
++}
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_program.h b/ps2xRuntime/src/lib/vu/ps2_vu1_program.h
+new file mode 100644
+index 0000000..b9d7d15
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_program.h
+@@ -0,0 +1,1580 @@
++#ifndef PS2_VU1_PROGRAM_H
++#define PS2_VU1_PROGRAM_H
++
++// VU programs compiled whole, MSCAL or VCALLMS entry to E bit: pairs issue in order under
++// the interpreter's stall rules, results land at issue, and whatever is still
++// in flight on return goes back into the interpreter's pipelines.
++
++#include "runtime/ps2_vu1.h"
++#include "runtime/ps2_memory.h"
++#include "ps2_vu1_decode.h"
++#include "ps2_vu1_detail.h"
++#include "ps2_vu1_upper_engine.h"
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <string>
++#include <utility>
++
++// FMAC fast paths: NEON on AArch64, SSE2 on x86. So that all three can be tested
++// on an ARM machine, PS2X_VU_PROGRAM_SSE runs the SSE2 one there through
++// sse2neon, and PS2X_VU_PROGRAM_PORTABLE runs neither.
++#if defined(PS2X_VU_PROGRAM_PORTABLE)
++#define PS2_VU_PROGRAM_NEON 0
++#define PS2_VU_PROGRAM_SSE 0
++#elif defined(__aarch64__) && !defined(PS2X_VU_PROGRAM_SSE)
++#define PS2_VU_PROGRAM_NEON 1
++#define PS2_VU_PROGRAM_SSE 0
++#include <arm_neon.h>
++#elif defined(__aarch64__) || defined(__SSE2__) || defined(_M_X64)
++#define PS2_VU_PROGRAM_NEON 0
++#define PS2_VU_PROGRAM_SSE 1
++#if defined(__aarch64__)
++#include "sse2neon.h"
++#else
++#include <immintrin.h>
++#endif
++#else
++#define PS2_VU_PROGRAM_NEON 0
++#define PS2_VU_PROGRAM_SSE 0
++#endif
++
++#if defined(_MSC_VER)
++#define PS2_VU_FORCE_INLINE __forceinline
++#define PS2_VU_INLINE_LAMBDA
++#else
++#define PS2_VU_FORCE_INLINE inline __attribute__((always_inline))
++#define PS2_VU_INLINE_LAMBDA __attribute__((always_inline))
++#endif
++
++namespace ps2_vu_program
++{
++using Unit = VU1Interpreter::Unit;
++class Run;
++
++// A routine is the code reachable from one entry without following calls or
++// register jumps. It returns the PC to continue at; the driver finds the
++// routine for that PC or hands the rest back to the interpreter.
++using Routine = uint32_t (*)(Run &, uint64_t budgetEnd);
++
++struct Entry
++{
++    uint32_t pc;
++    uint32_t codeSize; // of the unit's microcode memory: VU0 or VU1
++    uint32_t footprintPairs;
++    const uint16_t *footprint; // pair indices the routine was built from
++    const uint64_t *words;     // their instruction words, in the same order
++    Routine run;
++};
++
++// Programs are entered only when the budget clearly outlasts them, so a
++// cycle budget does not end one part-way in ordinary use.
++inline constexpr uint64_t kMinimumBudget = 4096u;
++
++Routine find(const uint8_t *code, uint32_t codeSize, uint32_t pc, uint64_t generation);
++
++// find() remembers its answers by code address and generation, which a new
++// interpreter or memory can repeat; a VU1 reset starts the answers over. VU0
++// resets before every VCALLMS, so that one does not.
++void forgetRoutines();
++
++// With PS2_VU_PROGRAM_PROFILE set, save the microcode image and entry of a
++// routine that has no compiled version, for compile_vu_programs.py.
++void recordMissing(const uint8_t *code, uint32_t codeSize, uint32_t pc);
++
++// Replaces the directory PS2_VU_PROGRAM_PROFILE named; empty stops recording.
++void setProfileDirectory(std::string directory);
++
++// Run from the current PC, starting with First. Returns true when the E-bit
++// delay slot issued, false when the interpreter has to continue.
++bool run(VU1Interpreter &vu, const uint8_t *code, uint32_t codeSize, uint64_t budgetEnd, Routine first);
++
++struct Access
++{
++    using Decoded = VU1Interpreter::DecodedInstructionPair;
++    using Usage = VU1Interpreter::InstructionUsage;
++    using ScalarEntry = VU1Interpreter::ScalarPipelineEntry;
++    static constexpr uint8_t kFdiv = VU1Interpreter::PipelineFdiv;
++    static constexpr uint8_t kEfu = VU1Interpreter::PipelineEfu;
++    static constexpr uint8_t kXgkick = VU1Interpreter::PipelineXgkick;
++    static constexpr uint8_t kBranch = VU1Interpreter::PipelineBranch;
++
++    // The units decode alike but for VU0's reserved instructions, which
++    // compile_vu_programs.py leaves to the interpreter.
++    static constexpr Decoded decode(uint32_t lower, uint32_t upper)
++    {
++        return VU1Interpreter::decodeInstructionWords(lower, upper, Unit::VU1);
++    }
++
++    static VU1State &state(VU1Interpreter &vu) { return vu.m_state; }
++    static uint64_t cycle(const VU1Interpreter &vu) { return vu.m_cycle; }
++    static void setCycle(VU1Interpreter &vu, uint64_t cycle) { vu.m_cycle = cycle; }
++    static uint8_t *data(VU1Interpreter &vu) { return vu.m_activeVuData; }
++    static bool xgkickActive(const VU1Interpreter &vu) { return vu.m_xgkick.active; }
++    static void startXgkick(VU1Interpreter &vu, uint32_t address) { vu.startXgkick(address); }
++    static void progressXgkick(VU1Interpreter &vu) { vu.progressXgkick(); }
++    static bool stopRequested(const VU1Interpreter &vu) { return vu.m_stopRequested; }
++    static ScalarEntry &fdiv(VU1Interpreter &vu) { return vu.m_fdiv; }
++    static std::array<ScalarEntry, 2> &efu(VU1Interpreter &vu) { return vu.m_efu; }
++    static uint64_t efuResourceReady(const VU1Interpreter &vu) { return vu.m_efuResourceReady; }
++    static void queueQ(VU1Interpreter &vu, float value, uint32_t latency, uint32_t statusDi)
++    {
++        vu.queueQ(value, latency, statusDi);
++    }
++    static void queueP(VU1Interpreter &vu, float value, uint32_t latency) { vu.queueP(value, latency); }
++    static uint64_t codeGeneration(const VU1Interpreter &vu)
++    {
++        if (!vu.m_activeMemory)
++            return 0u;
++        return vu.m_unit == Unit::VU1 ? vu.m_activeMemory->getVU1CodeGeneration()
++                                      : vu.m_activeMemory->getVU0CodeGeneration();
++    }
++    static uint32_t workingClip(const VU1Interpreter &vu) { return vu.m_workingClip; }
++
++    // Nothing issued earlier can still change state or stall a pair.
++    static bool drained(const VU1Interpreter &vu)
++    {
++        return vu.m_useCompiledExecution && !vu.pipelinesPending() &&
++               !vu.m_state.branchPending && !vu.m_state.ebit && !vu.m_state.haltAfterDelaySlot &&
++               !vu.m_stopRequested && !vu.m_pendingHaltD && !vu.m_pendingHaltT &&
++               !vu.m_state.dBitEnabled && !vu.m_state.tBitEnabled && vu.m_activeVuData &&
++               vu.m_activeVuDataSize == (vu.m_unit == Unit::VU1 ? PS2_VU1_DATA_SIZE : PS2_VU0_DATA_SIZE) &&
++               vu.m_activeMemory;
++    }
++
++    static int32_t branchBackup(const VU1Interpreter &vu, uint32_t &reg)
++    {
++        reg = vu.m_viBranchBackupValid ? vu.m_viBranchBackupReg : 0u;
++        return vu.m_viBranchBackupValue;
++    }
++
++    // Retire a Q or P result the compiled code has applied.
++    static void clearFdiv(VU1Interpreter &vu) { vu.m_fdiv = {}; }
++    static void clearEfu(VU1Interpreter &vu, uint32_t slot)
++    {
++        vu.m_efu[slot] = {};
++        vu.m_efuMask &= ~(1u << slot);
++    }
++
++    static void pendVf(VU1Interpreter &vu, uint8_t reg, uint8_t lanes, uint64_t ready);
++    static void pendVi(VU1Interpreter &vu, uint8_t reg, uint64_t ready);
++    static void pendFlags(VU1Interpreter &vu, uint64_t issue, uint32_t mac, uint32_t status,
++                          uint32_t sticky, uint32_t clip, uint8_t writes);
++    static void finish(VU1Interpreter &vu, uint64_t cycle, uint32_t workingClip, uint8_t backupReg,
++                       int32_t backupValue, uint64_t pairs);
++};
++
++inline constexpr uint8_t lane(uint32_t component) { return static_cast<uint8_t>(8u >> component); }
++
++// A block's pairs, which run straight through from pc. Generated code names
++// a pair by its block and position, so each pair can see the ones before it.
++template <size_t N>
++struct Block
++{
++    uint32_t pc;
++    uint64_t words[N]; // lower | upper << 32
++    // Of the unit's code memory: 0x0FFF on VU0. The data memory has the same size.
++    uint32_t codeMask = 0x3FFFu;
++};
++
++// No compiled pair writes a VF or VI register with a longer latency.
++inline constexpr uint32_t kMaxWriteLatency = 4u;
++
++constexpr uint32_t vfWriteLatency(const Access::Usage &usage)
++{
++    return usage.vfLatency != 0u ? usage.vfLatency : usage.latency;
++}
++
++constexpr uint32_t viWriteLatency(const Access::Usage &usage)
++{
++    return usage.viLatency != 0u ? usage.viLatency : usage.latency;
++}
++
++// The VI register a pair writes, if any; pairs write at most one.
++constexpr uint8_t viWritten(const Access::Usage &usage)
++{
++    const uint16_t writes = usage.viWrite & 0xFFFEu;
++    return writes != 0u ? static_cast<uint8_t>(std::countr_zero(writes)) : 0u;
++}
++
++// Reads of pair Index that cannot stall: last written in the block at least its
++// latency ago, or unwritten and past any write pending on entry. Bits 0-1 are
++// upper VF reads, 2-3 lower VF reads, and 4 + n VI register n.
++template <const auto &Code, uint32_t Index>
++constexpr uint32_t settledReads()
++{
++    const auto decodeAt = [](uint32_t index) {
++        const uint64_t word = Code.words[index];
++        return Access::decode(static_cast<uint32_t>(word), static_cast<uint32_t>(word >> 32u));
++    };
++    const uint32_t window = std::min(Index, kMaxWriteLatency - 1u);
++    const auto vfLaneSettled = [&](uint8_t reg, uint8_t laneBit) {
++        for (uint32_t back = 1u; back <= window; ++back)
++        {
++            const auto earlier = decodeAt(Index - back);
++            const auto &upper = earlier.upperUsage, &lower = earlier.lowerUsage;
++            // A lower write to the register the upper half also writes is dropped.
++            if (upper.vfWrite.reg == reg && (upper.vfWrite.lanes & laneBit) != 0u)
++                return back >= vfWriteLatency(upper);
++            if (lower.vfWrite.reg == reg && lower.vfWrite.reg != upper.vfWrite.reg &&
++                (lower.vfWrite.lanes & laneBit) != 0u)
++                return back >= vfWriteLatency(lower);
++        }
++        return Index >= kMaxWriteLatency - 1u;
++    };
++    const auto vfSettled = [&](uint8_t reg, uint8_t lanes) {
++        for (uint32_t component = 0u; component < 4u; ++component)
++            if ((lanes & lane(component)) != 0u && !vfLaneSettled(reg, lane(component)))
++                return false;
++        return true;
++    };
++    const auto viSettled = [&](uint8_t reg) {
++        for (uint32_t back = 1u; back <= window; ++back)
++        {
++            const auto earlier = decodeAt(Index - back);
++            if (viWritten(earlier.lowerUsage) == reg)
++                return back >= viWriteLatency(earlier.lowerUsage);
++        }
++        return Index >= kMaxWriteLatency - 1u;
++    };
++
++    const auto current = decodeAt(Index);
++    uint32_t settled = 0u;
++    for (uint32_t read = 0u; read < 2u; ++read)
++    {
++        if (read < current.upperUsage.vfReadCount &&
++            vfSettled(current.upperUsage.vfRead[read].reg, current.upperUsage.vfRead[read].lanes))
++            settled |= 1u << read;
++        if (read < current.lowerUsage.vfReadCount &&
++            vfSettled(current.lowerUsage.vfRead[read].reg, current.lowerUsage.vfRead[read].lanes))
++            settled |= 4u << read;
++    }
++    for (uint8_t reg = 1u; reg < 16u; ++reg)
++        if (viSettled(reg))
++            settled |= 16u << reg;
++    return settled;
++}
++
++// The opcode as computeUpper classifies it: the special form for 0x3C-0x3F.
++constexpr uint32_t upperCode(uint32_t upper)
++{
++    const uint32_t op = upper & 0x3Fu;
++    return op < 0x3Cu ? op : (upper & 3u) | ((upper >> 4u) & 0x7Cu);
++}
++
++constexpr bool upperIsNop(uint32_t upper)
++{
++    return (upper & 0x3Fu) >= 0x3Cu && (upperCode(upper) == 0x2Fu || upperCode(upper) == 0x30u);
++}
++
++constexpr bool upperReadsQ(uint32_t upper)
++{
++    const uint32_t code = upperCode(upper);
++    return code == 0x1Cu || code == 0x20u || code == 0x21u || code == 0x24u || code == 0x25u;
++}
++
++// MAX, MINI, ITOF, FTOI, ABS and CLIP publish no FMAC flags; their code is small.
++constexpr bool upperPublishesFlags(uint32_t upper)
++{
++    const uint32_t code = upperCode(upper);
++    if ((code >= 0x10u && code <= 0x17u) || code == 0x1Du || code == 0x1Fu)
++        return false;
++    if ((upper & 0x3Fu) < 0x3Cu)
++        return code != 0x2Bu && code != 0x2Fu;
++    return code != 0x2Fu && code != 0x30u;
++}
++
++// Queued FMAC conditions stay in the MAC register's layout, one bit per lane
++// in each of the Z, S, U and O groups; status bits are folded out on commit.
++constexpr uint32_t statusOf(uint32_t mac)
++{
++    return ((mac & 0x000Fu) != 0u ? 1u : 0u) | ((mac & 0x00F0u) != 0u ? 2u : 0u) |
++           ((mac & 0x0F00u) != 0u ? 4u : 0u) | ((mac & 0xF000u) != 0u ? 8u : 0u);
++}
++
++constexpr uint32_t spreadStatus(uint32_t status)
++{
++    return (status & 1u) | ((status & 2u) << 3u) | ((status & 4u) << 6u) | ((status & 8u) << 9u);
++}
++
++#if PS2_VU_PROGRAM_NEON
++namespace fast
++{
++// Lane conditions in the MAC register's layout, limited to the Dest lanes.
++template <uint8_t Dest>
++PS2_VU_FORCE_INLINE uint32_t layout(uint32x4_t zero, uint32x4_t sign, uint32x4_t underflow)
++{
++    const uint32x4_t zeroBits = {(Dest & 8u) ? 0x8u : 0u, (Dest & 4u) ? 0x4u : 0u, (Dest & 2u) ? 0x2u : 0u,
++                                 (Dest & 1u) ? 0x1u : 0u};
++    const uint32x4_t bits = vorrq_u32(vandq_u32(zero, zeroBits), vandq_u32(sign, vshlq_n_u32(zeroBits, 4)));
++    return vaddvq_u32(vorrq_u32(bits, vandq_u32(underflow, vshlq_n_u32(zeroBits, 8))));
++}
++
++// All ones in the lanes outside Dest, which no range check may reject.
++template <uint8_t Dest>
++PS2_VU_FORCE_INLINE uint32x4_t inactive()
++{
++    return uint32x4_t{(Dest & 8u) ? 0u : ~0u, (Dest & 4u) ? 0u : ~0u, (Dest & 2u) ? 0u : ~0u,
++                      (Dest & 1u) ? 0u : ~0u};
++}
++
++PS2_VU_FORCE_INLINE uint32x4_t negative(uint32x4_t bits)
++{
++    return vcltzq_s32(vreinterpretq_s32_u32(bits));
++}
++
++// Denormal operands read as zero of the same sign. Infinity and NaN patterns
++// stay as they are: every result they reach fails the range checks, so the
++// exact path, which clamps them, handles those lanes.
++PS2_VU_FORCE_INLINE float32x4_t flushDenormals(float32x4_t value)
++{
++    const uint32x4_t tiny = vcaltq_f32(value, vdupq_n_f32(std::numeric_limits<float>::min()));
++    return vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(value), vshrq_n_u32(tiny, 1)));
++}
++}
++#elif PS2_VU_PROGRAM_SSE
++namespace fast
++{
++// Movemask puts lane x in bit 0 and the MAC register in bit 3.
++inline constexpr uint8_t kReversed[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
++
++template <uint8_t Dest>
++inline constexpr int kLanes = kReversed[Dest];
++
++PS2_VU_FORCE_INLINE int mask(__m128i lanes)
++{
++    return _mm_movemask_ps(_mm_castsi128_ps(lanes));
++}
++
++// Lane masks in the MAC register's layout, limited to the Dest lanes.
++template <uint8_t Dest>
++PS2_VU_FORCE_INLINE uint32_t layout(int zero, int sign, int underflow)
++{
++    return (kReversed[zero] | kReversed[sign] << 4u | kReversed[underflow] << 8u) & (Dest * 0x111u);
++}
++
++// As the NEON version: infinity and NaN stay, and fail the range checks.
++PS2_VU_FORCE_INLINE __m128 flushDenormals(__m128 value)
++{
++    const __m128 magnitude = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
++    const __m128 tiny = _mm_cmplt_ps(_mm_and_ps(value, magnitude), _mm_set1_ps(std::numeric_limits<float>::min()));
++    return _mm_andnot_ps(_mm_and_ps(tiny, magnitude), value);
++}
++
++// Rounds like the interpreter's acc + fs * ft, which GCC and Clang fuse by
++// default wherever FMA is available. AArch64 only gets here in tests.
++template <bool Subtract>
++PS2_VU_FORCE_INLINE __m128 productSum(__m128 acc, __m128 left, __m128 right)
++{
++#if defined(__aarch64__)
++    return Subtract ? vfmsq_f32(acc, left, right) : vfmaq_f32(acc, left, right);
++#elif defined(__FMA__)
++    return Subtract ? _mm_fnmadd_ps(left, right, acc) : _mm_fmadd_ps(left, right, acc);
++#else
++    const __m128 product = _mm_mul_ps(left, right);
++    return Subtract ? _mm_sub_ps(acc, product) : _mm_add_ps(acc, product);
++#endif
++}
++}
++#endif
++
++class Run
++{
++public:
++    explicit Run(VU1Interpreter &vu);
++    Run(const Run &) = delete;
++    Run &operator=(const Run &) = delete;
++
++    bool finished() const { return m_finished; }
++    bool ended() const { return m_ended; }
++    uint64_t generation() const { return m_generation; }
++
++    // Stop before the pair at pc and let the interpreter continue.
++    uint32_t leave(uint32_t pc);
++
++private:
++    friend class Frame;
++
++    struct PendingFlags
++    {
++        uint32_t issue;
++        uint32_t writes; // 1 MAC, 2 status, 4 sticky (FSSET), 8 CLIP
++        uint32_t value;  // the MAC flags, FSSET's sticky bits or the CLIP flags
++        uint32_t sticky; // an FMAC's product conditions, laid out like MAC
++    };
++    // Results queue in a flat buffer. Each block reserves room for two per
++    // pair on entry, and compile_vu_programs.py keeps blocks short enough
++    // for that to fit next to the few results not yet due.
++    static constexpr uint32_t kFlagSlots = 512u;
++    static constexpr uint32_t kMaxBlockPairs = 128u;
++    static_assert(kFlagSlots >= 2u * kMaxBlockPairs + 16u);
++
++    struct Clock
++    {
++        uint32_t cycle;
++        bool kicking;
++    };
++
++    struct FlagRange
++    {
++        PendingFlags *head, *tail;
++    };
++
++    uint32_t relative(uint64_t absolute) const
++    {
++        return absolute > m_base ? static_cast<uint32_t>(absolute - m_base) : 0u;
++    }
++
++    // Rare paths. The Frame passes what they need and takes back what they change.
++    // exactUpper is the interpreter's full arithmetic, only needed for results
++    // near the range limits; it leaves its result in m_upper.
++    void exactUpper(uint32_t upper);
++    Clock stall(uint32_t cycle, uint32_t target, uint32_t pc, bool untilIdle);
++    bool progressKick(uint32_t cycle, uint32_t nextPc);
++    PendingFlags *commitFlags(PendingFlags *head, PendingFlags *tail, uint32_t upTo);
++    FlagRange makeRoom(PendingFlags *head, PendingFlags *tail, uint32_t cycle);
++    void cancelSameCycle(PendingFlags *head, PendingFlags *tail, uint32_t cycle, uint32_t writes);
++    PendingFlags *commitQ(PendingFlags *head, PendingFlags *tail, uint32_t cycle);
++    void commitP(uint32_t cycle);
++    void handBack();
++    uint32_t leaveStale();
++    uint32_t end(uint32_t pc);
++
++    VU1Interpreter &m_vu;
++    VU1State &m_state;
++    uint8_t *m_data;
++    uint64_t m_base;
++    uint64_t m_generation;
++    std::array<std::array<uint32_t, 4>, 32> m_vfReady{};
++    std::array<uint32_t, 16> m_viReady{};
++    // What the interpreter's registers would hold while a write is in flight:
++    // it lands a write only if no later one replaced it, so a register reads
++    // as its last write that landed before the next one issued. Read only
++    // where a write is still in flight, so never cleared.
++    std::array<std::array<float, 4>, 32> m_vfVisible;
++    std::array<int32_t, 16> m_viVisible;
++    // Not cleared: a run starts every MSCAL and only ever reads what it queued.
++    std::array<PendingFlags, kFlagSlots> m_flags;
++    ps2_vu_detail::upper::Result m_upper;
++    // FSSET results in the queue. Only those have to land in order with Q.
++    uint32_t m_fssetQueued = 0u;
++    // The Frame's state as of the last routine return.
++    uint64_t m_pairs = 0u;
++    uint32_t m_cycle = 0u;
++    PendingFlags *m_flagHead = m_flags.data();
++    PendingFlags *m_flagTail = m_flags.data();
++    uint32_t m_workingClip = 0u;
++    int32_t m_backupValue = 0;
++    uint32_t m_backupReg = 0u;
++    bool m_kickActive = false;
++    bool m_stale = false;
++    bool m_finished = false;
++    bool m_ended = false;
++    // Where to resume if a GIF callback rewrote microcode after a pair.
++    uint32_t m_stalePc = 0u;
++    uint32_t m_staleTarget = 0u;
++    bool m_staleBranch = false;
++    bool m_staleEnding = false;
++};
++
++class Frame
++{
++public:
++    PS2_VU_FORCE_INLINE Frame(Run &run, uint64_t budgetEnd)
++        : m_run(run), m_state(run.m_state), m_data(run.m_data), m_base(run.m_base),
++          m_limit(budgetEnd > run.m_base ? budgetEnd - run.m_base : 0u), m_pairs(run.m_pairs),
++          m_cycle(run.m_cycle), m_flagHead(run.m_flagHead), m_flagTail(run.m_flagTail),
++          m_workingClip(run.m_workingClip), m_backupValue(run.m_backupValue), m_backupReg(run.m_backupReg),
++          m_kickActive(run.m_kickActive)
++    {
++    }
++
++    // A block runs without cycle checks only while it cannot reach the budget.
++    // Counts a block's pairs up front, which is close enough for statistics
++    // and keeps a counter update out of every pair.
++    template <uint32_t Margin, uint32_t Pairs>
++    PS2_VU_FORCE_INLINE bool fits()
++    {
++        static_assert(Pairs <= Run::kMaxBlockPairs, "compile_vu_programs.py should have split this block");
++        if (m_cycle + static_cast<uint64_t>(Margin) >= m_limit)
++            return false;
++        // An upper instruction and FSSET or FCSET queue at most two results a pair.
++        if (m_flagTail + 2u * Pairs > m_run.m_flags.data() + Run::kFlagSlots) [[unlikely]]
++        {
++            const Run::FlagRange range = m_run.makeRoom(m_flagHead, m_flagTail, m_cycle);
++            m_flagHead = range.head;
++            m_flagTail = range.tail;
++        }
++        m_pairs += Pairs;
++        return true;
++    }
++
++    PS2_VU_FORCE_INLINE bool taken() const { return m_taken; }
++    PS2_VU_FORCE_INLINE uint32_t jumpTarget() const { return m_jumpTarget; }
++
++    // Issue pair Index of a block. NextPc is where the interpreter's PC would
++    // stand after it; it only matters if a GIF callback rewrites microcode, in
++    // which case this returns false and the routine must return leaveStale().
++    template <const auto &Code, uint32_t Index>
++    PS2_VU_FORCE_INLINE bool pair(uint32_t nextPc)
++    {
++        constexpr uint64_t word = Code.words[Index];
++        return issue<(Code.pc + Index * 8u) & Code.codeMask, static_cast<uint32_t>(word),
++                     static_cast<uint32_t>(word >> 32u), settledReads<Code, Index>(), Code.codeMask>(nextPc);
++    }
++
++    // Return to the driver, which continues with the routine at pc.
++    PS2_VU_FORCE_INLINE uint32_t exit(uint32_t pc)
++    {
++        save();
++        return pc;
++    }
++
++    // Stop before the pair at pc and let the interpreter continue.
++    PS2_VU_FORCE_INLINE uint32_t leave(uint32_t pc)
++    {
++        save();
++        return m_run.leave(pc);
++    }
++
++    PS2_VU_FORCE_INLINE uint32_t leaveStale()
++    {
++        save();
++        return m_run.leaveStale();
++    }
++
++    // The E-bit delay slot has issued; the interpreter flushes what remains.
++    PS2_VU_FORCE_INLINE uint32_t end(uint32_t pc)
++    {
++        save();
++        return m_run.end(pc);
++    }
++
++private:
++    PS2_VU_FORCE_INLINE void save()
++    {
++        m_run.m_pairs = m_pairs;
++        m_run.m_cycle = m_cycle;
++        m_run.m_flagHead = m_flagHead;
++        m_run.m_flagTail = m_flagTail;
++        m_run.m_workingClip = m_workingClip;
++        m_run.m_backupValue = m_backupValue;
++        m_run.m_backupReg = m_backupReg;
++        m_run.m_kickActive = m_kickActive;
++    }
++
++    // Lane helpers take the mask as a template argument and unfold without
++    // loops; routines inline thousands of them and loops cost compile time.
++    template <uint8_t Mask>
++    static PS2_VU_FORCE_INLINE uint32_t readyOf(const uint32_t *lanes, uint32_t ready)
++    {
++#if PS2_VU_PROGRAM_NEON
++        if constexpr (Mask == 0xFu)
++            return std::max(ready, vmaxvq_u32(vld1q_u32(lanes)));
++#endif
++        if constexpr ((Mask & 8u) != 0u)
++            ready = std::max(ready, lanes[0]);
++        if constexpr ((Mask & 4u) != 0u)
++            ready = std::max(ready, lanes[1]);
++        if constexpr ((Mask & 2u) != 0u)
++            ready = std::max(ready, lanes[2]);
++        if constexpr ((Mask & 1u) != 0u)
++            ready = std::max(ready, lanes[3]);
++        return ready;
++    }
++
++    template <uint8_t Mask, class T>
++    static PS2_VU_FORCE_INLINE void applyLanes(T *target, const T *value)
++    {
++        if constexpr ((Mask & 8u) != 0u)
++            target[0] = value[0];
++        if constexpr ((Mask & 4u) != 0u)
++            target[1] = value[1];
++        if constexpr ((Mask & 2u) != 0u)
++            target[2] = value[2];
++        if constexpr ((Mask & 1u) != 0u)
++            target[3] = value[3];
++    }
++
++    template <uint8_t Mask>
++    static PS2_VU_FORCE_INLINE void setReady(uint32_t *lanes, uint32_t ready)
++    {
++        const uint32_t value[4] = {ready, ready, ready, ready};
++        applyLanes<Mask>(lanes, value);
++    }
++
++    PS2_VU_FORCE_INLINE uint32_t relative(uint64_t absolute) const
++    {
++        return absolute > m_base ? static_cast<uint32_t>(absolute - m_base) : 0u;
++    }
++
++    template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t Settled, uint32_t CodeMask>
++    PS2_VU_FORCE_INLINE bool issue(uint32_t nextPc);
++
++    // The latest cycle an operand of the pair becomes ready, ignoring the
++    // clock and the reads settledReads found cannot stall.
++    template <uint32_t Lower, uint32_t Upper, uint32_t Settled>
++    PS2_VU_FORCE_INLINE uint32_t pairReady() const;
++
++    template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t CodeMask>
++    PS2_VU_FORCE_INLINE bool stale(uint32_t nextPc);
++
++    template <uint32_t Upper>
++    PS2_VU_FORCE_INLINE void upper(float *value);
++
++    template <uint8_t Reg, uint8_t Lanes>
++    PS2_VU_FORCE_INLINE void keepVisible();
++
++#if PS2_VU_PROGRAM_NEON || PS2_VU_PROGRAM_SSE
++    template <uint32_t Upper>
++    PS2_VU_FORCE_INLINE bool fastUpper(float *value);
++#endif
++
++    template <uint32_t Upper>
++    PS2_VU_FORCE_INLINE uint32_t plainUpper(float *value);
++
++    template <uint32_t Pc, uint32_t Lower, uint32_t CodeMask>
++    PS2_VU_FORCE_INLINE void lower(float *vfResult, int32_t &viResult);
++
++    // Room was reserved when the block was entered.
++    PS2_VU_FORCE_INLINE void pushFlags(uint32_t writes, uint32_t value, uint32_t sticky)
++    {
++        *m_flagTail++ = {m_cycle, writes, value, sticky};
++    }
++
++    PS2_VU_FORCE_INLINE void flagsAt()
++    {
++        if (m_flagHead != m_flagTail && m_flagHead->issue + 4u <= m_cycle)
++            m_flagHead = m_run.commitFlags(m_flagHead, m_flagTail, m_cycle);
++    }
++
++    PS2_VU_FORCE_INLINE void cancelSameCycle(uint32_t writes)
++    {
++        m_run.cancelSameCycle(m_flagHead, m_flagTail, m_cycle, writes);
++    }
++
++    PS2_VU_FORCE_INLINE bool qDue() const
++    {
++        const auto &fdiv = Access::fdiv(m_run.m_vu);
++        return fdiv.valid && relative(fdiv.readyCycle) <= m_cycle;
++    }
++
++    PS2_VU_FORCE_INLINE void commitQ() { m_flagHead = m_run.commitQ(m_flagHead, m_flagTail, m_cycle); }
++    PS2_VU_FORCE_INLINE void commitP() { m_run.commitP(m_cycle); }
++    PS2_VU_FORCE_INLINE void syncClock() { Access::setCycle(m_run.m_vu, m_base + m_cycle); }
++
++    PS2_VU_FORCE_INLINE int32_t branchVi(uint8_t reg) const
++    {
++        if (reg == 0u)
++            return 0;
++        return m_backupReg == reg ? m_backupValue : m_state.vi[reg];
++    }
++
++    Run &m_run;
++    VU1State &m_state;
++    uint8_t *m_data;
++    uint64_t m_base;
++    uint64_t m_limit;
++    uint64_t m_pairs;
++    uint32_t m_cycle;
++    Run::PendingFlags *m_flagHead;
++    Run::PendingFlags *m_flagTail;
++    uint32_t m_workingClip;
++    uint32_t m_jumpTarget = 0u;
++    int32_t m_backupValue;
++    uint32_t m_backupReg;
++    bool m_taken = false;
++    bool m_kickActive;
++};
++
++template <uint32_t Lower, uint32_t Upper, uint32_t Settled>
++PS2_VU_FORCE_INLINE uint32_t Frame::pairReady() const
++{
++    static constexpr Access::Decoded d = Access::decode(Lower, Upper);
++    const auto &vfReady = m_run.m_vfReady;
++    uint32_t ready = 0u;
++    if constexpr (d.upperUsage.vfReadCount > 0u && d.upperUsage.vfRead[0].reg != 0u && (Settled & 1u) == 0u)
++        ready = readyOf<d.upperUsage.vfRead[0].lanes>(vfReady[d.upperUsage.vfRead[0].reg].data(), ready);
++    if constexpr (d.upperUsage.vfReadCount > 1u && d.upperUsage.vfRead[1].reg != 0u && (Settled & 2u) == 0u)
++        ready = readyOf<d.upperUsage.vfRead[1].lanes>(vfReady[d.upperUsage.vfRead[1].reg].data(), ready);
++    if constexpr (d.lowerUsage.vfReadCount > 0u && d.lowerUsage.vfRead[0].reg != 0u && (Settled & 4u) == 0u)
++        ready = readyOf<d.lowerUsage.vfRead[0].lanes>(vfReady[d.lowerUsage.vfRead[0].reg].data(), ready);
++    if constexpr (d.lowerUsage.vfReadCount > 1u && d.lowerUsage.vfRead[1].reg != 0u && (Settled & 8u) == 0u)
++        ready = readyOf<d.lowerUsage.vfRead[1].lanes>(vfReady[d.lowerUsage.vfRead[1].reg].data(), ready);
++    constexpr uint16_t viReads = (d.upperUsage.viRead | d.lowerUsage.viRead) & 0xFFFEu & ~(Settled >> 4u);
++    [&]<size_t... Reg>(std::index_sequence<Reg...>) PS2_VU_INLINE_LAMBDA {
++        ((((viReads >> Reg) & 1u) != 0u ? (ready = std::max(ready, m_run.m_viReady[Reg])) : 0u), ...);
++    }(std::make_index_sequence<16>{});
++    constexpr auto lower = d.lowerUsage;
++    if constexpr (lower.pipeline == Access::kFdiv || lower.waitQ)
++    {
++        const auto &fdiv = Access::fdiv(m_run.m_vu);
++        if (fdiv.valid)
++            ready = std::max(ready, relative(fdiv.readyCycle));
++    }
++    if constexpr (lower.waitP)
++    {
++        const std::array<Access::ScalarEntry, 2> &efu = Access::efu(m_run.m_vu);
++        if (efu[0].valid)
++            ready = std::max(ready, relative(efu[0].readyCycle));
++        if (efu[1].valid)
++            ready = std::max(ready, relative(efu[1].readyCycle));
++    }
++    else if constexpr (lower.pipeline == Access::kEfu)
++        ready = std::max(ready, relative(Access::efuResourceReady(m_run.m_vu)));
++    return ready;
++}
++
++template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t Settled, uint32_t CodeMask>
++PS2_VU_FORCE_INLINE bool Frame::issue(uint32_t nextPc)
++{
++    static constexpr Access::Decoded decoded = Access::decode(Lower, Upper);
++    static_assert(!decoded.upperUsage.reserved && !decoded.lowerUsage.reserved,
++                  "reserved instruction in a compiled VU program");
++    static_assert(vfWriteLatency(decoded.upperUsage) <= kMaxWriteLatency &&
++                      (decoded.lowerUsage.vfWrite.reg == 0u || vfWriteLatency(decoded.lowerUsage) <= kMaxWriteLatency) &&
++                      (viWritten(decoded.lowerUsage) == 0u || viWriteLatency(decoded.lowerUsage) <= kMaxWriteLatency),
++                  "settledReads assumes no register write takes longer than kMaxWriteLatency");
++    constexpr bool immediate = (Upper & 0x80000000u) != 0u;
++    constexpr bool kick = !immediate && decoded.lowerUsage.pipeline == Access::kXgkick;
++
++    // While PATH1 is busy every stalled cycle feeds it; XGKICK waits for it.
++    // Only the last step depends on the clock, which keeps its chain short.
++    const uint32_t ready = pairReady<Lower, Upper, Settled>();
++    const bool kicking = m_kickActive;
++    if (kicking) [[unlikely]]
++    {
++        const Run::Clock clock = m_run.stall(m_cycle, ready, Pc, kick);
++        m_cycle = clock.cycle;
++        m_kickActive = clock.kicking;
++    }
++    else
++        m_cycle = std::max(m_cycle, ready);
++
++    // Both halves read the state from before the pair; results land after.
++    constexpr uint8_t upperReg = decoded.upperUsage.vfWrite.reg;
++    constexpr uint8_t upperLanes = decoded.upperUsage.vfWrite.lanes;
++    constexpr uint8_t accLanes = decoded.upperUsage.accWrite;
++    float upperValue[4];
++    if constexpr (!upperIsNop(Upper))
++    {
++        if constexpr (upperReadsQ(Upper))
++            if (qDue())
++                commitQ();
++        upper<Upper>(upperValue);
++    }
++
++    float lowerValue[4];
++    int32_t viValue = 0;
++    constexpr uint16_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu;
++    constexpr uint8_t viReg = viWrites != 0u ? static_cast<uint8_t>(std::countr_zero(viWrites)) : 0u;
++    constexpr uint8_t lowerReg = decoded.lowerUsage.vfWrite.reg;
++    constexpr uint8_t lowerLanes = decoded.lowerUsage.vfWrite.lanes;
++    if constexpr (immediate)
++    {
++        float value;
++        constexpr uint32_t bits = Lower;
++        std::memcpy(&value, &bits, sizeof(value));
++        m_state.i = ps2_vu_detail::upper::normalizeOperand(value);
++    }
++    else
++        lower<Pc, Lower, CodeMask>(lowerValue, viValue);
++
++    if constexpr (lowerReg != 0u && lowerReg != upperReg)
++    {
++        constexpr uint32_t latency = decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency
++                                                                        : decoded.lowerUsage.latency;
++        keepVisible<lowerReg, lowerLanes>();
++        applyLanes<lowerLanes>(m_state.vf[lowerReg], lowerValue);
++        setReady<lowerLanes>(m_run.m_vfReady[lowerReg].data(), m_cycle + latency);
++    }
++    if constexpr (upperReg != 0u)
++    {
++        constexpr uint32_t latency = decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency
++                                                                        : decoded.upperUsage.latency;
++        keepVisible<upperReg, upperLanes>();
++        applyLanes<upperLanes>(m_state.vf[upperReg], upperValue);
++        setReady<upperLanes>(m_run.m_vfReady[upperReg].data(), m_cycle + latency);
++    }
++    if constexpr (accLanes != 0u)
++        applyLanes<accLanes>(m_state.acc, upperValue);
++    if constexpr (viReg != 0u)
++    {
++        constexpr uint32_t latency = decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency
++                                                                        : decoded.lowerUsage.latency;
++        const int32_t old = m_state.vi[viReg];
++        if (m_run.m_viReady[viReg] <= m_cycle)
++            m_run.m_viVisible[viReg] = old;
++        m_state.vi[viReg] = static_cast<int16_t>(viValue);
++        m_run.m_viReady[viReg] = m_cycle + latency;
++        // A conditional branch right after reads the value from before this write.
++        if constexpr (decoded.lowerUsage.delaysNextBranchRead)
++        {
++            m_backupReg = viReg;
++            m_backupValue = old;
++        }
++        else
++            m_backupReg = 0u;
++    }
++    else
++        m_backupReg = 0u;
++
++    ++m_cycle;
++    if (kicking || m_kickActive) [[unlikely]]
++    {
++        if (m_kickActive)
++            m_kickActive = m_run.progressKick(m_cycle, nextPc);
++        if (m_run.m_stale)
++            return stale<Pc, Lower, Upper, CodeMask>(nextPc);
++    }
++    return true;
++}
++
++template <uint32_t Pc, uint32_t Lower, uint32_t Upper, uint32_t CodeMask>
++PS2_VU_FORCE_INLINE bool Frame::stale(uint32_t nextPc)
++{
++    // Resume exactly where the interpreter would fetch the next pair.
++    static constexpr Access::Decoded decoded = Access::decode(Lower, Upper);
++    constexpr bool immediate = (Upper & 0x80000000u) != 0u;
++    constexpr uint32_t op = Lower >> 25u;
++    constexpr bool branch = !immediate && decoded.lowerUsage.pipeline == Access::kBranch;
++    constexpr int32_t imm11 = static_cast<int32_t>(Lower << 21u) >> 21;
++    m_run.m_stalePc = nextPc;
++    m_run.m_staleBranch = branch && m_taken;
++    m_run.m_staleTarget = (op == 0x24u || op == 0x25u) ? m_jumpTarget
++                                                       : ((Pc + 8u + static_cast<uint32_t>(imm11 * 8)) & CodeMask);
++    m_run.m_staleEnding = (Upper & 0x40000000u) != 0u;
++    return false;
++}
++
++template <uint8_t Reg, uint8_t Lanes>
++PS2_VU_FORCE_INLINE void Frame::keepVisible()
++{
++    // The register's last write landed unless it is still in flight.
++    const uint32_t *ready = m_run.m_vfReady[Reg].data();
++    float *visible = m_run.m_vfVisible[Reg].data();
++#if PS2_VU_PROGRAM_NEON
++    const uint32x4_t lanes = vmvnq_u32(fast::inactive<Lanes>());
++    const uint32x4_t landed = vandq_u32(lanes, vcleq_u32(vld1q_u32(ready), vdupq_n_u32(m_cycle)));
++    vst1q_f32(visible, vbslq_f32(landed, vld1q_f32(m_state.vf[Reg]), vld1q_f32(visible)));
++#elif PS2_VU_PROGRAM_SSE
++    // Relative cycles stay below 2^31, so the signed compare does.
++    const __m128i lanes = _mm_set_epi32((Lanes & 1u) ? -1 : 0, (Lanes & 2u) ? -1 : 0, (Lanes & 4u) ? -1 : 0,
++                                        (Lanes & 8u) ? -1 : 0);
++    const __m128i pending = _mm_cmpgt_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(ready)),
++                                            _mm_set1_epi32(static_cast<int32_t>(m_cycle)));
++    const __m128 landed = _mm_castsi128_ps(_mm_andnot_si128(pending, lanes));
++    _mm_storeu_ps(visible, _mm_or_ps(_mm_and_ps(landed, _mm_loadu_ps(m_state.vf[Reg])),
++                                     _mm_andnot_ps(landed, _mm_loadu_ps(visible))));
++#else
++    for (uint32_t component = 0; component < 4u; ++component)
++        if ((Lanes & lane(component)) != 0u && ready[component] <= m_cycle)
++            visible[component] = m_state.vf[Reg][component];
++#endif
++}
++
++template <uint32_t Upper>
++PS2_VU_FORCE_INLINE void Frame::upper(float *value)
++{
++    if constexpr (!upperPublishesFlags(Upper))
++    {
++        const uint32_t clip = plainUpper<Upper>(value);
++        if constexpr ((Upper & 0x3Fu) >= 0x3Cu && upperCode(Upper) == 0x1Fu)
++        {
++            m_workingClip = ((m_workingClip << 6u) | (clip & 0x3Fu)) & 0xFFFFFFu;
++            pushFlags(8u, m_workingClip, 0u);
++        }
++    }
++    else
++    {
++#if PS2_VU_PROGRAM_NEON || PS2_VU_PROGRAM_SSE
++        if (fastUpper<Upper>(value))
++            return;
++#endif
++        m_run.exactUpper(Upper);
++        const ps2_vu_detail::upper::Result &exact = m_run.m_upper;
++        std::memcpy(value, exact.value, sizeof(exact.value));
++        if (exact.flags)
++            pushFlags(3u, exact.mac, spreadStatus(exact.sticky));
++    }
++}
++
++// The upper instructions without FMAC flags, lane by lane in computeUpper's
++// arithmetic; inlining computeUpper itself costs more compile time. Returns
++// CLIP's six bits.
++template <uint32_t Upper>
++PS2_VU_FORCE_INLINE uint32_t Frame::plainUpper(float *value)
++{
++    using ps2_vu_detail::upper::normalizeOperand;
++    constexpr uint32_t code = upperCode(Upper);
++    constexpr bool special = (Upper & 0x3Fu) >= 0x3Cu;
++    constexpr uint8_t fs = static_cast<uint8_t>((Upper >> 11u) & 31u);
++    constexpr uint8_t ft = static_cast<uint8_t>((Upper >> 16u) & 31u);
++    const float *source = m_state.vf[fs];
++    if constexpr (special && code >= 0x10u && code <= 0x17u) // ITOF and FTOI
++    {
++        constexpr float scale = (code & 3u) == 0u ? 1.0f : (code & 3u) == 1u ? 16.0f : (code & 3u) == 2u ? 4096.0f : 32768.0f;
++        for (uint32_t lane = 0u; lane < 4u; ++lane)
++        {
++            int32_t bits;
++            if constexpr (code <= 0x13u)
++            {
++                std::memcpy(&bits, &source[lane], sizeof(bits));
++                value[lane] = static_cast<float>(bits) / scale;
++            }
++            else
++            {
++                bits = ps2_vu_detail::upper::floatToInt(normalizeOperand(source[lane]), scale);
++                std::memcpy(&value[lane], &bits, sizeof(bits));
++            }
++        }
++    }
++    else if constexpr (special && code == 0x1Du) // ABS
++    {
++        for (uint32_t lane = 0u; lane < 4u; ++lane)
++            value[lane] = std::fabs(normalizeOperand(source[lane]));
++    }
++    else if constexpr (special && code == 0x1Fu) // CLIP, on the raw bit patterns
++    {
++        uint32_t w;
++        std::memcpy(&w, &m_state.vf[ft][3], sizeof(w));
++        const int32_t limit = (w & 0x7F800000u) != 0u ? static_cast<int32_t>(w & 0x7FFFFFFFu) : 0x007FFFFF;
++        uint32_t flags = 0u;
++        for (uint32_t lane = 0u; lane < 3u; ++lane)
++        {
++            int32_t bits;
++            std::memcpy(&bits, &source[lane], sizeof(bits));
++            if (bits > limit)
++                flags |= 1u << (lane * 2u);
++            if ((bits ^ std::numeric_limits<int32_t>::min()) > limit)
++                flags |= 2u << (lane * 2u);
++        }
++        return flags;
++    }
++    else // MAX and MINI with a broadcast, I or a whole vector
++    {
++        static_assert(!special, "unexpected upper instruction without FMAC flags");
++        constexpr bool max = code <= 0x13u || code == 0x1Du || code == 0x2Bu;
++        for (uint32_t lane = 0u; lane < 4u; ++lane)
++        {
++            const float left = normalizeOperand(source[lane]);
++            float right;
++            if constexpr (code <= 0x17u)
++                right = normalizeOperand(m_state.vf[ft][code & 3u]);
++            else if constexpr (code == 0x1Du || code == 0x1Fu)
++                right = normalizeOperand(m_state.i);
++            else
++                right = normalizeOperand(m_state.vf[ft][lane]);
++            value[lane] = max ? (left > right ? left : right) : (left < right ? left : right);
++        }
++    }
++    return 0u;
++}
++
++#if PS2_VU_PROGRAM_NEON || PS2_VU_PROGRAM_SSE
++// computeUpper's vector cases with the same range checks, but with the flags
++// built straight into the MAC layout. Results the checks do not clear take
++// the exact path.
++template <uint32_t Upper>
++PS2_VU_FORCE_INLINE bool Frame::fastUpper(float *value)
++{
++    constexpr uint32_t code = upperCode(Upper);
++    constexpr uint8_t dest = static_cast<uint8_t>((Upper >> 21u) & 15u);
++    constexpr uint8_t fs = static_cast<uint8_t>((Upper >> 11u) & 31u);
++    constexpr uint8_t ft = static_cast<uint8_t>((Upper >> 16u) & 31u);
++    // OPMULA and OPMSUB take the cross-product lanes fs.yzx and ft.zxy. Their w
++    // result is a constant zero, which the exact path handles.
++    constexpr bool cross = code == 0x2Eu && (dest & 1u) == 0u;
++    constexpr bool accumulate = (Upper & 0x3Fu) >= 0x3Cu;
++    constexpr bool simpleAdd = code <= 3u || code == 0x20u || code == 0x22u || code == 0x28u;
++    constexpr bool simpleSub = (code >= 4u && code <= 7u) || code == 0x24u || code == 0x26u || code == 0x2Cu;
++    constexpr bool simpleMul = (code >= 0x18u && code <= 0x1Cu) || code == 0x1Eu || code == 0x2Au || (cross && accumulate);
++    constexpr bool productSum = (code >= 8u && code <= 0xFu) || code == 0x21u || code == 0x23u ||
++                                code == 0x25u || code == 0x27u || code == 0x29u || code == 0x2Du || (cross && !accumulate);
++    constexpr bool subtract = (code >= 0xCu && code <= 0xFu) || code == 0x25u || code == 0x27u || code == 0x2Du || cross;
++    if constexpr (!simpleAdd && !simpleSub && !simpleMul && !productSum)
++        return false;
++#if PS2_VU_PROGRAM_NEON
++    else
++    {
++        using fast::flushDenormals;
++        const uint32x4_t magnitudeMask = vdupq_n_u32(0x7FFFFFFFu);
++        float32x4_t left = flushDenormals(vld1q_f32(m_state.vf[fs]));
++        float32x4_t right;
++        if constexpr (code <= 0xFu || (code >= 0x18u && code <= 0x1Bu))
++            right = vld1q_dup_f32(&m_state.vf[ft][code & 3u]);
++        else if constexpr (code == 0x1Cu || code == 0x20u || code == 0x21u || code == 0x24u || code == 0x25u)
++            right = vdupq_n_f32(m_state.q);
++        else if constexpr (code == 0x1Eu || code == 0x22u || code == 0x23u || code == 0x26u || code == 0x27u)
++            right = vdupq_n_f32(m_state.i);
++        else
++            right = vld1q_f32(m_state.vf[ft]);
++        right = flushDenormals(right);
++        if constexpr (cross)
++        {
++            // fs.yzxw and ft.zxyw; GCC only has __builtin_shufflevector from 12 on.
++            left = vcopyq_laneq_f32(vcopyq_laneq_f32(vextq_f32(left, left, 1), 2, left, 0), 3, left, 3);
++            right = vcopyq_laneq_f32(vcopyq_laneq_f32(vextq_f32(right, right, 3), 0, right, 2), 3, right, 3);
++        }
++        const uint32x4_t leftBits = vreinterpretq_u32_f32(left);
++        const uint32x4_t rightBits = vreinterpretq_u32_f32(right);
++
++        if constexpr (!productSum)
++        {
++            float32x4_t result;
++            if constexpr (simpleAdd)
++                result = vaddq_f32(left, right);
++            else if constexpr (simpleSub)
++                result = vsubq_f32(left, right);
++            else
++                result = vmulq_f32(left, right);
++            const uint32x4_t bits = vreinterpretq_u32_f32(result);
++            const uint32x4_t magnitude = vandq_u32(bits, magnitudeMask);
++            const uint32x4_t leftZero = vceqzq_u32(vandq_u32(leftBits, magnitudeMask));
++            const uint32x4_t rightZero = vceqzq_u32(vandq_u32(rightBits, magnitudeMask));
++            uint32x4_t exactZero;
++            if constexpr (simpleMul)
++                exactZero = vorrq_u32(leftZero, rightZero);
++            else
++            {
++                const uint32x4_t opposing = simpleAdd ? veorq_u32(rightBits, vdupq_n_u32(0x80000000u)) : rightBits;
++                exactZero = vorrq_u32(vandq_u32(leftZero, rightZero), vceqq_u32(leftBits, opposing));
++            }
++            const uint32x4_t zero = vceqzq_u32(magnitude);
++            const uint32x4_t normal = vandq_u32(vcgtq_u32(magnitude, vdupq_n_u32(0x00800000u)),
++                                                vcltq_u32(magnitude, vdupq_n_u32(0x7F7FFFFFu)));
++            // Boundary results keep the exact checks: tiny results rounded to
++            // zero or MIN_NORMAL, and overflow to FLT_MAX.
++            const uint32x4_t safe = vorrq_u32(normal, vandq_u32(zero, exactZero));
++            if (vminvq_u32(vorrq_u32(safe, fast::inactive<dest>())) == 0u)
++                return false;
++            vst1q_f32(value, result);
++            if constexpr (dest != 0u)
++                pushFlags(3u, fast::layout<dest>(zero, fast::negative(bits), vdupq_n_u32(0u)), 0u);
++            return true;
++        }
++        else
++        {
++            // Only FMAC results reach ACC, and those are already in range.
++            const float32x4_t acc = vld1q_f32(m_state.acc);
++            const float32x4_t result = subtract ? vfmsq_f32(acc, left, right) : vfmaq_f32(acc, left, right);
++            const uint32x4_t bits = vreinterpretq_u32_f32(result);
++            const uint32x4_t exponentMask = vdupq_n_u32(0xFFu);
++            const uint32x4_t resultExponent = vandq_u32(vshrq_n_u32(bits, 23), exponentMask);
++            const uint32x4_t leftExponent = vandq_u32(vshrq_n_u32(leftBits, 23), exponentMask);
++            const uint32x4_t rightExponent = vandq_u32(vshrq_n_u32(rightBits, 23), exponentMask);
++            const uint32x4_t productBound = vaddq_u32(leftExponent, rightExponent);
++            const uint32x4_t zeroProduct = vorrq_u32(vceqzq_u32(leftExponent), vceqzq_u32(rightExponent));
++            const uint32x4_t productSafe = vandq_u32(vcleq_u32(productBound, vdupq_n_u32(379u)),
++                                                     vcleq_u32(productBound, vaddq_u32(resultExponent, vdupq_n_u32(146u))));
++            const uint32x4_t resultSafe = vandq_u32(vcgeq_u32(resultExponent, vdupq_n_u32(2u)),
++                                                    vcleq_u32(resultExponent, vdupq_n_u32(253u)));
++            const uint32x4_t zero = vceqzq_u32(vandq_u32(bits, magnitudeMask));
++            const uint32x4_t safe = vorrq_u32(vandq_u32(resultSafe, vorrq_u32(zeroProduct, productSafe)),
++                                              vandq_u32(zero, zeroProduct));
++            if (vminvq_u32(vorrq_u32(safe, fast::inactive<dest>())) == 0u)
++                return false;
++            vst1q_f32(value, result);
++            if constexpr (dest != 0u)
++            {
++                // The accepted exponent bound excludes product overflow. A tiny
++                // product is exact zero only when one multiplicand is zero.
++                const uint32x4_t product = vreinterpretq_u32_f32(vabsq_f32(vmulq_f32(left, right)));
++                const uint32x4_t tiny = vcltq_u32(product, vdupq_n_u32(0x00800000u));
++                const uint32_t conditions = fast::layout<dest>(tiny, fast::negative(veorq_u32(leftBits, rightBits)),
++                                                               vbicq_u32(tiny, zeroProduct));
++                pushFlags(3u, fast::layout<dest>(zero, fast::negative(bits), vdupq_n_u32(0u)), conditions);
++            }
++            return true;
++        }
++    }
++#else
++    else
++    {
++        // The same steps. Every integer compare here is on values below 2^31,
++        // which SSE2's signed compares handle.
++        using fast::flushDenormals;
++        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
++        const __m128i none = _mm_setzero_si128();
++        __m128 left = flushDenormals(_mm_loadu_ps(m_state.vf[fs]));
++        __m128 right;
++        if constexpr (code <= 0xFu || (code >= 0x18u && code <= 0x1Bu))
++            right = _mm_set1_ps(m_state.vf[ft][code & 3u]);
++        else if constexpr (code == 0x1Cu || code == 0x20u || code == 0x21u || code == 0x24u || code == 0x25u)
++            right = _mm_set1_ps(m_state.q);
++        else if constexpr (code == 0x1Eu || code == 0x22u || code == 0x23u || code == 0x26u || code == 0x27u)
++            right = _mm_set1_ps(m_state.i);
++        else
++            right = _mm_loadu_ps(m_state.vf[ft]);
++        right = flushDenormals(right);
++        if constexpr (cross)
++        {
++            left = _mm_shuffle_ps(left, left, _MM_SHUFFLE(3, 0, 2, 1));
++            right = _mm_shuffle_ps(right, right, _MM_SHUFFLE(3, 1, 0, 2));
++        }
++        const __m128i leftBits = _mm_castps_si128(left);
++        const __m128i rightBits = _mm_castps_si128(right);
++
++        if constexpr (!productSum)
++        {
++            __m128 result;
++            if constexpr (simpleAdd)
++                result = _mm_add_ps(left, right);
++            else if constexpr (simpleSub)
++                result = _mm_sub_ps(left, right);
++            else
++                result = _mm_mul_ps(left, right);
++            const __m128i magnitude = _mm_and_si128(_mm_castps_si128(result), magnitudeMask);
++            const __m128i leftZero = _mm_cmpeq_epi32(_mm_and_si128(leftBits, magnitudeMask), none);
++            const __m128i rightZero = _mm_cmpeq_epi32(_mm_and_si128(rightBits, magnitudeMask), none);
++            __m128i exactZero;
++            if constexpr (simpleMul)
++                exactZero = _mm_or_si128(leftZero, rightZero);
++            else
++            {
++                const __m128i opposing =
++                    simpleAdd ? _mm_xor_si128(rightBits, _mm_set1_epi32(std::numeric_limits<int32_t>::min())) : rightBits;
++                exactZero = _mm_or_si128(_mm_and_si128(leftZero, rightZero), _mm_cmpeq_epi32(leftBits, opposing));
++            }
++            const __m128i zero = _mm_cmpeq_epi32(magnitude, none);
++            const __m128i normal = _mm_and_si128(_mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x00800000)),
++                                                 _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x7F7FFFFF)));
++            const __m128i safe = _mm_or_si128(normal, _mm_and_si128(zero, exactZero));
++            if ((fast::mask(safe) & fast::kLanes<dest>) != fast::kLanes<dest>)
++                return false;
++            _mm_storeu_ps(value, result);
++            if constexpr (dest != 0u)
++                pushFlags(3u, fast::layout<dest>(fast::mask(zero), _mm_movemask_ps(result), 0), 0u);
++            return true;
++        }
++        else
++        {
++            const __m128 result = fast::productSum<subtract>(_mm_loadu_ps(m_state.acc), left, right);
++            const __m128i bits = _mm_castps_si128(result);
++            const __m128i exponentMask = _mm_set1_epi32(0xFF);
++            const __m128i resultExponent = _mm_and_si128(_mm_srli_epi32(bits, 23), exponentMask);
++            const __m128i leftExponent = _mm_and_si128(_mm_srli_epi32(leftBits, 23), exponentMask);
++            const __m128i rightExponent = _mm_and_si128(_mm_srli_epi32(rightBits, 23), exponentMask);
++            const __m128i productBound = _mm_add_epi32(leftExponent, rightExponent);
++            const __m128i zeroProduct =
++                _mm_or_si128(_mm_cmpeq_epi32(leftExponent, none), _mm_cmpeq_epi32(rightExponent, none));
++            // A nonzero product that may be infinite, or round by too much next to the result.
++            const __m128i risky = _mm_andnot_si128(
++                zeroProduct, _mm_or_si128(_mm_cmpgt_epi32(productBound, _mm_set1_epi32(379)),
++                                          _mm_cmpgt_epi32(productBound, _mm_add_epi32(resultExponent, _mm_set1_epi32(146)))));
++            const __m128i resultSafe = _mm_and_si128(_mm_cmpgt_epi32(resultExponent, _mm_set1_epi32(1)),
++                                                     _mm_cmplt_epi32(resultExponent, _mm_set1_epi32(254)));
++            const __m128i zero = _mm_cmpeq_epi32(_mm_and_si128(bits, magnitudeMask), none);
++            const __m128i safe = _mm_or_si128(_mm_andnot_si128(risky, resultSafe), _mm_and_si128(zero, zeroProduct));
++            if ((fast::mask(safe) & fast::kLanes<dest>) != fast::kLanes<dest>)
++                return false;
++            _mm_storeu_ps(value, result);
++            if constexpr (dest != 0u)
++            {
++                const __m128i product = _mm_and_si128(_mm_castps_si128(_mm_mul_ps(left, right)), magnitudeMask);
++                const __m128i tiny = _mm_cmplt_epi32(product, _mm_set1_epi32(0x00800000));
++                const uint32_t conditions = fast::layout<dest>(fast::mask(tiny), _mm_movemask_ps(_mm_xor_ps(left, right)),
++                                                               fast::mask(_mm_andnot_si128(zeroProduct, tiny)));
++                pushFlags(3u, fast::layout<dest>(fast::mask(zero), _mm_movemask_ps(result), 0), conditions);
++            }
++            return true;
++        }
++    }
++#endif
++}
++#endif
++
++template <uint32_t Pc, uint32_t Lower, uint32_t CodeMask>
++PS2_VU_FORCE_INLINE void Frame::lower(float *vfResult, int32_t &viResult)
++{
++    constexpr uint32_t opcode = Lower >> 25u;
++    constexpr uint8_t dest = static_cast<uint8_t>((Lower >> 21u) & 15u);
++    constexpr uint8_t vfT = static_cast<uint8_t>((Lower >> 16u) & 31u);
++    constexpr uint8_t vfS = static_cast<uint8_t>((Lower >> 11u) & 31u);
++    constexpr uint8_t viT = vfT & 15u;
++    constexpr uint8_t viS = vfS & 15u;
++    constexpr int32_t imm11 = static_cast<int32_t>(Lower << 21u) >> 21;
++    constexpr uint32_t pcMask = CodeMask;
++    constexpr uint32_t relativeTarget = (Pc + 8u + static_cast<uint32_t>(imm11 * 8)) & pcMask;
++    // Data memory is as large as code memory on both units.
++    const auto address = [](int32_t qword) PS2_VU_INLINE_LAMBDA {
++        return (static_cast<uint32_t>(qword) * 16u) & (CodeMask & ~0xFu);
++    };
++    const auto store = [&](uint32_t addr, const uint32_t *words) PS2_VU_INLINE_LAMBDA {
++        uint32_t lanes[4];
++        std::memcpy(lanes, m_data + addr, sizeof(lanes));
++        applyLanes<dest>(lanes, words);
++        std::memcpy(m_data + addr, lanes, sizeof(lanes));
++    };
++    const auto storeVector = [&](uint32_t addr) PS2_VU_INLINE_LAMBDA {
++        uint32_t words[4];
++        std::memcpy(words, m_state.vf[vfS], sizeof(words));
++        store(addr, words);
++    };
++    constexpr uint32_t integerLane = (dest & 8u) ? 0u : (dest & 4u) ? 1u : (dest & 2u) ? 2u : 3u;
++    const auto broadcast = [&](float value) PS2_VU_INLINE_LAMBDA {
++        vfResult[0] = vfResult[1] = vfResult[2] = vfResult[3] = value;
++    };
++
++    if constexpr (Lower == 0u || Lower == 0x8000033Cu)
++        return;
++    else if constexpr (opcode == 0x00u) // LQ
++        std::memcpy(vfResult, m_data + address(m_state.vi[viS] + imm11), 16u);
++    else if constexpr (opcode == 0x01u) // SQ
++        storeVector(address(m_state.vi[viT] + imm11));
++    else if constexpr (opcode == 0x04u) // ILW
++    {
++        uint32_t value;
++        std::memcpy(&value, m_data + address(m_state.vi[viS] + imm11) + integerLane * 4u, 4u);
++        viResult = static_cast<int16_t>(value & 0xFFFFu);
++    }
++    else if constexpr (opcode == 0x05u) // ISW
++    {
++        const uint32_t value = static_cast<uint16_t>(m_state.vi[viT] & 0xFFFF);
++        const uint32_t words[4] = {value, value, value, value};
++        store(address(m_state.vi[viS] + imm11), words);
++    }
++    else if constexpr (opcode == 0x08u || opcode == 0x09u) // IADDIU, ISUBIU
++    {
++        constexpr int32_t imm15 = static_cast<int16_t>((Lower & 0x7FFu) | ((Lower >> 10u) & 0x7800u));
++        viResult = static_cast<int16_t>(opcode == 0x08u ? m_state.vi[viS] + imm15 : m_state.vi[viS] - imm15);
++    }
++    else if constexpr (opcode == 0x10u) // FCEQ
++    {
++        flagsAt();
++        viResult = (m_state.clip & 0xFFFFFFu) == (Lower & 0xFFFFFFu) ? 1 : 0;
++    }
++    else if constexpr (opcode == 0x11u) // FCSET
++    {
++        m_workingClip = Lower & 0xFFFFFFu;
++        cancelSameCycle(8u);
++        pushFlags(8u, m_workingClip, 0u);
++    }
++    else if constexpr (opcode == 0x12u) // FCAND
++    {
++        flagsAt();
++        viResult = (m_state.clip & Lower & 0xFFFFFFu) != 0u ? 1 : 0;
++    }
++    else if constexpr (opcode == 0x13u) // FCOR
++    {
++        flagsAt();
++        viResult = ((m_state.clip | Lower) & 0xFFFFFFu) == 0xFFFFFFu ? 1 : 0;
++    }
++    else if constexpr (opcode >= 0x14u && opcode <= 0x17u) // FSEQ, FSSET, FSAND, FSOR
++    {
++        constexpr uint32_t imm12 = (((Lower >> 21u) & 1u) << 11u) | (Lower & 0x7FFu);
++        if constexpr (opcode == 0x15u)
++        {
++            cancelSameCycle(2u);
++            pushFlags(4u, imm12 & 0xFC0u, 0u);
++            ++m_run.m_fssetQueued;
++        }
++        else
++        {
++            if (qDue())
++                commitQ();
++            flagsAt();
++            const uint32_t status = m_state.status & 0xFFFu;
++            if constexpr (opcode == 0x14u)
++                viResult = status == imm12 ? 1 : 0;
++            else if constexpr (opcode == 0x16u)
++                viResult = static_cast<int32_t>(status & imm12);
++            else
++                viResult = static_cast<int32_t>(status | imm12);
++        }
++    }
++    else if constexpr (opcode == 0x18u || opcode == 0x1Au || opcode == 0x1Bu) // FMEQ, FMAND, FMOR
++    {
++        flagsAt();
++        const uint32_t mask = static_cast<uint16_t>(m_state.vi[viS]);
++        if constexpr (opcode == 0x18u)
++            viResult = (m_state.mac & 0xFFFFu) == mask ? 1 : 0;
++        else if constexpr (opcode == 0x1Au)
++            viResult = static_cast<int32_t>(m_state.mac & mask);
++        else
++            viResult = static_cast<int32_t>(m_state.mac | mask);
++    }
++    else if constexpr (opcode == 0x1Cu) // FCGET
++    {
++        flagsAt();
++        viResult = static_cast<int32_t>(m_state.clip & 0x0FFFu);
++    }
++    else if constexpr (opcode == 0x20u || opcode == 0x21u) // B, BAL
++    {
++        // The interpreter leaves the last taken target in the state; so do we.
++        m_taken = true;
++        m_state.branchTarget = relativeTarget;
++        if constexpr (opcode == 0x21u)
++            viResult = static_cast<int32_t>((Pc + 16u) / 8u);
++    }
++    else if constexpr (opcode == 0x24u || opcode == 0x25u) // JR, JALR
++    {
++        // Register jumps do not use the delayed operand of conditional branches.
++        m_taken = true;
++        m_jumpTarget = (static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[viS])) * 8u) & pcMask;
++        m_state.branchTarget = m_jumpTarget;
++        if constexpr (opcode == 0x25u)
++            viResult = static_cast<int32_t>((Pc + 16u) / 8u);
++    }
++    else if constexpr (opcode == 0x28u || opcode == 0x29u || (opcode >= 0x2Cu && opcode <= 0x2Fu))
++    {
++        const int16_t s = static_cast<int16_t>(branchVi(viS));
++        if constexpr (opcode == 0x28u) // IBEQ
++            m_taken = s == static_cast<int16_t>(branchVi(viT));
++        else if constexpr (opcode == 0x29u) // IBNE
++            m_taken = s != static_cast<int16_t>(branchVi(viT));
++        else if constexpr (opcode == 0x2Cu) // IBLTZ
++            m_taken = s < 0;
++        else if constexpr (opcode == 0x2Du) // IBGTZ
++            m_taken = s > 0;
++        else if constexpr (opcode == 0x2Eu) // IBLEZ
++            m_taken = s <= 0;
++        else // IBGEZ
++            m_taken = s >= 0;
++        if (m_taken)
++            m_state.branchTarget = relativeTarget;
++    }
++    else if constexpr (opcode == 0x40u)
++    {
++        constexpr uint32_t direct = Lower & 0x3Fu;
++        constexpr uint32_t special = (Lower & 3u) | ((Lower >> 4u) & 0x7Cu);
++        using ps2_vu_detail::upper::normalizeOperand;
++        if constexpr (direct == 0x30u) // IADD
++            viResult = static_cast<int16_t>(m_state.vi[viS] + m_state.vi[viT]);
++        else if constexpr (direct == 0x31u) // ISUB
++            viResult = static_cast<int16_t>(m_state.vi[viS] - m_state.vi[viT]);
++        else if constexpr (direct == 0x32u) // IADDI
++        {
++            constexpr int32_t imm5 = static_cast<int32_t>(((Lower >> 6u) & 0x1Fu) << 27u) >> 27;
++            viResult = static_cast<int16_t>(m_state.vi[viS] + imm5);
++        }
++        else if constexpr (direct == 0x34u) // IAND
++            viResult = m_state.vi[viS] & m_state.vi[viT];
++        else if constexpr (direct == 0x35u) // IOR
++            viResult = m_state.vi[viS] | m_state.vi[viT];
++        else if constexpr (special == 0x30u) // MOVE
++            std::memcpy(vfResult, m_state.vf[vfS], 16u);
++        else if constexpr (special == 0x31u) // MR32
++        {
++            const float *source = m_state.vf[vfS];
++            vfResult[0] = source[1];
++            vfResult[1] = source[2];
++            vfResult[2] = source[3];
++            vfResult[3] = source[0];
++        }
++        else if constexpr (special == 0x34u) // LQI
++        {
++            std::memcpy(vfResult, m_data + address(static_cast<uint16_t>(m_state.vi[viS])), 16u);
++            viResult = static_cast<int16_t>(m_state.vi[viS] + 1);
++        }
++        else if constexpr (special == 0x35u) // SQI
++        {
++            storeVector(address(static_cast<uint16_t>(m_state.vi[viT])));
++            viResult = static_cast<int16_t>(m_state.vi[viT] + 1);
++        }
++        else if constexpr (special == 0x36u) // LQD
++        {
++            const int32_t value = viS != 0u ? static_cast<int16_t>(m_state.vi[viS] - 1) : 0;
++            viResult = value;
++            std::memcpy(vfResult, m_data + address(static_cast<uint16_t>(value)), 16u);
++        }
++        else if constexpr (special == 0x37u) // SQD
++        {
++            const int32_t value = viT != 0u ? static_cast<int16_t>(m_state.vi[viT] - 1) : 0;
++            viResult = value;
++            storeVector(address(static_cast<uint16_t>(value)));
++        }
++        else if constexpr (special == 0x38u || special == 0x39u || special == 0x3Au) // DIV, SQRT, RSQRT
++        {
++            constexpr uint32_t fsf = (Lower >> 21u) & 3u, ftf = (Lower >> 23u) & 3u;
++            if (qDue())
++                commitQ();
++            syncClock();
++            if constexpr (special == 0x38u)
++            {
++                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
++                const float den = normalizeOperand(m_state.vf[vfT][ftf]);
++                uint32_t statusDi = 0u;
++                float result;
++                if (den == 0.0f)
++                {
++                    statusDi = num == 0.0f ? 0x10u : 0x20u;
++                    result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
++                                                                    : std::numeric_limits<float>::max();
++                }
++                else
++                    result = num / den;
++                uint32_t ignored = 0u;
++                result = ps2_vu_detail::upper::normalizeResult(result, ignored);
++                Access::queueQ(m_run.m_vu, result, 7u, statusDi);
++            }
++            else if constexpr (special == 0x39u)
++            {
++                const float value = normalizeOperand(m_state.vf[vfT][ftf]);
++                Access::queueQ(m_run.m_vu, std::sqrt(std::fabs(value)), 7u, value < 0.0f ? 0x10u : 0u);
++            }
++            else
++            {
++                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
++                const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float den = std::sqrt(std::fabs(radicand));
++                uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
++                float result;
++                if (den != 0.0f)
++                    result = num / den;
++                else
++                {
++                    statusDi = num == 0.0f ? 0x10u : 0x20u;
++                    result = std::signbit(num) ? -std::numeric_limits<float>::max()
++                                               : std::numeric_limits<float>::max();
++                }
++                uint32_t ignored = 0u;
++                result = ps2_vu_detail::upper::normalizeResult(result, ignored);
++                Access::queueQ(m_run.m_vu, result, 13u, statusDi);
++            }
++        }
++        else if constexpr (special == 0x3Bu || special == 0x7Bu) // WAITQ, WAITP
++        {
++        }
++        else if constexpr (special == 0x3Cu) // MTIR
++        {
++            uint32_t bits;
++            std::memcpy(&bits, &m_state.vf[vfS][(Lower >> 21u) & 3u], 4u);
++            viResult = static_cast<int16_t>(bits & 0xFFFFu);
++        }
++        else if constexpr (special == 0x3Du) // MFIR
++        {
++            const int32_t value = static_cast<int16_t>(m_state.vi[viS] & 0xFFFF);
++            float bits;
++            std::memcpy(&bits, &value, 4u);
++            broadcast(bits);
++        }
++        else if constexpr (special == 0x3Eu) // ILWR
++        {
++            uint32_t value;
++            std::memcpy(&value, m_data + address(static_cast<uint16_t>(m_state.vi[viS])) + integerLane * 4u, 4u);
++            viResult = static_cast<int16_t>(value & 0xFFFFu);
++        }
++        else if constexpr (special == 0x3Fu) // ISWR
++        {
++            const uint32_t value = static_cast<uint16_t>(m_state.vi[viT] & 0xFFFF);
++            const uint32_t words[4] = {value, value, value, value};
++            store(address(static_cast<uint16_t>(m_state.vi[viS])), words);
++        }
++        else if constexpr (special == 0x64u) // MFP
++        {
++            commitP();
++            broadcast(m_state.p);
++        }
++        else if constexpr (special == 0x68u) // XTOP
++            viResult = static_cast<int32_t>(m_state.top & 0x3FFu);
++        else if constexpr (special == 0x69u) // XITOP
++            viResult = static_cast<int32_t>(m_state.itop & 0x3FFu);
++        else if constexpr (special == 0x6Cu) // XGKICK
++        {
++            syncClock();
++            Access::startXgkick(m_run.m_vu, static_cast<uint16_t>(m_state.vi[viS]));
++            m_kickActive = Access::xgkickActive(m_run.m_vu);
++        }
++        else if constexpr (special >= 0x70u && special <= 0x7Eu && special != 0x77u) // EFU; 0x77 is unassigned
++        {
++            const float *source = m_state.vf[vfS];
++            const float x = normalizeOperand(source[0]), y = normalizeOperand(source[1]);
++            const float z = normalizeOperand(source[2]);
++            const float component = normalizeOperand(source[(Lower >> 21u) & 3u]);
++            float result = 0.0f;
++            uint32_t latency = 0u;
++            if constexpr (special == 0x70u) // ESADD
++            {
++                result = x * x + y * y + z * z;
++                latency = 11u;
++            }
++            else if constexpr (special == 0x71u) // ERSADD
++            {
++                const float sum = x * x + y * y + z * z;
++                result = sum != 0.0f ? 1.0f / sum : sum;
++                latency = 18u;
++            }
++            else if constexpr (special == 0x72u) // ELENG
++            {
++                result = std::sqrt(x * x + y * y + z * z);
++                latency = 18u;
++            }
++            else if constexpr (special == 0x73u) // ERLENG
++            {
++                const float length = std::sqrt(x * x + y * y + z * z);
++                result = length != 0.0f ? 1.0f / length : length;
++                latency = 24u;
++            }
++            else if constexpr (special == 0x74u) // EATANxy
++            {
++                result = x != 0.0f ? ps2_vu_detail::vuEatan(y / x) : 0.0f;
++                latency = 54u;
++            }
++            else if constexpr (special == 0x75u) // EATANxz
++            {
++                result = x != 0.0f ? ps2_vu_detail::vuEatan(z / x) : 0.0f;
++                latency = 54u;
++            }
++            else if constexpr (special == 0x76u) // ESUM
++            {
++                // Summed from 0.0f like the interpreter, which matters when every lane is -0.
++                result = 0.0f + x + y + z + normalizeOperand(source[3]);
++                latency = 12u;
++            }
++            else if constexpr (special == 0x78u) // ESQRT
++            {
++                result = component >= 0.0f ? std::sqrt(component) : component;
++                latency = 12u;
++            }
++            else if constexpr (special == 0x79u) // ERSQRT
++            {
++                result = component;
++                if (result >= 0.0f)
++                {
++                    result = std::sqrt(result);
++                    if (result != 0.0f)
++                        result = 1.0f / result;
++                }
++                latency = 18u;
++            }
++            else if constexpr (special == 0x7Au) // ERCPR
++            {
++                result = component != 0.0f ? 1.0f / component : component;
++                latency = 12u;
++            }
++            else if constexpr (special == 0x7Cu) // ESIN
++            {
++                result = ps2_vu_detail::vuEsin(component);
++                latency = 29u;
++            }
++            else if constexpr (special == 0x7Du) // EATAN
++            {
++                result = ps2_vu_detail::vuEatan(component);
++                latency = 54u;
++            }
++            else if constexpr (special == 0x7Eu) // EEXP
++            {
++                result = ps2_vu_detail::vuEexp(component);
++                latency = 44u;
++            }
++            else
++                static_assert(special == 0x70u, "unsupported EFU instruction in a compiled VU program");
++            commitP();
++            syncClock();
++            Access::queueP(m_run.m_vu, result, latency);
++        }
++        else
++            static_assert(special == 0x30u, "unsupported lower instruction in a compiled VU program");
++    }
++    else
++        static_assert(opcode == 0x00u, "unsupported lower instruction in a compiled VU program");
++}
++
++}
++#endif
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 27f3058..b6f3ca3 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -30,6 +30,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_runtime_interrupt_tests.cpp
+     src/ps2_memory_tests.cpp
+     src/ps2_vu1_tests.cpp
++    src/ps2_vu1_program_tests.cpp
+     src/ps2_vu_tests.cpp
+     src/ps2_gs_tests.cpp
+     src/ps2_iop_tests.cpp
+diff --git a/ps2xTest/data/vu_programs.py b/ps2xTest/data/vu_programs.py
+new file mode 100644
+index 0000000..d4cdcd0
+--- /dev/null
++++ b/ps2xTest/data/vu_programs.py
+@@ -0,0 +1,452 @@
++#!/usr/bin/env python3
++"""Write synthetic VU0 and VU1 programs as a program profile, to test compiled routines.
++
++usage: vu_programs.py DIRECTORY
++
++DIRECTORY gets the layout a run with PS2_VU_PROGRAM_PROFILE records: 16 KiB
++vu1-<hash>.code and 4 KiB vu0-<hash>.code images and an entries.txt. Build the runtime with
++PS2X_VU_PROGRAM_PROFILES=DIRECTORY to compile the programs, then run the VU
++tests with PS2_VU_PROGRAM_FIXTURES=DIRECTORY: ps2_vu1_program_tests.cpp runs
++every entry both compiled and interpreted and compares the two.
++
++A few programs are written out to reach particular paths: blocks split for
++length, an E bit on a branch, a program the compiler hands back part-way. The
++rest come from a seeded generator that mixes the instructions the compiler
++accepts inside counted loops, forward branches, calls and register jumps.
++They rely on what the test sets up: VI registers start at zero, data memory
++holds floats, and qword 0x3F0 holds a GIF packet for XGKICK. VU0 programs
++leave out what VU0 lacks (EFU, MFP, XGKICK) but one, which stops at an XGKICK;
++their stream pointer starts past the end of VU0 data memory, which wraps.
++"""
++
++import random
++import struct
++import sys
++from pathlib import Path
++
++CODE_SIZE = 16384
++PAIRS = CODE_SIZE // 8
++VU0_PAIRS = 4096 // 8
++LOWER_NOP = 0x8000033C
++UPPER_NOP = 0x000002FF
++E_BIT = 1 << 30
++I_BIT = 1 << 31
++XYZ = 0b1110
++
++# Registers with fixed jobs, so that loops end and addresses stay in range.
++# Generated integer code writes only VI2-VI7, and FCAND and friends VI1.
++SCRATCH = (2, 3, 4, 5, 6, 7)
++COUNTERS = (8, 9)  # loop counters, by nesting depth
++POINTER = 10       # LQI/SQI/LQD/SQD base, reset before each loop
++KICK = 11          # XGKICK address
++BASE = 12          # LQ/SQ/ILW/ISW base
++TARGET = 13        # JALR target
++FIXED = 14         # set once by a hand-written program
++LINK = 15
++
++KICK_QWORD = 0x3F0  # the test's GIF packet
++BASE_QWORD = 0x40
++POINTER_QWORD = 0x100
++
++# Upper opcodes 0x00-0x2F: ADD, SUB, MADD, MSUB, MAX, MINI and MUL in their
++# broadcast, Q and I forms, then the three-register ones. OPMSUB is left to
++# outer_product(), which pairs it with OPMULA.
++VECTOR_OPS = [op for op in range(0x30) if op != 0x2E]
++# Special upper opcodes that write ACC: the A forms of the above.
++ACC_OPS = [*range(0x10), *range(0x18, 0x1D), 0x1E, *range(0x20, 0x2B), 0x2C, 0x2D]
++# EFU operations on a vector, with the fields each one reads, and on one field.
++EFU_VECTOR = ((0x70, XYZ), (0x71, XYZ), (0x72, XYZ), (0x73, XYZ), (0x74, 0b1100), (0x75, 0b1010), (0x76, 0b1111))
++EFU_SCALAR = (0x78, 0x79, 0x7A, 0x7C, 0x7D, 0x7E)
++
++FLOATS = (0.0, -0.0, 1.0, -1.0, 0.5, -2.5, 3.0, 1000.0, 1e-30, 1e30, 3.4e38, -3.4e38)
++# Bit patterns without a PS2 float meaning: infinities, NaN, a denormal.
++RAW_FLOATS = (0x7F800000, 0xFF800000, 0x7FC00000, 0x00000001, 0x7FFFFFFF)
++
++
++def upper(op, dest, ft, fs, fd):
++    return (dest << 21) | (ft << 16) | (fs << 11) | (fd << 6) | op
++
++
++def upper_special(op, dest, ft, fs):
++    return (dest << 21) | (ft << 16) | (fs << 11) | ((op & 0x7C) << 4) | (op & 3) | 0x3C
++
++
++def lower_special(op, is_=0, it=0, dest=0):
++    return (0x40 << 25) | (dest << 21) | (it << 16) | (is_ << 11) | ((op & 0x7C) << 4) | (op & 3) | 0x3C
++
++
++def lower_direct(funct, is_, it, id_):
++    return (0x40 << 25) | (it << 16) | (is_ << 11) | (id_ << 6) | funct
++
++
++def immediate15(op, it, is_, value):
++    """IADDIU and ISUBIU, whose 15-bit immediate is split around the dest field."""
++    return (op << 25) | (((value >> 11) & 15) << 21) | (it << 16) | (is_ << 11) | (value & 0x7FF)
++
++
++def memory(op, dest, t, s, offset):
++    return (op << 25) | (dest << 21) | (t << 16) | (s << 11) | (offset & 0x7FF)
++
++
++def branch(op, it=0, is_=0, offset=0):
++    return (op << 25) | (it << 16) | (is_ << 11) | (offset & 0x7FF)
++
++
++def flag_immediate(op, it, value):
++    return (op << 25) | (((value >> 11) & 1) << 21) | (it << 16) | (value & 0x7FF)
++
++
++def flag_register(op, it, is_=0):
++    return (op << 25) | (it << 16) | (is_ << 11)
++
++
++class Program:
++    """Pairs laid out from an entry. Branch offsets are patched in once the
++    target is known."""
++
++    def __init__(self, entry):
++        self.entry = entry
++        self.pairs = []
++
++    @property
++    def next(self):
++        return self.entry + len(self.pairs)
++
++    def add(self, lower=LOWER_NOP, upper_word=UPPER_NOP):
++        self.pairs.append([lower, upper_word])
++        return self.next - 1
++
++    def patch_branch(self, index, target):
++        pair = self.pairs[index - self.entry]
++        pair[0] = (pair[0] & ~0x7FF) | ((target - index - 1) & 0x7FF)
++
++    def patch_immediate(self, index, value):
++        pair = self.pairs[index - self.entry]
++        pair[0] = immediate15(pair[0] >> 25, (pair[0] >> 16) & 15, (pair[0] >> 11) & 15, value)
++
++
++class Subroutine:
++    def __init__(self):
++        self.calls = []  # BAL pairs to point at it
++        self.loads = []  # IADDIU pairs that load its address for JALR
++
++
++class Generator:
++    def __init__(self, seed, outer_iterations=8, vu0=False):
++        self.random = random.Random(seed)
++        self.vu0 = vu0
++        # Long programs outlast the compiled path's minimum budget many times
++        # over, so the test can stop them at many points.
++        self.outer_iterations = outer_iterations
++
++    def vf(self):
++        return self.random.randrange(32)
++
++    def written_vf(self):
++        return self.random.randrange(1, 32)
++
++    def vi(self):
++        return self.random.choice((0, 1) + SCRATCH)
++
++    def dest(self):
++        return self.random.choice((15, 15, 15, 14, 12, 8, 4, 2, 1, 3, 7, 11, 13))
++
++    def lane(self):
++        return self.random.randrange(4)
++
++    def float_bits(self):
++        if self.random.random() < 0.15:
++            return self.random.choice(RAW_FLOATS)
++        value = self.random.choice(FLOATS) if self.random.random() < 0.4 else self.random.uniform(-200.0, 200.0)
++        return struct.unpack("<I", struct.pack("<f", value))[0]
++
++    def upper(self):
++        """A random upper instruction and the VF register it writes, if any."""
++        kind = self.random.choices(("nop", "vector", "acc", "convert", "abs", "clip"), (12, 50, 16, 8, 3, 6))[0]
++        dest = self.dest()
++        if kind == "vector":
++            fd = self.written_vf()
++            return upper(self.random.choice(VECTOR_OPS), dest, self.vf(), self.vf(), fd), fd
++        if kind == "acc":
++            return upper_special(self.random.choice(ACC_OPS), dest, self.vf(), self.vf()), None
++        if kind in ("convert", "abs"):
++            ft = self.written_vf()
++            op = self.random.randrange(0x10, 0x18) if kind == "convert" else 0x1D
++            return upper_special(op, dest, ft, self.vf()), ft
++        if kind == "clip":
++            return upper_special(0x1F, XYZ, self.vf(), self.vf()), None
++        return UPPER_NOP, None
++
++    def lower(self, avoid=None):
++        """A random lower instruction that neither branches nor writes VF avoid."""
++        while True:
++            word, writes = self.any_lower()
++            if writes is None or writes != avoid:
++                return word
++
++    def any_lower(self):
++        r = self.random
++        kind = r.choices(
++            ("nop", "integer", "load", "store", "stream", "integer memory", "move", "transfer",
++             "fdiv", "waitq", "efu", "waitp", "mfp", "status", "mac", "clip", "xtop", "kick"),
++            (14, 14, 7, 5, 5, 4, 5, 4, 4, 1, 0 if self.vu0 else 4, 0 if self.vu0 else 1,
++             0 if self.vu0 else 2, 3, 3, 3, 1, 0 if self.vu0 else 1))[0]
++        dest = self.dest()
++        if kind == "integer":
++            target = r.choice(SCRATCH)
++            form = r.randrange(4)
++            if form == 0:
++                return lower_direct(r.choice((0x30, 0x31, 0x34, 0x35)), self.vi(), self.vi(), target), None
++            if form == 1:
++                return lower_direct(0x32, self.vi(), target, r.randrange(32)), None  # IADDI
++            return immediate15(r.choice((0x08, 0x09)), target, self.vi(), r.randrange(2048)), None
++        if kind == "load":
++            ft = self.written_vf()
++            return memory(0x00, dest, ft, BASE, r.randrange(64)), ft
++        if kind == "store":
++            return memory(0x01, dest, BASE, self.vf(), r.randrange(64)), None
++        if kind == "stream":
++            op = r.choice((0x34, 0x35, 0x36, 0x37))  # LQI, SQI, LQD, SQD
++            if op in (0x34, 0x36):
++                ft = self.written_vf()
++                return lower_special(op, POINTER, ft, dest), ft
++            return lower_special(op, self.vf(), POINTER, dest), None
++        if kind == "integer memory":
++            one = 8 >> self.lane()
++            form = r.randrange(4)
++            if form == 0:
++                return memory(0x04, one, r.choice(SCRATCH), BASE, r.randrange(64)), None  # ILW
++            if form == 1:
++                return memory(0x05, dest, self.vi(), BASE, r.randrange(64)), None     # ISW
++            if form == 2:
++                return lower_special(0x3E, BASE, r.choice(SCRATCH), one), None       # ILWR
++            return lower_special(0x3F, BASE, self.vi(), dest), None                  # ISWR
++        if kind == "move":
++            ft = self.written_vf()
++            return lower_special(r.choice((0x30, 0x31)), self.vf(), ft, dest), ft  # MOVE, MR32
++        if kind == "transfer":
++            if r.random() < 0.5:
++                return lower_special(0x3C, self.vf(), r.choice(SCRATCH), self.lane()), None  # MTIR
++            ft = self.written_vf()
++            return lower_special(0x3D, self.vi(), ft, dest), ft  # MFIR
++        if kind == "fdiv":
++            op = r.choice((0x38, 0x39, 0x3A))  # DIV, SQRT, RSQRT
++            fields = (self.lane() << 2) | (self.lane() if op != 0x39 else 0)
++            return lower_special(op, self.vf() if op != 0x39 else 0, self.vf(), fields), None
++        if kind == "waitq":
++            return lower_special(0x3B), None
++        if kind == "efu":
++            if r.random() < 0.5:
++                op, fields = r.choice(EFU_VECTOR)
++                return lower_special(op, self.vf(), 0, fields), None
++            return lower_special(r.choice(EFU_SCALAR), self.vf(), 0, self.lane()), None
++        if kind == "waitp":
++            return lower_special(0x7B), None
++        if kind == "mfp":
++            ft = self.written_vf()
++            return lower_special(0x64, 0, ft, dest), ft
++        if kind == "status":
++            op = r.choice((0x14, 0x15, 0x16, 0x17))  # FSEQ, FSSET, FSAND, FSOR
++            return flag_immediate(op, r.choice(SCRATCH) if op != 0x15 else 0, r.randrange(4096)), None
++        if kind == "mac":
++            return flag_register(r.choice((0x18, 0x1A, 0x1B)), r.choice(SCRATCH), self.vi()), None
++        if kind == "clip":
++            if r.random() < 0.25:
++                return flag_register(0x1C, r.choice(SCRATCH)), None  # FCGET
++            return (r.choice((0x10, 0x11, 0x12, 0x13)) << 25) | r.randrange(1 << 24), None
++        if kind == "xtop":
++            return lower_special(r.choice((0x68, 0x69)), 0, r.choice(SCRATCH)), None
++        if kind == "kick":
++            return lower_special(0x6C, KICK), None
++        return LOWER_NOP, None
++
++    def pair(self, program):
++        word, writes = self.upper()
++        if self.random.random() < 0.06:
++            return program.add(self.float_bits(), word | I_BIT)
++        return program.add(self.lower(writes), word)
++
++    def outer_product(self, program):
++        fs, ft, fd = self.vf(), self.vf(), self.written_vf()
++        program.add(self.lower(), upper_special(0x2E, XYZ, ft, fs))
++        program.add(self.lower(fd), upper(0x2E, XYZ, fs, ft, fd))
++
++    def straight(self, program, count):
++        for _ in range(count):
++            if self.random.random() < 0.04:
++                self.outer_product(program)
++            else:
++                self.pair(program)
++
++    def body(self, program, items, depth, subroutines=()):
++        for _ in range(items):
++            roll = self.random.random()
++            if roll < 0.08 and depth < len(COUNTERS):
++                self.loop(program, depth, subroutines)
++            elif roll < 0.16:
++                self.skip(program, depth, subroutines)
++            elif roll < 0.20 and subroutines:
++                self.call(program, self.random.choice(subroutines))
++            else:
++                self.straight(program, self.random.randint(1, 4))
++
++    def loop(self, program, depth, subroutines):
++        counter = COUNTERS[depth]
++        limit = self.outer_iterations if depth == 0 else 4
++        program.add(immediate15(0x08, counter, 0, self.random.randint(max(1, limit // 3), limit)), self.upper()[0])
++        program.add(immediate15(0x08, POINTER, 0, POINTER_QWORD), self.upper()[0])
++        head = program.next
++        self.body(program, self.random.randint(3, 12), depth + 1, subroutines)
++        program.add(immediate15(0x09, counter, counter, 1), self.upper()[0])
++        # Sometimes the branch reads the counter straight after the decrement.
++        if self.random.random() < 0.5:
++            self.pair(program)
++        at = program.add(branch(0x29, 0, counter), self.upper()[0])  # IBNE
++        program.patch_branch(at, head)
++        self.pair(program)
++
++    def skip(self, program, depth, subroutines):
++        op = self.random.choice((0x20, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F))
++        at = program.add(branch(op, self.vi(), self.vi()), self.upper()[0])
++        self.pair(program)
++        self.body(program, self.random.randint(1, 4), depth, subroutines)
++        program.patch_branch(at, program.next)
++
++    def call(self, program, subroutine):
++        if self.random.random() < 0.5:
++            subroutine.calls.append(program.add(branch(0x21, LINK), self.upper()[0]))  # BAL
++        else:
++            subroutine.loads.append(program.add(immediate15(0x08, TARGET, 0, 0), self.upper()[0]))
++            self.straight(program, self.random.randint(0, 2))
++            program.add(branch(0x25, LINK, TARGET), self.upper()[0])  # JALR
++        self.pair(program)
++
++    def end(self, program):
++        word, writes = self.upper()
++        program.add(self.lower(writes), word | E_BIT)
++        self.pair(program)
++
++    def start(self, entry):
++        """A program that has set up the registers generated code addresses through."""
++        program = Program(entry)
++        program.add(immediate15(0x08, KICK, 0, KICK_QWORD), self.upper()[0])
++        program.add(immediate15(0x08, BASE, 0, BASE_QWORD), self.upper()[0])
++        program.add(immediate15(0x08, POINTER, 0, POINTER_QWORD), self.upper()[0])
++        return program
++
++    def program(self, entry, items=(12, 40)):
++        program = self.start(entry)
++        subroutines = [Subroutine() for _ in range(self.random.randint(0, 2))]
++        self.body(program, self.random.randint(*items), 0, subroutines)
++        self.end(program)
++        for subroutine in subroutines:
++            start = program.next
++            self.body(program, self.random.randint(2, 6), len(COUNTERS))
++            program.add(branch(0x24, 0, LINK), self.upper()[0])  # JR
++            self.pair(program)
++            for at in subroutine.calls:
++                program.patch_branch(at, start)
++            for at in subroutine.loads:
++                program.patch_immediate(at, start)
++        return program
++
++
++def long_straight(generator):
++    """Past the compiler's block size, so the run is cut into several blocks."""
++    program = generator.start(0)
++    generator.straight(program, 300)
++    generator.end(program)
++    return program
++
++
++def branch_with_e_bit(generator, taken):
++    """The E bit on a conditional branch ends the program after the delay slot."""
++    program = generator.start(40)
++    generator.straight(program, 8)
++    program.add(immediate15(0x08, FIXED, 0, 1 if taken else 0))
++    generator.straight(program, 3)
++    at = program.add(branch(0x29, 0, FIXED), UPPER_NOP | E_BIT)  # IBNE
++    generator.pair(program)
++    generator.straight(program, 4)
++    program.patch_branch(at, program.next)
++    generator.end(program)
++    return program
++
++
++def handed_back(generator):
++    """RINIT is not compiled, so the program returns to the interpreter there."""
++    program = generator.start(100)
++    program.add(immediate15(0x08, 8, 0, 5))
++    head = program.next
++    generator.straight(program, 12)
++    program.add(lower_special(0x42, 1, 0, 0), UPPER_NOP)  # RINIT R, VF1x
++    generator.straight(program, 12)
++    program.add(immediate15(0x09, 8, 8, 1))
++    at = program.add(branch(0x29, 0, 8))
++    program.patch_branch(at, head)
++    generator.pair(program)
++    generator.end(program)
++    return program
++
++
++def stopped_by_xgkick(generator):
++    """XGKICK is reserved on VU0: the compiled routine leaves it to the interpreter,
++    which stops at once, with the last pairs' results still in flight: an ADD
++    and an ILW, whose VI result takes four cycles too."""
++    program = generator.start(16)
++    generator.straight(program, 10)
++    program.add(memory(0x04, 8, 2, BASE, 3), upper(0x28, 0b1111, 2, 1, 3))  # ILW.x vi2 / ADD vf3, vf1, vf2
++    program.add(lower_special(0x6C, KICK), UPPER_NOP)
++    generator.straight(program, 4)
++    generator.end(program)
++    return program
++
++
++def image(programs, pairs=PAIRS):
++    words = [(LOWER_NOP, UPPER_NOP)] * pairs
++    for program in programs:
++        if program.entry + len(program.pairs) > pairs:
++            raise ValueError(f"program at {program.entry * 8:#x} runs past the end of code memory")
++        for index, pair in enumerate(program.pairs, program.entry):
++            words[index] = tuple(pair)
++    return b"".join(struct.pack("<II", lower, upper_word) for lower, upper_word in words)
++
++
++def fnv(data):
++    value = 14695981039346656037
++    for byte in data:
++        value = ((value ^ byte) * 1099511628211) & (2**64 - 1)
++    return value
++
++
++def main():
++    if len(sys.argv) != 2:
++        sys.exit(__doc__)
++    output = Path(sys.argv[1])
++    output.mkdir(parents=True, exist_ok=True)
++    images = [[long_straight(Generator(1))],
++              [branch_with_e_bit(Generator(2), True), handed_back(Generator(3))],
++              [branch_with_e_bit(Generator(4), False)]]
++    # Two generated programs per image, at entries the layout leaves free.
++    for seed in range(100, 124, 2):
++        first = Generator(seed).program(0)
++        second = Generator(seed + 1).program(first.next + 16)
++        images.append([first, second])
++    for seed in range(200, 206):
++        images.append([Generator(seed, outer_iterations=60).program(0)])
++    # VU0 code memory holds a quarter as much: one shorter program per image.
++    vu0_images = [[stopped_by_xgkick(Generator(299, vu0=True))]]
++    vu0_images += [[Generator(seed, vu0=True).program(0, (8, 20))] for seed in range(300, 312)]
++    vu0_images += [[Generator(seed, outer_iterations=60, vu0=True).program(0, (8, 20))] for seed in range(400, 403)]
++    lines = []
++    for unit, pairs, group in (("vu1", PAIRS, images), ("vu0", VU0_PAIRS, vu0_images)):
++        for programs in group:
++            code = image(programs, pairs)
++            name = f"{fnv(code):016x}"
++            (output / f"{unit}-{name}.code").write_bytes(code)
++            lines += [f"{name} {program.entry * 8:x}" for program in programs]
++    (output / "entries.txt").write_text("\n".join(lines) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index 4d3b6de..9cd574a 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -11,6 +11,7 @@ void register_ps2_runtime_kernel_tests();
+ void register_ps2_runtime_interrupt_tests();
+ void register_ps2_memory_tests();
+ void register_ps2_vu1_tests();
++void register_ps2_vu1_program_tests();
+ void register_ps2_vu_tests();
+ void register_ps2_gs_tests();
+ void register_ps2_iop_tests();
+@@ -42,6 +43,7 @@ int main()
+     register_ps2_runtime_interrupt_tests();
+     register_ps2_memory_tests();
+     register_ps2_vu1_tests();
++    register_ps2_vu1_program_tests();
+     register_ps2_vu_tests();
+     register_ps2_gs_tests();
+     register_ps2_iop_tests();
+diff --git a/ps2xTest/src/ps2_vu1_program_tests.cpp b/ps2xTest/src/ps2_vu1_program_tests.cpp
+new file mode 100644
+index 0000000..6a63413
+--- /dev/null
++++ b/ps2xTest/src/ps2_vu1_program_tests.cpp
+@@ -0,0 +1,440 @@
++#include "MiniTest.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/gs/gs_types.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/ps2_vu1.h"
++#include "../../ps2xRuntime/src/lib/vu/ps2_vu1_program.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <tuple>
++#include <vector>
++
++// Compiled VU0 and VU1 routines against the interpreter, on the vu_programs.py programs
++// the runtime was built with, named by PS2_VU_PROGRAM_FIXTURES. With
++// PS2_VU_REQUIRE_PROGRAMS, an entry without a routine fails.
++
++namespace
++{
++    constexpr uint32_t kWideBudget = 65536u;
++    constexpr uint32_t kKickQword = 0x3F0u;
++
++    using Unit = VU1Interpreter::Unit;
++
++    struct ProgramEntry
++    {
++        std::string name;
++        uint32_t pc = 0u;
++        Unit unit = Unit::VU1;
++        std::vector<uint8_t> code;
++    };
++
++    std::vector<ProgramEntry> loadEntries(std::string &error)
++    {
++        std::vector<ProgramEntry> entries;
++        const char *list = std::getenv("PS2_VU_PROGRAM_FIXTURES");
++        std::stringstream directories(list ? list : "");
++        std::string directory;
++        while (std::getline(directories, directory, ';'))
++        {
++            if (directory.empty())
++                continue;
++            std::ifstream listing(directory + "/entries.txt");
++            if (!listing)
++            {
++                error = "cannot read " + directory + "/entries.txt";
++                return {};
++            }
++            ProgramEntry entry;
++            while (listing >> entry.name >> std::hex >> entry.pc)
++            {
++                const std::string vu0 = directory + "/vu0-" + entry.name + ".code";
++                entry.unit = std::filesystem::exists(vu0) ? Unit::VU0 : Unit::VU1;
++                const uint32_t size = entry.unit == Unit::VU0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE;
++                std::ifstream image(entry.unit == Unit::VU0 ? vu0 : directory + "/vu1-" + entry.name + ".code",
++                                    std::ios::binary);
++                entry.code.assign(size, 0u);
++                if (!image.read(reinterpret_cast<char *>(entry.code.data()), size))
++                {
++                    error = "cannot read the code image " + entry.name;
++                    return {};
++                }
++                entries.push_back(entry);
++            }
++        }
++        return entries;
++    }
++
++    // Ordinary values, with zeros, a host denormal and a huge value mixed in.
++    float pattern(uint32_t n)
++    {
++        switch (n % 16u)
++        {
++        case 3u:
++            return 0.0f;
++        case 7u:
++            return -0.0f;
++        case 10u:
++            return 1e-39f;
++        case 13u:
++            return 3.0e38f;
++        default:
++            return (static_cast<float>(n % 29u) - 14.0f) * 0.625f + static_cast<float>(n / 16u);
++        }
++    }
++
++    VU1State initialState()
++    {
++        VU1State state{};
++        for (uint32_t reg = 1u; reg < 32u; ++reg)
++            for (uint32_t lane = 0u; lane < 4u; ++lane)
++                state.vf[reg][lane] = pattern(reg * 4u + lane);
++        state.vf[0][3] = 1.0f;
++        // Only FMAC results reach ACC, so it never holds a denormal, an
++        // infinity or a NaN, and the compiled product sums rely on that.
++        const float acc[4] = {-7.25f, 0.0f, 3.0e38f, -0.0f};
++        std::memcpy(state.acc, acc, sizeof(acc));
++        state.q = 1.5f;
++        state.p = 0.75f;
++        state.i = 2.0f;
++        state.r = 0x3F812345u;
++        return state;
++    }
++
++    // Floats everywhere but the GIF packet the VU1 programs kick.
++    std::vector<uint8_t> initialData(Unit unit = Unit::VU1)
++    {
++        std::vector<uint8_t> data(unit == Unit::VU0 ? PS2_VU0_DATA_SIZE : PS2_VU1_DATA_SIZE, 0u);
++        for (uint32_t qword = 0u; qword < std::min<uint32_t>(kKickQword, data.size() / 16u); ++qword)
++            for (uint32_t lane = 0u; lane < 4u; ++lane)
++            {
++                const float value = pattern(1000u + qword * 4u + lane);
++                std::memcpy(&data[qword * 16u + lane * 4u], &value, sizeof(value));
++            }
++        if (unit == Unit::VU0)
++            return data;
++        const uint64_t tag = 2u | (1ull << 15) | (static_cast<uint64_t>(GIF_FMT_IMAGE) << 58);
++        std::memcpy(&data[kKickQword * 16u], &tag, sizeof(tag));
++        for (uint32_t byte = 0u; byte < 32u; ++byte)
++            data[(kKickQword + 1u) * 16u + byte] = static_cast<uint8_t>(0xA0u + byte);
++        return data;
++    }
++
++    struct Side
++    {
++        explicit Side(Unit unit = Unit::VU1) : unit(unit), vu(unit) {}
++
++        Unit unit;
++        PS2Memory mem;
++        GS gs;
++        VU1Interpreter vu;
++        std::vector<std::vector<uint8_t>> packets;
++
++        uint8_t *code() { return unit == Unit::VU0 ? mem.getVU0Code() : mem.getVU1Code(); }
++        uint32_t codeSize() const { return unit == Unit::VU0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE; }
++        uint8_t *data() { return unit == Unit::VU0 ? mem.getVU0Data() : mem.getVU1Data(); }
++        uint32_t dataSize() const { return unit == Unit::VU0 ? PS2_VU0_DATA_SIZE : PS2_VU1_DATA_SIZE; }
++        uint64_t generation() const
++        {
++            return unit == Unit::VU0 ? mem.getVU0CodeGeneration() : mem.getVU1CodeGeneration();
++        }
++
++        bool initialize(const std::vector<uint8_t> &code, bool compiled)
++        {
++            if (!mem.initialize())
++                return false;
++            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
++            std::memcpy(this->code(), code.data(), codeSize());
++            if (unit == Unit::VU0)
++            {
++                mem.markVU0CodeModified();
++                // A VU0 reset keeps find()'s answers, and this memory may reuse
++                // an earlier one's address and generation.
++                ps2_vu_program::forgetRoutines();
++            }
++            else
++                mem.markVU1CodeModified();
++            mem.setGifPacketCallback([this](const uint8_t *data, uint32_t size)
++                                     { packets.emplace_back(data, data + size); });
++            vu.setCompiledExecutionEnabled(compiled);
++            return true;
++        }
++
++        void reset(const VU1State &initial, const std::vector<uint8_t> &data)
++        {
++            vu.reset();
++            vu.state() = initial;
++            std::memcpy(this->data(), data.data(), dataSize());
++            packets.clear();
++        }
++
++        void start(uint32_t pc, uint32_t cycles)
++        {
++            vu.execute(code(), codeSize(), data(), dataSize(), gs, &mem, pc, 0u, 0u, cycles);
++        }
++
++        void resume(uint32_t cycles)
++        {
++            vu.resume(code(), codeSize(), data(), dataSize(), gs, &mem, 0u, 0u, cycles);
++        }
++
++        uint64_t cycles() const { return vu.state().cycles; }
++    };
++
++    bool same(Side &native, Side &oracle)
++    {
++        return std::memcmp(&native.vu.state(), &oracle.vu.state(), sizeof(VU1State)) == 0 &&
++               std::memcmp(native.data(), oracle.data(), native.dataSize()) == 0 &&
++               native.packets == oracle.packets;
++    }
++
++    std::string describe(const ProgramEntry &entry, uint64_t budget, const Side &oracle)
++    {
++        std::ostringstream text;
++        text << (entry.unit == Unit::VU0 ? "VU0 " : "VU1 ") << entry.name << " entry 0x" << std::hex << entry.pc << std::dec << ", budget " << budget
++             << ", cycle " << oracle.cycles();
++        return text.str();
++    }
++
++    // What differs, compiled first, so that a failure says where to look.
++    std::string difference(Side &native, Side &oracle)
++    {
++        const VU1State &a = native.vu.state(), &b = oracle.vu.state();
++        std::ostringstream text;
++        const auto differs = [](const void *x, const void *y, size_t size) { return std::memcmp(x, y, size) != 0; };
++        const auto both = [&](const char *name, uint64_t x, uint64_t y) {
++            if (x != y)
++                text << ' ' << name << " 0x" << std::hex << x << "/0x" << y << std::dec;
++        };
++        both("pc", a.pc, b.pc);
++        both("cycles", a.cycles, b.cycles);
++        both("mac", a.mac, b.mac);
++        both("status", a.status, b.status);
++        both("clip", a.clip, b.clip);
++        both("ebit", a.ebit, b.ebit);
++        both("branch", a.branchPending, b.branchPending);
++        both("target", a.branchTarget, b.branchTarget);
++        both("delay", a.branchDelay, b.branchDelay);
++        bool shown = false;
++        for (uint32_t reg = 0u; reg < 32u; ++reg)
++            if (differs(a.vf[reg], b.vf[reg], sizeof(a.vf[reg])))
++            {
++                text << " vf" << reg;
++                // The first one in full, as bit patterns.
++                for (const VU1State *state : {shown ? nullptr : &a, shown ? nullptr : &b})
++                    if (state)
++                    {
++                        uint32_t bits[4];
++                        std::memcpy(bits, state->vf[reg], sizeof(bits));
++                        text << (state == &a ? " (" : " / ") << std::hex << bits[0] << ' ' << bits[1] << ' '
++                             << bits[2] << ' ' << bits[3] << std::dec << (state == &a ? "" : ")");
++                    }
++                shown = true;
++            }
++        for (uint32_t reg = 0u; reg < 16u; ++reg)
++            both(("vi" + std::to_string(reg)).c_str(), static_cast<uint32_t>(a.vi[reg]), static_cast<uint32_t>(b.vi[reg]));
++        if (differs(a.acc, b.acc, sizeof(a.acc)))
++            text << " acc";
++        for (const auto &[name, x, y] : {std::tuple{"q", &a.q, &b.q}, {"p", &a.p, &b.p}, {"i", &a.i, &b.i}})
++            if (differs(x, y, sizeof(float)))
++                text << ' ' << name;
++        for (uint32_t qword = 0u; qword < native.dataSize() / 16u; ++qword)
++            if (differs(native.data() + qword * 16u, oracle.data() + qword * 16u, 16u))
++            {
++                text << " data qword 0x" << std::hex << qword << std::dec;
++                break;
++            }
++        both("packets", native.packets.size(), oracle.packets.size());
++        return text.str();
++    }
++
++    // Record a failure like IsTrue, and say whether to go on: after the first
++    // difference the rest of an entry only repeats it.
++    bool check(TestCase &t, bool condition, const std::string &message)
++    {
++        t.IsTrue(condition, message);
++        return condition;
++    }
++
++    bool matches(TestCase &t, Side &native, Side &oracle, const std::string &message)
++    {
++        if (same(native, oracle))
++            return true;
++        t.Fail(message + " (compiled/interpreted:" + difference(native, oracle) + ")");
++        return false;
++    }
++
++    void checkEntry(TestCase &t, const ProgramEntry &entry, bool require)
++    {
++        Side native(entry.unit), oracle(entry.unit);
++        if (!native.initialize(entry.code, true) || !oracle.initialize(entry.code, false))
++        {
++            t.Fail("VU fixtures should initialize");
++            return;
++        }
++        if (require)
++            t.IsTrue(ps2_vu_program::find(native.code(), native.codeSize(), entry.pc, native.generation()) != nullptr,
++                     describe(entry, 0u, oracle) + ": the entry has a compiled routine");
++        const VU1State initial = initialState();
++        const std::vector<uint8_t> data = initialData(entry.unit);
++
++        // One uninterrupted run gives the cycle the program ends on.
++        oracle.reset(initial, data);
++        native.reset(initial, data);
++        oracle.start(entry.pc, kWideBudget);
++        native.start(entry.pc, kWideBudget);
++        const uint64_t end = oracle.cycles();
++        if (!check(t, end < kWideBudget, describe(entry, kWideBudget, oracle) + ": the program ends") ||
++            !matches(t, native, oracle, describe(entry, kWideBudget, oracle) + ": uninterrupted run"))
++            return;
++        if (require)
++            t.IsTrue(native.vu.compiledPairsExecuted() != 0u, describe(entry, kWideBudget, oracle) + ": ran compiled");
++        const VU1State finalState = oracle.vu.state();
++        const std::vector<uint8_t> finalData(oracle.data(), oracle.data() + oracle.dataSize());
++        const auto finalPackets = oracle.packets;
++
++        // A VU0 macro call or an MSCAL starts the next program without a reset,
++        // so the same program again on the same unit ends the same, its clock aside.
++        const uint64_t firstEnd = native.cycles();
++        native.vu.state() = initial;
++        std::memcpy(native.data(), data.data(), native.dataSize());
++        native.packets.clear();
++        native.start(entry.pc, kWideBudget);
++        VU1State again = native.vu.state();
++        again.cycles -= firstEnd;
++        if (!check(t, std::memcmp(&again, &finalState, sizeof(VU1State)) == 0 &&
++                           std::memcmp(native.data(), finalData.data(), native.dataSize()) == 0 &&
++                           native.packets == finalPackets,
++                   describe(entry, kWideBudget, oracle) + ": a second run without a reset ends like the first"))
++            return;
++
++        // A budget the program outlasts stops it at a block boundary and the
++        // interpreter takes over; then the rest in uneven slices.
++        std::vector<uint64_t> budgets;
++        if (end > ps2_vu_program::kMinimumBudget)
++        {
++            const uint64_t span = end - ps2_vu_program::kMinimumBudget;
++            budgets = {ps2_vu_program::kMinimumBudget, ps2_vu_program::kMinimumBudget + span / 3u,
++                       ps2_vu_program::kMinimumBudget + span * 2u / 3u, end - 1u};
++            budgets.erase(std::unique(budgets.begin(), budgets.end()), budgets.end());
++        }
++        for (const uint64_t budget : budgets)
++        {
++            oracle.reset(initial, data);
++            native.reset(initial, data);
++            oracle.start(entry.pc, static_cast<uint32_t>(budget));
++            native.start(entry.pc, static_cast<uint32_t>(budget));
++            if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": stopped by the budget"))
++                return;
++            for (uint32_t slice : {1u, 2u, 3u, 5u, 8u, 13u, kWideBudget})
++            {
++                while (oracle.cycles() < end)
++                {
++                    const uint32_t cycles = static_cast<uint32_t>(std::min<uint64_t>(slice, end - oracle.cycles()));
++                    oracle.resume(cycles);
++                    native.resume(cycles);
++                    if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": resumed"))
++                        return;
++                    if (slice != kWideBudget)
++                        break;
++                }
++            }
++            t.IsTrue(std::memcmp(&oracle.vu.state(), &finalState, sizeof(VU1State)) == 0 &&
++                         std::memcmp(oracle.data(), finalData.data(), oracle.dataSize()) == 0 &&
++                         oracle.packets == finalPackets,
++                     describe(entry, budget, oracle) + ": sliced run ends like the uninterrupted one");
++        }
++
++        // Budgets the program outlasts, every one at first and then every
++        // seventh: a routine hands back at the last block boundary that fits,
++        // possibly only a few cycles before the budget, with results in flight.
++        for (uint64_t budget = ps2_vu_program::kMinimumBudget; budget < end;
++             budget += budget < ps2_vu_program::kMinimumBudget + 2048u ? 1u : 7u)
++        {
++            oracle.reset(initial, data);
++            native.reset(initial, data);
++            oracle.start(entry.pc, static_cast<uint32_t>(budget));
++            native.start(entry.pc, static_cast<uint32_t>(budget));
++            if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": stopped by every budget"))
++                return;
++            oracle.resume(kWideBudget);
++            native.resume(kWideBudget);
++            if (!matches(t, native, oracle, describe(entry, budget, oracle) + ": finished after every budget"))
++                return;
++        }
++    }
++
++    // The target comes from VU memory, so only running the code finds it.
++    void checkJumpRecording(TestCase &t, Unit unit)
++    {
++        constexpr uint32_t kLowerNop = 0x8000033Cu;
++        constexpr uint32_t kUpperNop = 0x000002FFu;
++        constexpr uint32_t kEBit = 0x40000000u;
++        std::vector<uint8_t> code(unit == Unit::VU0 ? PS2_VU0_CODE_SIZE : PS2_VU1_CODE_SIZE, 0u);
++        const auto pair = [&code](uint32_t pc, uint32_t lower, uint32_t upper)
++        {
++            std::memcpy(&code[pc], &lower, sizeof(lower));
++            std::memcpy(&code[pc + 4u], &upper, sizeof(upper));
++        };
++        for (uint32_t pc = 0u; pc < 0x210u; pc += 8u)
++            pair(pc, kLowerNop, kUpperNop);
++        pair(0x000u, 0x09010010u, kUpperNop); // ILW.x vi1, 0x10(vi0)
++        pair(0x028u, 0x48000800u, kUpperNop); // JR vi1
++        pair(0x200u, kLowerNop, kUpperNop | kEBit);
++        std::vector<uint8_t> data = initialData(unit);
++        const uint32_t target = 0x200u / 8u;
++        std::memcpy(&data[0x10u * 16u], &target, sizeof(target));
++
++        const std::filesystem::path directory =
++            std::filesystem::temp_directory_path() / "ps2x-vu-jump-recording";
++        std::filesystem::remove_all(directory);
++        ps2_vu_program::setProfileDirectory(directory.string());
++        Side side(unit);
++        t.IsTrue(side.initialize(code, true), "memory initializes");
++        side.reset(initialState(), data);
++        side.start(0u, kWideBudget);
++        ps2_vu_program::setProfileDirectory({});
++
++        std::ifstream entries(directory / "entries.txt");
++        std::string hash;
++        std::string pc;
++        bool recorded = false;
++        while (entries >> hash >> pc)
++            recorded = recorded || pc == "200";
++        t.IsTrue(recorded,
++                 std::string(unit == Unit::VU0 ? "VU0" : "VU1") + ": the jump target 0x200 is saved as an entry");
++        entries.close(); // Windows will not delete a file that is still open
++        std::filesystem::remove_all(directory);
++    }
++}
++
++void register_ps2_vu1_program_tests()
++{
++    MiniTest::Case("PS2VU1Programs", [](TestCase &tc)
++    {
++        tc.Run("compiled routines match the interpreter on authored programs", [](TestCase &t)
++        {
++            std::string error;
++            const auto entries = loadEntries(error);
++            t.IsTrue(error.empty(), error);
++            const bool require = std::getenv("PS2_VU_REQUIRE_PROGRAMS") != nullptr;
++            if (require)
++                t.IsTrue(!entries.empty(), "PS2_VU_PROGRAM_FIXTURES names the compiled programs");
++            for (const auto &entry : entries)
++                checkEntry(t, entry, require);
++        });
++
++        tc.Run("a recording notes where register jumps land, on both units", [](TestCase &t)
++        {
++            for (const Unit unit : {Unit::VU1, Unit::VU0})
++                checkJumpRecording(t, unit);
++        });
++    });
++}
++
+diff --git a/ps2xTest/src/ps2_vu1_tests.cpp b/ps2xTest/src/ps2_vu1_tests.cpp
+index 30918bc..c7640de 100644
+--- a/ps2xTest/src/ps2_vu1_tests.cpp
++++ b/ps2xTest/src/ps2_vu1_tests.cpp
+@@ -1844,5 +1844,59 @@ void register_ps2_vu1_tests()
+             t.Equals(vu1.state().vi[1], 0,
+                      "instruction following a reserved opcode must not execute");
+         });
++
++        tc.Run("execute and reset start a program with nothing in flight", [](TestCase &t)
++        {
++            Vu1Fixture fx;
++            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
++
++            // At 0: ILW.x vi2 and ADD.x vf3, both still in flight a cycle later.
++            // At 0x100: IADDIU vi3, vi2, 1 and ADD.x vf4, vf3, vf3, which read them, then E.
++            const uint32_t word = 7u;
++            std::memcpy(fx.data, &word, sizeof(word));
++            writeVuInstructionPair(fx.code, 0u, makeVuIlw(0x8u, 2u, 0u, 0), makeVuUpper(0x28u, 0x8u, 2u, 1u, 3u));
++            writeVuInstructionPair(fx.code, 0x100u, makeVuIaddiu(3u, 2u, 1),
++                                   makeVuUpper(0x28u, 0x8u, 3u, 3u, 4u) | 0x40000000u);
++            writeVuInstructionPair(fx.code, 0x108u, 0u, kVuUpperNop);
++
++            const auto runReader = [&](VU1Interpreter &vu)
++            {
++                vu.state().vf[1][0] = 1.0f;
++                vu.state().vf[2][0] = 2.0f;
++                vu.state().vf[3][0] = 10.0f;
++                vu.state().vi[2] = 5;
++                const uint64_t start = vu.state().cycles;
++                vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                           0x100u, 0u, 0u, 64u);
++                return vu.state().cycles - start;
++            };
++            VU1Interpreter fresh;
++            const uint64_t freshCycles = runReader(fresh);
++            const auto matchesFresh = [&](VU1Interpreter &vu, uint64_t cycles, const char *what)
++            {
++                const std::string prefix = what;
++                t.Equals(vu.state().vf[4][0], 20.0f, prefix + ": ADD reads the VF value the program started with");
++                t.Equals(vu.state().vi[3], 6, prefix + ": IADDIU reads the VI value the program started with");
++                t.Equals(vu.state().vf[3][0], 10.0f, prefix + ": an earlier program's VF write never lands");
++                t.Equals(vu.state().vi[2], 5, prefix + ": an earlier program's VI write never lands");
++                t.Equals(cycles, freshCycles, prefix + ": nothing earlier stalls the program");
++            };
++
++            matchesFresh(fresh, freshCycles, "fresh unit");
++
++            // Stopped one cycle in, with both writes still pending.
++            VU1Interpreter interrupted;
++            interrupted.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                                0u, 0u, 0u, 1u);
++            matchesFresh(interrupted, runReader(interrupted), "after an interrupted program");
++
++            // Both writes landed, then a reset rewinds the clock to before their ready cycles.
++            VU1Interpreter rewound;
++            rewound.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
++                            0u, 0u, 0u, 16u);
++            t.Equals(rewound.state().vi[2], 7, "the first program's ILW lands within its budget");
++            rewound.reset();
++            matchesFresh(rewound, runReader(rewound), "after a reset");
++        });
+     });
+ }
+diff --git a/tools/compile_vu_programs.py b/tools/compile_vu_programs.py
+new file mode 100644
+index 0000000..a1f1d5b
+--- /dev/null
++++ b/tools/compile_vu_programs.py
+@@ -0,0 +1,600 @@
++#!/usr/bin/env python3
++"""Compile VU0 and VU1 microprogram routines to C++ from locally recorded microcode.
++
++Inputs are directories written by a run with PS2_VU_PROGRAM_PROFILE set: code
++images named vu1-<hash>.code (16 KiB) or vu0-<hash>.code (4 KiB) and an
++entries.txt of "<hash> <pc>" lines. A routine is the code reachable from one entry through branches; calls
++and register jumps end it, and their targets become routines of their own.
++The output is generated from game microcode and must stay local.
++"""
++
++import argparse
++import struct
++from pathlib import Path
++
++# Code image size by unit; VU data memory has the same size.
++CODE_SIZES = {"vu0": 4096, "vu1": 16384}
++# Run::kMaxBlockPairs: each block reserves flag queue room for its pairs.
++MAX_BLOCK_PAIRS = 128
++# Pairs compiled as one function; longer routines are compiled in chunks.
++# Optimizers slow down sharply on long functions: MSVC 14.51 spent an hour
++# on one 498-pair routine, most of it in a single SSA pass, and 18 seconds
++# on 127 pairs.
++MAX_ROUTINE_PAIRS = 256
++BRANCHES = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
++CONDITIONAL = {0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
++CALLS = {0x21, 0x25}
++REGISTER_JUMPS = {0x24, 0x25}
++LOWER_OPS = {0x00, 0x01, 0x04, 0x05, 0x08, 0x09, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
++             0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C} | BRANCHES
++LOWER_DIRECT = {0x30, 0x31, 0x32, 0x34, 0x35}
++# The EFU operations and WAITP; 0x77 and 0x7F are unassigned.
++EFU_SPECIAL = set(range(0x70, 0x77)) | set(range(0x78, 0x7F))
++LOWER_SPECIAL = {0x30, 0x31, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
++                 0x3E, 0x3F, 0x64, 0x68, 0x69, 0x6C} | EFU_SPECIAL
++FDIV_SPECIAL = {0x38, 0x39, 0x3A, 0x3B}
++# Reserved on VU0, which has no EFU, MFP or XGKICK; the interpreter reports them.
++VU0_RESERVED_SPECIAL = EFU_SPECIAL | {0x64, 0x6C}
++
++
++def upper_supported(upper):
++    op = upper & 0x3F
++    if op <= 0x2F:
++        return True
++    if op < 0x3C:
++        return False
++    special = (upper & 3) | ((upper >> 4) & 0x7C)
++    return special <= 0x2A or special in (0x2C, 0x2D, 0x2E, 0x2F, 0x30)
++
++
++def lower_special(lower):
++    return (lower & 3) | ((lower >> 4) & 0x7C)
++
++
++def lower_supported(lower, vu0=False):
++    if lower in (0, 0x8000033C):
++        return True
++    op = lower >> 25
++    if op in LOWER_OPS:
++        return True
++    if op != 0x40:
++        return False
++    direct = lower & 0x3F
++    if direct in LOWER_DIRECT:
++        return True
++    if direct < 0x3C:
++        return False
++    special = lower_special(lower)
++    return special in LOWER_SPECIAL and not (vu0 and special in VU0_RESERVED_SPECIAL)
++
++
++class Pair:
++    __slots__ = ("lower", "upper", "vu0")
++
++    def __init__(self, lower, upper, vu0=False):
++        self.lower = lower
++        self.upper = upper
++        self.vu0 = vu0
++
++    @property
++    def immediate(self):
++        return bool(self.upper & 0x80000000)
++
++    @property
++    def ebit(self):
++        return bool(self.upper & 0x40000000)
++
++    @property
++    def op(self):
++        return None if self.immediate else self.lower >> 25
++
++    @property
++    def branch(self):
++        return self.op in BRANCHES
++
++    @property
++    def supported(self):
++        return upper_supported(self.upper) and (self.immediate or lower_supported(self.lower, self.vu0))
++
++    @property
++    def word(self):
++        return self.lower | (self.upper << 32)
++
++    def branch_target(self, index, pairs):
++        offset = self.lower & 0x7FF
++        if offset & 0x400:
++            offset -= 0x800
++        return (index + 1 + offset) & (pairs - 1)
++
++    def stall_bound(self):
++        """Cycles the pair can take, stalls included, ignoring PATH1 waits."""
++        bound = 5
++        if self.immediate or self.lower >> 25 != 0x40 or (self.lower & 0x3F) < 0x3C:
++            return bound
++        special = lower_special(self.lower)
++        if special in FDIV_SPECIAL:
++            bound += 13
++        if special in EFU_SPECIAL:
++            bound += 54
++        if special == 0x6C:
++            bound += 8192
++        return bound
++
++
++def load_images(directories, parser):
++    images = {}
++    entries = []
++    for directory in directories:
++        listing = directory / "entries.txt"
++        if not listing.is_file():
++            parser.error(f"{directory}: no entries.txt; record with PS2_VU_PROGRAM_PROFILE")
++        for number, line in enumerate(listing.read_text().splitlines(), 1):
++            fields = line.split()
++            if not fields:
++                continue
++            try:
++                name, pc = fields[0], int(fields[1], 16)
++            except (IndexError, ValueError):
++                parser.error(f"{listing}:{number}: expected '<hash> <pc>'")
++            if name not in images:
++                found = [unit for unit in CODE_SIZES if (directory / f"{unit}-{name}.code").is_file()]
++                if len(found) != 1:
++                    parser.error(f"{directory}: expected one of vu0-{name}.code and vu1-{name}.code")
++                unit = found[0]
++                data = (directory / f"{unit}-{name}.code").read_bytes()
++                if len(data) != CODE_SIZES[unit]:
++                    parser.error(f"{directory}/{unit}-{name}.code: expected {CODE_SIZES[unit]} bytes")
++                images[name] = [Pair(*struct.unpack_from("<II", data, i), vu0=unit == "vu0")
++                                for i in range(0, len(data), 8)]
++            if pc % 8 or pc >= len(images[name]) * 8:
++                parser.error(f"{listing}:{number}: invalid entry {pc:#x}")
++            entries.append((name, pc // 8))
++    return images, entries
++
++
++def constant_target(pairs, block_start, jump_index):
++    """Resolve a register jump set by IADDIU from VI0 earlier in its block."""
++    reg = (pairs[jump_index].lower >> 11) & 15
++    mask = len(pairs) - 1
++    if reg == 0:
++        return 0
++    for index in range(jump_index - 1, block_start - 1, -1):
++        pair = pairs[index]
++        if pair.immediate:
++            continue
++        lower = pair.lower
++        op = lower >> 25
++        writes = None
++        if op in (0x04, 0x08, 0x09):
++            writes = (lower >> 16) & 15
++        elif op in (0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C):
++            writes = (lower >> 16) & 15
++        elif op in (0x10, 0x12, 0x13):
++            writes = 1
++        elif op == 0x40:
++            direct = lower & 0x3F
++            if direct in (0x30, 0x31, 0x34, 0x35):
++                writes = (lower >> 6) & 15
++            elif direct == 0x32:
++                writes = (lower >> 16) & 15
++            elif direct >= 0x3C:
++                special = lower_special(lower)
++                if special in (0x34, 0x36):
++                    writes = (lower >> 11) & 15
++                elif special in (0x35, 0x37, 0x3C, 0x3E, 0x68, 0x69):
++                    writes = (lower >> 16) & 15
++        if writes != reg:
++            continue
++        if op == 0x08 and (lower >> 11) & 15 == 0:
++            return ((lower & 0x7FF) | ((lower >> 10) & 0x7800)) & mask
++        return None
++    return None
++
++
++class Routine:
++    def __init__(self, pairs, entry):
++        self.pairs = pairs
++        self.entry = entry
++        self.blocks = {}   # start -> (pair indices, terminator)
++        self.calls = set() # further routine entries this one can reach
++        self.build()
++
++    def terminates(self, index):
++        """Why the straight line from index cannot simply continue, if at all."""
++        pair = self.pairs[index]
++        if not pair.supported or index + 1 >= len(self.pairs):
++            return ("leave",)
++        if pair.branch or pair.ebit:
++            delay = self.pairs[index + 1]
++            if not delay.supported or delay.branch or delay.ebit or index + 2 > len(self.pairs):
++                return ("leave",)
++        return None
++
++    def build(self):
++        leaders = {self.entry}
++        work = [self.entry]
++        visited = set()
++        while work:
++            index = work.pop()
++            while index not in visited:
++                visited.add(index)
++                if self.terminates(index):
++                    break
++                pair = self.pairs[index]
++                if pair.branch:
++                    op = pair.op
++                    targets = []
++                    if op in (0x20,) + tuple(CONDITIONAL):
++                        targets.append(pair.branch_target(index, len(self.pairs)))
++                    if op in CONDITIONAL:
++                        targets.append(index + 2)
++                    if not pair.ebit:
++                        for target in targets:
++                            if target not in leaders:
++                                leaders.add(target)
++                                work.append(target)
++                    break
++                if pair.ebit:
++                    break
++                index += 1
++                if index >= len(self.pairs):
++                    break
++        pending = sorted(leaders)
++        while pending:
++            start = pending.pop()
++            if start in self.blocks:
++                continue
++            self.blocks[start] = body, terminator = self.walk(start, leaders)
++            # A long straight run was cut; the rest becomes a block of its own.
++            if terminator[0] == "fall" and terminator[1] not in leaders:
++                leaders.add(terminator[1])
++                pending.append(terminator[1])
++
++    def walk(self, start, leaders):
++        body = []
++        index = start
++        while True:
++            # Room for a branch and its delay slot must remain.
++            if len(body) >= MAX_BLOCK_PAIRS - 1:
++                return body, ("fall", index)
++            reason = self.terminates(index)
++            if reason:
++                return body, ("leave", index)
++            pair = self.pairs[index]
++            if pair.branch:
++                body += [index, index + 1]
++                op = pair.op
++                after = index + 2
++                if op in REGISTER_JUMPS:
++                    target = constant_target(self.pairs, start, index)
++                    if op in CALLS:
++                        self.calls.add(after)
++                    if target is not None:
++                        self.calls.add(target)
++                    kind = "call" if op in CALLS else "jump"
++                    return body, (kind, target, pair.ebit)
++                target = pair.branch_target(index, len(self.pairs))
++                if op == 0x21:
++                    self.calls.update((target, after))
++                    return body, ("call", target, pair.ebit)
++                if pair.ebit:
++                    return body, ("end-branch", target, op in CONDITIONAL, after)
++                if op == 0x20:
++                    return body, ("goto", target)
++                return body, ("cond", target, after)
++            if pair.ebit:
++                body += [index, index + 1]
++                return body, ("end", index + 2)
++            body.append(index)
++            index += 1
++            if index in leaders:
++                return body, ("fall", index)
++
++    def footprint(self):
++        indices = set()
++        for body, terminator in self.blocks.values():
++            indices.update(body)
++            if terminator[0] == "leave":
++                indices.add(terminator[1])
++        return sorted(indices)
++
++    def key(self):
++        # The code size keeps VU0 and VU1 routines apart.
++        return (self.entry, len(self.pairs), tuple((i, self.pairs[i].word) for i in self.footprint()))
++
++
++def fnv(values):
++    value = 14695981039346656037
++    for item in values:
++        for byte in struct.pack("<Q", item):
++            value = ((value ^ byte) * 1099511628211) & (2**64 - 1)
++    return value
++
++
++def pc(index):
++    return f"0x{index * 8:04X}u"
++
++
++def successors(terminator):
++    """The blocks a block continues at within its routine, straight line first."""
++    kind = terminator[0]
++    if kind in ("fall", "goto"):
++        return [terminator[1]]
++    if kind == "cond":
++        return [terminator[2], terminator[1]]
++    return []
++
++
++def loops(routine):
++    """Each block's strongly connected component, as a frozenset of block starts."""
++    # Tarjan's algorithm without recursion: a routine can chain over a
++    # thousand blocks, deeper than Python's recursion limit.
++    index, low, stack, on_stack, component = {}, {}, [], set(), {}
++    path = []
++
++    def enter(start):
++        index[start] = low[start] = len(index)
++        stack.append(start)
++        on_stack.add(start)
++        path.append((start, iter(successors(routine.blocks[start][1]))))
++
++    for root in sorted(routine.blocks):
++        if root in index:
++            continue
++        enter(root)
++        while path:
++            start, targets = path[-1]
++            target = next(targets, None)
++            if target is not None:
++                if target not in index:
++                    enter(target)
++                elif target in on_stack:
++                    low[start] = min(low[start], index[target])
++                continue
++            path.pop()
++            if path:
++                parent = path[-1][0]
++                low[parent] = min(low[parent], low[start])
++            if low[start] == index[start]:
++                members = []
++                while True:
++                    member = stack.pop()
++                    on_stack.discard(member)
++                    members.append(member)
++                    if member == start:
++                        break
++                for member in members:
++                    component[member] = frozenset(members)
++    return component
++
++
++def partition(routine, max_pairs):
++    """Cut a routine's blocks, in depth-first order, into runs of at most max_pairs pairs.
++
++    A loop that fits in one run stays in one, so that no iteration changes chunks.
++    """
++    order, seen, work = [], set(), [routine.entry]
++    while work:
++        start = work.pop()
++        if start in seen:
++            continue
++        seen.add(start)
++        order.append(start)
++        work.extend(reversed(successors(routine.blocks[start][1])))
++    component = loops(routine)
++    size_of = lambda starts: sum(len(routine.blocks[start][0]) for start in starts)
++    chunks, size, placed = [[]], 0, set()
++    for start in order:
++        if start in placed:
++            continue
++        unit = [start]
++        if len(component[start]) > 1 and size_of(component[start]) <= max_pairs:
++            unit = [member for member in order if member in component[start]]
++        pairs = size_of(unit)
++        if chunks[-1] and size + pairs > max_pairs:
++            chunks.append([])
++            size = 0
++        chunks[-1].extend(unit)
++        placed.update(unit)
++        size += pairs
++    return chunks
++
++
++def emit_routine(routine, name, max_pairs):
++    pairs = routine.pairs
++    # The entry block comes first; every other block is reached by goto.
++    blocks = sorted(routine.blocks, key=lambda start: start != routine.entry)
++    chunks = [blocks]
++    if sum(len(body) for body, _ in routine.blocks.values()) > max_pairs:
++        chunks = partition(routine, max_pairs)
++    chunk_of = {start: index for index, chunk in enumerate(chunks) for start in chunk}
++    # Where each chunk can be entered: its first block, then blocks other chunks branch to.
++    entries = [[chunk[0]] for chunk in chunks]
++    for start, (_, terminator) in sorted(routine.blocks.items()):
++        for target in successors(terminator):
++            chunk = chunk_of[target]
++            if chunk != chunk_of[start] and target not in entries[chunk]:
++                entries[chunk].append(target)
++    targets = {start for entry in entries for start in entry[1:]}
++    for start, (_, terminator) in routine.blocks.items():
++        targets.update(target for target in successors(terminator) if chunk_of[target] == chunk_of[start])
++    assert len(chunks) < 256 and all(len(entry) < 256 for entry in entries)
++
++    def jump(source, target):
++        chunk = chunk_of[target]
++        if chunk == chunk_of[source]:
++            return f"goto b_{target:04x};"
++        # The routine's own function continues with the chunk holding the target.
++        return f"return p.exit(0x{0x10000 | chunk << 8 | entries[chunk].index(target):05X}u);"
++
++    # Pairs are named by block and position, which lets each one see the pairs
++    # issued before it in the block.
++    tables = []
++    lines = []
++
++    def emit_block(start):
++        body, terminator = routine.blocks[start]
++        table = f"{name}_{start:04x}"
++        if body:
++            words = ", ".join(f"0x{pairs[i].word:016x}ull" for i in body)
++            mask = "" if len(pairs) == CODE_SIZES["vu1"] // 8 else f", 0x{len(pairs) * 8 - 1:04X}u"
++            tables.append(f"constexpr Block<{len(body)}> {table}{{{pc(start)}, {{{words}}}{mask}}};")
++
++        def emit_pair(index, next_pc, checked=True):
++            call = f"p.pair<{table}, {index - start}>({next_pc})"
++            # A GIF callback that rewrote microcode sends the rest to the interpreter.
++            return f"    if (!{call}) return p.leaveStale();" if checked else f"    {call};"
++
++        margin = sum(pairs[i].stall_bound() for i in body) + 1
++        if start in targets:
++            lines.append(f"b_{start:04x}:")
++        lines.append(f"    if (!p.fits<{margin}u, {len(body)}u>()) return p.leave({pc(start)});")
++        kind = terminator[0]
++        tail = [] if kind in ("fall", "leave") else body[-2:]
++        for index in body[:len(body) - len(tail)]:
++            lines.append(emit_pair(index, pc(index + 1)))
++        if kind == "leave":
++            lines.append(f"    return p.leave({pc(terminator[1])});")
++            return
++        if kind == "fall":
++            lines.append(f"    {jump(start, terminator[1])}")
++            return
++
++        first, delay = tail
++        if kind == "end":
++            # Once the delay slot has issued the program is over either way.
++            lines.append(emit_pair(first, pc(delay)))
++            lines.append(emit_pair(delay, pc(terminator[1]), checked=False))
++            lines.append(f"    return p.end({pc(terminator[1])});")
++            return
++
++        # A branch and its delay slot. The E bit on the branch ends the program
++        # once the delay slot has issued.
++        if kind in ("call", "jump"):
++            target = pc(terminator[1]) if terminator[1] is not None else "p.jumpTarget()"
++            ending = terminator[2]
++        else:
++            target = pc(terminator[1])
++            ending = kind == "end-branch"
++        conditional = kind == "cond" or (kind == "end-branch" and terminator[2])
++        after = f"(p.taken() ? {target} : {pc(delay + 1)})" if conditional else target
++        lines.append(emit_pair(first, pc(delay)))
++        lines.append(emit_pair(delay, after, checked=not ending))
++        if ending:
++            lines.append(f"    return p.end({after});")
++        elif kind in ("call", "jump"):
++            lines.append(f"    return p.exit({after});")
++        elif kind == "goto":
++            lines.append(f"    {jump(start, terminator[1])}")
++        else:
++            lines.append(f"    if (p.taken()) {jump(start, terminator[1])}")
++            lines.append(f"    {jump(start, terminator[2])}")
++
++    if len(chunks) == 1:
++        lines += [f"uint32_t {name}(Run &run, uint64_t budgetEnd)", "{", "    Frame p(run, budgetEnd);"]
++        for start in blocks:
++            emit_block(start)
++        lines.append("}")
++        return tables + lines
++
++    # Optimizers take far longer than linear time on long functions, so a
++    # long routine is compiled as chunks of at most max_pairs pairs. A chunk
++    # hands over by returning 0x1CCEE, chunk CC entered at EE, which no PC is.
++    for index, chunk in enumerate(chunks):
++        lines += [f"static PS2_VU_CHUNK uint32_t {name}_c{index}(Run &run, uint64_t budgetEnd, uint32_t entry)",
++                  "{", "    Frame p(run, budgetEnd);"]
++        if len(entries[index]) > 1:
++            lines += ["    switch (entry)", "    {"]
++            lines += [f"    case {number}u: goto b_{start:04x};" for number, start in enumerate(entries[index]) if number]
++            lines += ["    default: break;", "    }"]
++        for start in chunk:
++            emit_block(start)
++        lines += ["}", ""]
++    lines += [f"uint32_t {name}(Run &run, uint64_t budgetEnd)", "{",
++              f"    uint32_t next = {name}_c0(run, budgetEnd, 0u);",
++              "    while (next >= 0x10000u)", "    {",
++              "        const uint32_t entry = next & 0xFFu;",
++              "        switch ((next >> 8u) & 0xFFu)", "        {"]
++    lines += [f"        case {index}u: next = {name}_c{index}(run, budgetEnd, entry); break;" for index in range(1, len(chunks))]
++    lines += [f"        default: next = {name}_c0(run, budgetEnd, entry); break;", "        }", "    }", "    return next;", "}"]
++    return tables + lines
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=Path, required=True,
++                        help="registry include; declarations and shards are written beside it")
++    parser.add_argument("--shards", type=int, default=4)
++    parser.add_argument("--max-routine-pairs", type=int, default=MAX_ROUTINE_PAIRS,
++                        help="pairs compiled as one function; longer routines are cut into chunks")
++    parser.add_argument("profiles", type=Path, nargs="*")
++    args = parser.parse_args()
++    if args.shards < 1:
++        parser.error("--shards must be positive")
++    if args.max_routine_pairs < MAX_BLOCK_PAIRS:
++        parser.error(f"--max-routine-pairs must be at least {MAX_BLOCK_PAIRS}")
++
++    images, entries = load_images(args.profiles, parser)
++    routines = {}
++    for name, entry in entries:
++        pairs = images[name]
++        work, seen = [entry], set()
++        while work:
++            start = work.pop()
++            if start in seen or start >= len(pairs):
++                continue
++            seen.add(start)
++            routine = Routine(pairs, start)
++            routines.setdefault(routine.key(), routine)
++            work.extend(routine.calls)
++
++    output = args.output
++    output.parent.mkdir(parents=True, exist_ok=True)
++    header = "// Generated from local VU microcode; do not distribute game data.\n"
++    ordered = sorted(routines.items(), key=lambda item: (item[0][0], item[0][1], fnv(w for _, w in item[0][2])))
++    names = [f"r_{fnv(w for _, w in key[2]):016x}_{i}" for i, (key, _) in enumerate(ordered)]
++
++    registry = [header]
++    externs = [header, "namespace ps2_vu_program::generated\n{\n"]
++    shards = [[header, '#include "ps2_vu1_program.h"\n\n', "namespace ps2_vu_program::generated\n{\n"]
++              for _ in range(args.shards)]
++    # Compile time follows pair count, so fill the lightest shard first,
++    # biggest routines first.
++    load = [0] * args.shards
++    assigned = {}
++    for (key, routine), name in sorted(zip(ordered, names), key=lambda item: (-len(item[0][1].footprint()), item[1])):
++        lightest = load.index(min(load))
++        assigned[name] = lightest
++        load[lightest] += len(routine.footprint())
++    for (key, routine), name in zip(ordered, names):
++        footprint = routine.footprint()
++        externs.append(f"extern const uint16_t {name}_pairs[];\n")
++        externs.append(f"extern const uint64_t {name}_words[];\n")
++        externs.append(f"uint32_t {name}(Run &, uint64_t);\n")
++        registry.append(f"{{{pc(routine.entry)}, {len(routine.pairs) * 8}u, {len(footprint)}u, generated::{name}_pairs, "
++                        f"generated::{name}_words, &generated::{name}}},\n")
++        shard = shards[assigned[name]]
++        shard.append(f"extern const uint16_t {name}_pairs[] = {{"
++                     + ", ".join(str(i) for i in footprint) + "};\n")
++        shard.append(f"extern const uint64_t {name}_words[] = {{"
++                     + ", ".join(f"0x{routine.pairs[i].word:016x}ull" for i in footprint) + "};\n")
++        shard.append("\n".join(emit_routine(routine, name, args.max_routine_pairs)) + "\n\n")
++    externs.append("}\n")
++    for shard in shards:
++        shard.append("}\n")
++        if any("PS2_VU_CHUNK" in part for part in shard):
++            # A chunk inlined into its routine would make the long function again.
++            shard.insert(2, "#if defined(_MSC_VER)\n#define PS2_VU_CHUNK __declspec(noinline)\n#else\n"
++                            "#define PS2_VU_CHUNK __attribute__((noinline))\n#endif\n\n")
++
++    output.write_text("".join(registry))
++    output.with_name(output.stem + "_extern.inc").write_text("".join(externs))
++    for index, shard in enumerate(shards):
++        output.with_name(f"{output.stem}_{index}.cpp").write_text("".join(shard))
++    pair_total = sum(len(r.footprint()) for r in routines.values())
++    print(f"compile_vu_programs: {len(routines)} routines, {pair_total} pairs from "
++          f"{len(entries)} entries in {len(images)} images")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/tests/test_compile_vu_programs.py b/tools/tests/test_compile_vu_programs.py
+new file mode 100644
+index 0000000..fddc94e
+--- /dev/null
++++ b/tools/tests/test_compile_vu_programs.py
+@@ -0,0 +1,264 @@
++"""Check how compile_vu_programs.py cuts VU0 and VU1 microcode into routines and blocks."""
++
++import importlib.util
++import re
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / "tools" / "compile_vu_programs.py"
++FIXTURES = ROOT / "ps2xTest" / "data" / "vu_programs.py"
++
++spec = importlib.util.spec_from_file_location("vu_programs", FIXTURES)
++vu = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(vu)
++
++
++def profile(directory, pairs, entries, unit="vu1", name="test"):
++    """Write one code image holding pairs from index 0, with the given entry indices."""
++    words = [(vu.LOWER_NOP, vu.UPPER_NOP)] * (vu.VU0_PAIRS if unit == "vu0" else vu.PAIRS)
++    for index, pair in enumerate(pairs):
++        words[index] = pair
++    (directory / f"{unit}-{name}.code").write_bytes(b"".join(struct.pack("<II", *pair) for pair in words))
++    with open(directory / "entries.txt", "a") as listing:
++        listing.write("".join(f"{name} {index * 8:x}\n" for index in entries))
++
++
++def compile_profile(directory, shards=1, options=()):
++    output = directory / "out" / "vu_programs.inc"
++    result = subprocess.run([sys.executable, str(SCRIPT), "--output", str(output), "--shards", str(shards),
++                             *options, str(directory)], capture_output=True, text=True)
++    return result, output
++
++
++def registered_pcs(output):
++    return {int(pc, 16) for pc in re.findall(r"^\{0x([0-9A-F]+)u,", output.read_text(), re.M)}
++
++
++def routines(output):
++    text = "".join(path.read_text() for path in sorted(output.parent.glob("vu_programs_*.cpp")))
++    return text, [int(pairs) for pairs in re.findall(r"p\.fits<\d+u, (\d+)u>", text)]
++
++
++class CompileVuProgramsTests(unittest.TestCase):
++    def test_fixture_programs_all_get_routines_and_the_output_is_stable(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            subprocess.run([sys.executable, str(FIXTURES), str(root / "fixtures")], check=True)
++            outputs = []
++            for name in ("a", "b"):
++                output = root / name / "vu_programs.inc"
++                subprocess.run([sys.executable, str(SCRIPT), "--output", str(output), "--shards", "3",
++                                str(root / "fixtures")], check=True, capture_output=True, text=True)
++                outputs.append([path.read_text() for path in sorted(output.parent.iterdir())])
++            self.assertEqual(outputs[0], outputs[1])
++            entries = {int(line.split()[1], 16)
++                       for line in (root / "fixtures" / "entries.txt").read_text().splitlines()}
++            self.assertLessEqual(entries, registered_pcs(root / "a" / "vu_programs.inc"))
++
++    def test_long_straight_runs_are_cut_into_blocks_that_fit_the_flag_queue(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)] * 300
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(sum(blocks), len(pairs))
++            self.assertEqual(max(blocks), 127)
++            self.assertIn("goto b_007f;", text)
++
++    def test_calls_and_constant_register_jumps_start_routines_of_their_own(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            pairs = [nop] * 24
++            pairs[0] = (vu.branch(0x21, vu.LINK, 0, 10 - 1), vu.UPPER_NOP)  # BAL to 10
++            pairs[2] = (vu.immediate15(0x08, vu.TARGET, 0, 20), vu.UPPER_NOP)
++            pairs[3] = (vu.branch(0x25, vu.LINK, vu.TARGET), vu.UPPER_NOP)  # JALR to 20
++            pairs[5] = (vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT)
++            pairs[10] = (vu.branch(0x24, 0, vu.LINK), vu.UPPER_NOP)  # JR
++            pairs[20] = (vu.branch(0x24, 0, vu.LINK), vu.UPPER_NOP)
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            # The entry, both callees, and the two places the calls return to.
++            self.assertEqual(registered_pcs(output), {0, 10 * 8, 2 * 8, 20 * 8, 5 * 8})
++            text, _ = routines(output)
++            self.assertEqual(text.count("return p.exit(p.jumpTarget());"), 2)
++
++    def test_an_unsupported_pair_hands_the_program_back_where_it_stands(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            rinit = (vu.lower_special(0x42, 1), vu.UPPER_NOP)
++            pairs = [nop, nop, nop, rinit, nop, (vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(blocks, [3])
++            self.assertIn("return p.leave(0x0018u);", text)
++
++    def test_every_assigned_efu_opcode_compiles_and_the_unassigned_ones_hand_back(self):
++        nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++        end = [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++        assigned = [op for op in range(0x70, 0x80) if op not in (0x77, 0x7F)]
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.lower_special(op, 1), vu.UPPER_NOP) for op in assigned] + end
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            _, blocks = routines(output)
++            self.assertEqual(blocks, [len(pairs)])
++        for op in (0x77, 0x7F):
++            with tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                profile(root, [nop, nop, (vu.lower_special(op, 1), vu.UPPER_NOP)] + end, [0])
++                result, output = compile_profile(root)
++                self.assertEqual(result.returncode, 0, result.stderr)
++                text, blocks = routines(output)
++                self.assertEqual(blocks, [2])
++                self.assertIn("return p.leave(0x0010u);", text)
++
++    def test_entries_must_be_pair_aligned_and_inside_code_memory(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            profile(root, [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT)], [0])
++            for line in ("test 4\n", "test 4000\n", "test\n"):
++                (root / "entries.txt").write_text(line)
++                result, _ = compile_profile(root)
++                self.assertNotEqual(result.returncode, 0)
++                self.assertRegex(result.stderr, "invalid entry|expected '<hash> <pc>'")
++
++    def test_vu0_routines_carry_their_code_size_and_mask(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            # B back by two from pair 0 lands on the last pair of VU0 code memory.
++            pairs = [(vu.branch(0x20, offset=-2), vu.UPPER_NOP), nop]
++            profile(root, pairs, [0], unit="vu0")
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            self.assertEqual(registered_pcs(output), {0})
++            self.assertIn("{0x0000u, 4096u, ", output.read_text())
++            text, _ = routines(output)
++            self.assertIn("0x0FFFu};", text)
++            self.assertIn(f"goto b_{vu.VU0_PAIRS - 1:04x};", text)
++
++    def test_vu0_hands_its_reserved_instructions_to_the_interpreter(self):
++        nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++        end = [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++        # EFU operations, WAITP, MFP and XGKICK exist on VU1 only.
++        for lower in (vu.lower_special(0x70, 1), vu.lower_special(0x7B), vu.lower_special(0x64, 0, 1, 15),
++                      vu.lower_special(0x6C, vu.KICK)):
++            for unit, blocks in (("vu1", [len(end) + 3]), ("vu0", [2])):
++                with tempfile.TemporaryDirectory() as directory:
++                    root = Path(directory)
++                    profile(root, [nop, nop, (lower, vu.UPPER_NOP)] + end, [0], unit=unit)
++                    result, output = compile_profile(root)
++                    self.assertEqual(result.returncode, 0, result.stderr)
++                    text, found = routines(output)
++                    self.assertEqual(found, blocks, f"{unit} {lower:#x}")
++                    self.assertEqual("return p.leave(0x0010u);" in text, unit == "vu0")
++
++    def test_the_same_code_on_both_units_gives_two_routines(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP), (vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT),
++                     (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0], unit="vu0", name="zero")
++            profile(root, pairs, [0], unit="vu1", name="one")
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            registry = output.read_text()
++            self.assertIn("{0x0000u, 4096u, ", registry)
++            self.assertIn("{0x0000u, 16384u, ", registry)
++
++    def test_a_code_image_must_have_its_unit_size(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            profile(root, [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT)], [0])
++            (root / "vu1-test.code").rename(root / "vu0-test.code")
++            result, _ = compile_profile(root)
++            self.assertNotEqual(result.returncode, 0)
++            self.assertIn("expected 4096 bytes", result.stderr)
++
++    def test_long_routines_are_compiled_in_chunks_that_continue_each_other(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)] * 600
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            # Still one routine, entered and checked as a whole.
++            self.assertEqual(registered_pcs(output), {0})
++            text, blocks = routines(output)
++            self.assertEqual(sum(blocks), len(pairs))
++            chunks = re.split(r"^static PS2_VU_CHUNK ", text, flags=re.M)[1:]
++            self.assertEqual(len(chunks), 3)
++            for chunk in chunks:
++                self.assertLessEqual(sum(int(n) for n in re.findall(r"p\.fits<\d+u, (\d+)u>", chunk)), 256)
++            self.assertIn("return p.exit(0x10100u);", text)
++            self.assertIn("return p.exit(0x10200u);", text)
++
++    def test_a_loop_that_fits_in_a_chunk_is_not_cut(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            work = (vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            pairs = [work] * 119 + [(vu.immediate15(0x08, 8, 0, 3), vu.UPPER_NOP)]
++            head = len(pairs)
++            # 150 pairs, which the compiler cuts into blocks of 127 and 23.
++            pairs += [work] * 147 + [(vu.immediate15(0x09, 8, 8, 1), vu.UPPER_NOP)]
++            pairs += [(vu.branch(0x29, 0, 8, head - (len(pairs) + 1)), vu.UPPER_NOP), nop]
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(sorted(blocks), [2, 23, 120, 127])
++            # Filling the first chunk would have cut the loop after its first block.
++            self.assertEqual(text.count("static PS2_VU_CHUNK"), 2)
++            self.assertIn(f"goto b_{head + 127:04x};", text)
++            self.assertIn(f"if (p.taken()) goto b_{head:04x};", text)
++
++    def test_routines_under_the_limit_compile_as_before(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            pairs = [(vu.immediate15(0x08, 2, 2, 1), vu.UPPER_NOP)] * 600
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), (vu.LOWER_NOP, vu.UPPER_NOP)]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root, options=("--max-routine-pairs", "1000"))
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, _ = routines(output)
++            self.assertNotIn("PS2_VU_CHUNK", text)
++            for limit in ("127", "x"):
++                result, _ = compile_profile(root, options=("--max-routine-pairs", limit))
++                self.assertNotEqual(result.returncode, 0)
++
++    def test_a_routine_of_a_thousand_chained_blocks_compiles(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            nop = (vu.LOWER_NOP, vu.UPPER_NOP)
++            # Each IBNE continues at the next block either way: all of code
++            # memory as one chain of 1,024 blocks.
++            pairs = [(vu.branch(0x29, offset=1), vu.UPPER_NOP), nop] * 1023
++            pairs += [(vu.LOWER_NOP, vu.UPPER_NOP | vu.E_BIT), nop]
++            profile(root, pairs, [0])
++            result, output = compile_profile(root)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            text, blocks = routines(output)
++            self.assertEqual(len(blocks), 1024)
++            self.assertEqual(text.count("static PS2_VU_CHUNK"), 8)
++
++
++if __name__ == "__main__":
++    unittest.main()

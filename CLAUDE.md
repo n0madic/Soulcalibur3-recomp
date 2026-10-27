@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp), on macOS arm64. This repository tracks a numbered series of patches against PS2Recomp, recompiler configuration, build/analysis scripts, and progress documentation. PS2Recomp itself, the original disc image, extracted game files, generated game code, recorded VU microcode, captures, working directories, and caches stay local and are excluded from Git by the root `.gitignore` source allowlist. `recomp/README.md` is the main document: it lists the patches, records findings and measurements, and lists the known gaps. Read it before changing anything, and add or update its row for every patch you change.
+A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp), on macOS arm64. This repository tracks a series of patches against PS2Recomp (one per problem area), recompiler configuration, build/analysis scripts, and progress documentation. PS2Recomp itself, the original disc image, extracted game files, generated game code, recorded VU microcode, captures, working directories, and caches stay local and are excluded from Git by the root `.gitignore` source allowlist. `recomp/README.md` is the main document: it lists the patches and the problem areas they belong to, records findings and measurements, and lists the known gaps. Read it before changing anything, and add or update its row (and its details) for every patch you change.
 
 ## Layout
 
 - `Makefile` has three targets: `make build` (runs `recomp/build.sh`), `make run` and `make ghidra`.
-- `recomp/NNNN-*.patch` is the patch series, applied in order to PS2Recomp at the commit in `recomp/PS2Recomp.commit`.
+- `recomp/series` lists the patch series that `build.sh` applies, in that order, to PS2Recomp at the commit in `recomp/PS2Recomp.commit`: 20 local patches `recomp/NNNN-<area>.patch` (the fixes of one problem area in one patch) and 14 upstream PRs in `recomp/upstream/NN-prNNN-*.patch`, interleaved. An upstream patch stays as the PR has it and is dropped when the PR is merged; local fixes of it go into a local patch after it. Until 2026-10-27 the series had 72 patches; `recomp/README.md` maps the former numbers (used in its investigation notes) to the current patches.
 - `recomp/debug/*.patch` are diagnostics that are never applied by default.
   - `diagnostics-scene-state.patch`: frame dumps and the `[TEMP-DEBUG globals]` scene/tick line.
   - `diagnostics-vu1-verify.patch`: `PS2_VU_VERIFY=1` shadows each compiled VU run with the interpreter.
@@ -25,7 +25,7 @@ A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ra
 
 ## Commands
 
-The first full build of the runner takes about 5 minutes (since patch 0047). Changing any runtime header recompiles all ~2100 generated units; ccache helps with this.
+The first full build of the runner takes about 5 minutes (since the Ghidra far-chunk fix in `0001-recompiler-function-boundaries-and-delay-slots`). Changing any runtime header recompiles all ~2100 generated units; ccache helps with this.
 
 Full build: extract the ISO, clone and patch PS2Recomp, recompile, build the runner.
 ```sh
@@ -61,11 +61,14 @@ PS2_TEST_REQUIRE_GPU=1 PS2_VU_PROGRAM_FIXTURES=<fixture dir> PS2_VU_REQUIRE_PROG
 
 ### Producing a patch
 
-`build.sh` applies `recomp/[0-9][0-9][0-9][0-9]-*.patch` only to a fresh clone. The working tree contains debug code, so do not diff it to make a patch. Instead:
-1. Make the change in a clean checkout at the base commit, with patches up to N-1 committed.
-2. Build and run the tests there.
-3. Write the patch with `git format-patch -1 --stdout > recomp/NNNN-name.patch`.
-4. Check that `debug/diagnostics-*.patch` still applies on top.
+**Add and fix patches inside the patch group of their area; do not stack a new patch for every fix.** A fix, extension or test for something an existing patch already covers is folded into that patch. Only a new problem area gets a new numbered patch. A patch that merely corrects another patch should have been part of it. Upstream patches are never edited; their local fixes go into a local patch of the same area.
+
+`build.sh` applies the patches of `recomp/series` only to a fresh clone. The working tree contains debug code, so do not diff it to make a patch. Instead:
+1. In a clean checkout at the base commit, apply the series with `git am --whitespace=nowarn` (the patches are mailbox files; one commit each), at least up to the patch of the area you change. A fix belongs to the patch of its area; an upstream patch is never edited.
+2. Make the change with its regression test, build and run the tests there.
+3. Fold the change into that patch's commit (`git commit --fixup=<commit>`, `git rebase -i --autosquash`) or, for a new area, commit it as a new patch; apply the rest of the series on top so that all of it still applies.
+4. Write each changed patch with `git format-patch -1 --stdout --no-signature --zero-commit > recomp/NNNN-<area>.patch`, and list a new patch in `recomp/series` (local: `NNNN-<area>.patch`, upstream: `upstream/NN-prNNN-<name>.patch`).
+5. Check that the series applied to the base commit gives the tree you tested, and that `debug/diagnostics-*.patch` still applies on top.
 
 ## Architecture (PS2Recomp as used here)
 
@@ -77,9 +80,9 @@ PS2_TEST_REQUIRE_GPU=1 PS2_VU_PROGRAM_FIXTURES=<fixture dir> PS2_VU_REQUIRE_PROG
   - A VBlank is a deadline that needs both the emulated cycle count and host wall time. Host time is the pacing source.
   - Events posted from other threads (`postEvent`) are handled in `processPendingEvents`, which runs between guest calls.
 - **Memory and hardware: `PS2Memory`.** It owns RAM, the I/O registers (an `unordered_map`), DMA, the VIF1 interpreter (`ps2_vif1_interpreter.cpp`) and the EE timers. The timer counters are brought up to date lazily, and Timer 3 counts H-blanks. GS privileged registers live in `GSRegisters`.
-- **Sound.** The game's own sound IRX modules run on the emulated IOP and drive the SPU2 emulation in `ps2xIOP` (`iop_spu2.cpp`, patches `0048`/`0049`), including AutoDMA for the ADX streams. Its output goes to a raylib `AudioStream`.
-- **Movies.** CRI Sofdec feeds its MPEG video bitstream to the IPU itself over the toIPU DMA (channel 4) and libmpeg's Nodata callback. `PS2Memory` hands that DMA to an IPU input sink, and the HLE `sceMpeg*` stubs decode it with FFmpeg (`0056`, `0061`, `0063`). Sofdec and ADX stream from disc in the ADX manager's idle thread, which needs `ResumeThread` to return the thread id (`0064`). Building with movies needs `ENABLE_FFMPEG=ON SKIP_INTRO=0 ./recomp/build.sh`.
-- **Graphics.** paraLLEl-GS (Vulkan via MoltenVK) is the default GS. `PS2_GS_BACKEND=cpu` selects the software GS. paraLLEl-GS publishes each vsync's picture one vsync later; the host window takes a picture only when a new one is published (`GS::latchNewHostPresentationFrame`, `0065`), not when the vsync tick changes. At every rate the game's final blit is replaced by its 32-bit source (`0069`; the paraLLEl-GS fixes `recomp/parallel-gs/gs/0001` and `0002`, tested by `0068` and `0072`, make the promotion work in game and skip it for blits that fade the picture or are split over two render passes). `PS2_GS_SSAA` defaults to 1: 4 or more (8 and 16 run as 4 on Apple GPUs) scans out at twice the resolution (`0066`) but cannot hold 60 frames/s in battle on an M1 Pro. The window smooths edges with SMAA (default, built from the paraLLEl-GS checkout's Granite, `0071`) or FXAA (`0070`) at the picture's own resolution (`PS2_HOST_AA`) and scales the picture with a bicubic shader (`PS2_HOST_FILTER`, `0067`).
+- **Sound.** The game's own sound IRX modules run on the emulated IOP and drive the SPU2 emulation in `ps2xIOP` (`iop_spu2.cpp`; `upstream/13-pr308-spu2` and `0015-spu2-autodma-and-audio-queue`), including AutoDMA for the ADX streams. Its output goes to a raylib `AudioStream`.
+- **Movies.** CRI Sofdec feeds its MPEG video bitstream to the IPU itself over the toIPU DMA (channel 4) and libmpeg's Nodata callback. `PS2Memory` hands that DMA to an IPU input sink, and the HLE `sceMpeg*` stubs decode it with FFmpeg (`0016-movies-mpeg-ipu`). Sofdec and ADX stream from disc in the ADX manager's idle thread, which needs `ResumeThread` to return the thread id (`0013-kernel-memory-and-dma`). Building with movies needs `ENABLE_FFMPEG=ON SKIP_INTRO=0 ./recomp/build.sh`.
+- **Graphics.** paraLLEl-GS (Vulkan via MoltenVK) is the default GS. `PS2_GS_BACKEND=cpu` selects the software GS. paraLLEl-GS publishes each vsync's picture one vsync later; the host window takes a picture only when a new one is published (`GS::latchNewHostPresentationFrame`, `0018-gs-presentation-and-super-sampling`), not when the vsync tick changes. At every rate the game's final blit is replaced by its 32-bit source (`0019-gs-backbuffer-promotion`; the paraLLEl-GS fixes `recomp/parallel-gs/gs/0001` and `0002`, tested by the same patch, make the promotion work in game and skip it for blits that fade the picture or are split over two render passes). `PS2_GS_SSAA` defaults to 1: 4 or more (8 and 16 run as 4 on Apple GPUs) scans out at twice the resolution (`0018`) but cannot hold 60 frames/s in battle on an M1 Pro. The window smooths edges with SMAA (default, built from the paraLLEl-GS checkout's Granite) or FXAA at the picture's own resolution (`PS2_HOST_AA`) and scales the picture with a bicubic shader (`PS2_HOST_FILTER`; all in `0020-host-picture-scaling-and-aa`).
 - **VU0/VU1.** There is an interpreter (`ps2xRuntime/src/lib/vu`), plus compiled routines. Microcode recorded with `PS2_VU_PROGRAM_PROFILE` is compiled into the runner by `tools/compile_vu_programs.py` (CMake `PS2X_VU_PROGRAM_PROFILES`). `ps2_vu_program::run` enters a compiled routine only from a drained pipeline. `Run::handBack` returns in-flight results to the interpreter in the interpreter's own view. `PS2_VU_EXECUTION=interpreter` disables the compiled routines.
 
 ## Measuring and debugging

@@ -10,6 +10,8 @@
 
 /recomp/*
 !/recomp/[0-9][0-9][0-9][0-9]-*.patch
+!/recomp/series
+!/recomp/upstream/
 !/recomp/PS2Recomp.commit
 !/recomp/parallel-gs.commit
 !/recomp/README.md
@@ -24,6 +26,8 @@
 
 /recomp/debug/*
 !/recomp/debug/diagnostics-*.patch
+/recomp/upstream/*
+!/recomp/upstream/[0-9][0-9]-*.patch
 /recomp/ghidra_scripts/*
 !/recomp/ghidra_scripts/*.java
 /recomp/parallel-gs/*

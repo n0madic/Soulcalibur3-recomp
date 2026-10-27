@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:28:20 +0200
+Subject: [PATCH] GS: backbuffer promotion at every rate, with its tests
+
+Former patches of the series, merged:
+- 0068: Tests: backbuffer promotion survives edge lines drawn after the blit
+- 0069: GS: scan out the blit's source at every rate, no super-sampling by default
+- 0072: Tests: a fade and a split blit do not make the frame lose its parts
+---
+ ps2xRuntime/include/runtime/gs/gs_parallel.h |   9 +-
+ ps2xRuntime/src/lib/gs/gs_parallel.cpp       |  11 +-
+ ps2xRuntime/src/lib/ps2_runtime.cpp          |   7 +-
+ ps2xTest/src/ps2_gs_parallel_tests.cpp       | 129 +++++++++++++++++--
+ 4 files changed, 131 insertions(+), 25 deletions(-)
+
+diff --git a/ps2xRuntime/include/runtime/gs/gs_parallel.h b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+index 7a8e0fa..e6ff148 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_parallel.h
++++ b/ps2xRuntime/include/runtime/gs/gs_parallel.h
+@@ -23,11 +23,10 @@ std::vector<uint64_t> gsBuildImageUploadPacket(uint64_t bitbltbuf, uint64_t trxp
+ // Image quality settings of the GPU renderer.
+ struct GSParallelOptions
+ {
+-    // Samples per pixel: 1, 4, 8 or 16. 1 scans out exactly what the game displays. With 4 or more the
+-    // picture is scanned out at twice its resolution from the samples (4: one per output pixel, 8 and
+-    // 16: averaged, which smooths polygon edges); a game's final blit of its frame into the display
+-    // buffer (often scaled down, 16-bit, or blended with the previous picture) is replaced by the
+-    // blit's source buffer, so that the samples reach the screen.
++    // Samples per pixel: 1, 4, 8 or 16. With 4 or more the picture is scanned out at twice its
++    // resolution from the samples (4: one per output pixel, 8 and 16: averaged, which smooths polygon
++    // edges). At every rate a game's final blit of its frame into the display buffer (often scaled
++    // down, 16-bit, or blended with the previous picture) is replaced by the blit's source buffer.
+     uint32_t superSampling = 1u;
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+index 5704361..1eb9268 100644
+--- a/ps2xRuntime/src/lib/gs/gs_parallel.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
+@@ -128,12 +128,11 @@ namespace
+                 return false;
+             }
+             m_gs.set_signal_interface(&m_signals);
+-            if (m_highResolution)
+-            {
+-                ParallelGS::Hacks hacks;
+-                hacks.backbuffer_promotion = true;
+-                m_gs.set_hacks(hacks);
+-            }
++            // The blit's source is scanned out at every rate: the display buffer it replaces is often 16-bit
++            // or blended with the previous picture.
++            ParallelGS::Hacks hacks;
++            hacks.backbuffer_promotion = true;
++            m_gs.set_hacks(hacks);
+             m_ready = true;
+             return true;
+         }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5635abb..31a0be1 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -721,16 +721,15 @@ bool PS2Runtime::selectGsRenderer()
+         return false;
+     }
+ 
+-    // 8x super-sampling by default: twice the resolution with smoothed edges, at no cost to the frame
+-    // rate on an M1 Pro. PS2_GS_SSAA=1 shows exactly what the game displays.
++    // No super-sampling by default: with 4 samples an M1 Pro takes longer than a 60 Hz frame to shade
++    // Soulcalibur III's battles. PS2_GS_SSAA=4 or more doubles the resolution on a faster GPU.
+     GSParallelOptions options;
+-    options.superSampling = 8u;
+     if (const char *ssaa = std::getenv("PS2_GS_SSAA"))
+     {
+         const std::optional<uint32_t> rate = gsParseSuperSampling(ssaa);
+         if (!rate)
+         {
+-            std::cerr << "[gs] unsupported PS2_GS_SSAA '" << ssaa << "' (expected 1, 2, 4, 8 or 16)" << std::endl;
++            std::cerr << "[gs] unsupported PS2_GS_SSAA '" << ssaa << "' (expected 1, 4, 8 or 16)" << std::endl;
+             return false;
+         }
+         options.superSampling = *rate;
+diff --git a/ps2xTest/src/ps2_gs_parallel_tests.cpp b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+index 35fb620..83c521c 100644
+--- a/ps2xTest/src/ps2_gs_parallel_tests.cpp
++++ b/ps2xTest/src/ps2_gs_parallel_tests.cpp
+@@ -82,13 +82,41 @@ namespace
+         uint32_t height = 0u;
+         uint32_t partlyCoveredPixels = 0u; // neither the triangle's green nor the black around it
+         uint8_t centreGreen = 0u;
++        uint8_t cornerGreen = 0u;   // near the top-left corner, which the triangle covers
++        uint8_t topRightGreen = 0u; // in the top rows, near where the triangle's tip is; black further down
+     };
+ 
+     // The way Soulcalibur III builds a frame: it renders into a 640x448 PSMCT32 buffer at page 0, then
+     // blits that buffer with a textured sprite into the 512x512 PSMCT16 buffer at page 0x8C, which is
+     // what the display circuit reads. The frame is a green triangle with a diagonal edge over black.
+-    // The blit follows a vsync, as in the game, so it is a render pass of its own.
+-    Presented presentBlittedFrame(TestCase &t, uint32_t superSampling)
++    // The blit follows a vsync, as in the game, so it is a render pass of its own. The game then draws
++    // untextured one-pixel sprites over the first and last line, in the blit's render pass.
++    enum class EdgeLines
++    {
++        None,
++        InBlitPass,
++        OwnPass,
++    };
++
++    // How the blit's sprites are split over render passes, as the game's blits are when the GS flushes
++    // in the middle of one.
++    enum class BlitSplit
++    {
++        None,
++        FirstTile,  // the first tile in a pass of its own, the rest in another
++        TopStrip,   // the top rows in a pass of their own, the rest in another
++    };
++
++    // How the blit itself is drawn. The default is a plain copy (DECAL) in one sprite.
++    struct BlitStyle
++    {
++        // Non-zero modulates the texture by this vertex colour (0x80 is the identity), as a fade does.
++        uint32_t modulateColour = 0u;
++        BlitSplit split = BlitSplit::None;
++    };
++
++    Presented presentBlittedFrame(TestCase &t, uint32_t superSampling, EdgeLines edgeLines = EdgeLines::None,
++                                  const BlitStyle &style = {})
+     {
+         GsFixture f;
+         if (!requireGpuGs(t, f.gs, GSParallelOptions{superSampling}))
+@@ -112,16 +140,51 @@ namespace
+                              {kRegXyz2, (440ull << 4) << 16}}));
+         f.gs.onVsync(1u); // the game blits a finished frame at the start of the next one
+         // TEX0: page 0, 640 wide, PSMCT24, 1024x512, TCC, DECAL. PRIM: sprite, TME, FST.
+-        const uint64_t tex0 = (10ull << 14) | (1ull << 20) | (10ull << 26) | (9ull << 30) | (1ull << 34) | (1ull << 35);
++        uint64_t tex0 = (10ull << 14) | (1ull << 20) | (10ull << 26) | (9ull << 30) | (1ull << 34) | (1ull << 35);
++        if (style.modulateColour != 0u)
++            tex0 &= ~((1ull << 34) | (1ull << 35)); // MODULATE, no alpha from the texture
+         send(f.gs, adPacket({{kRegPrmodecont, 1u}, // the attributes come from PRIM
+                              {kRegFrame1, 0x8Cull | (8ull << 16) | (2ull << 24)},
+                              {kRegScissor1, (511ull << 16) | (511ull << 48)},
+                              {kRegTex01, tex0},
+                              {kRegPrim, 0x116u},
+-                             {kRegUv, 0u},
+-                             {kRegXyz2, 0u},
+-                             {kRegUv, (640ull << 4) | ((448ull << 4) << 16)},
+-                             {kRegXyz2, (512ull << 4) | ((512ull << 4) << 16)}}));
++                             {kRegRgbaq, style.modulateColour * 0x010101ull | (0x80ull << 24)}}));
++        // A sprite of the blit from texels (u0,v0)-(u1,v1) to pixels (x0,y0)-(x1,y1); the 640x448 frame
++        // is drawn into the 512x512 buffer.
++        const auto sprite = [&](uint64_t u0, uint64_t v0, uint64_t u1, uint64_t v1, uint64_t x0, uint64_t y0,
++                                uint64_t x1, uint64_t y1)
++        {
++            send(f.gs, adPacket({{kRegUv, (u0 << 4) | (v0 << 20)},
++                                 {kRegXyz2, (x0 << 4) | (y0 << 20)},
++                                 {kRegUv, (u1 << 4) | (v1 << 20)},
++                                 {kRegXyz2, (x1 << 4) | (y1 << 20)}}));
++        };
++        switch (style.split)
++        {
++        case BlitSplit::None:
++            sprite(0, 0, 640, 448, 0, 0, 512, 512);
++            break;
++        case BlitSplit::FirstTile:
++            sprite(0, 0, 80, 56, 0, 0, 64, 64);
++            f.gs.onVsync(0u);
++            sprite(80, 0, 640, 448, 64, 0, 512, 512);
++            sprite(0, 56, 80, 448, 0, 64, 64, 512);
++            break;
++        case BlitSplit::TopStrip:
++            sprite(0, 0, 640, 56, 0, 0, 512, 64);
++            f.gs.onVsync(0u);
++            sprite(0, 56, 640, 448, 0, 64, 512, 512);
++            break;
++        }
++        if (edgeLines == EdgeLines::OwnPass)
++            f.gs.onVsync(0u);
++        if (edgeLines != EdgeLines::None)
++            send(f.gs, adPacket({{kRegPrim, 6u},
++                                 {kRegRgbaq, 0x80ull << 24},
++                                 {kRegXyz2, 0u},
++                                 {kRegXyz2, (512ull << 4) | ((1ull << 4) << 16)},
++                                 {kRegXyz2, (511ull << 4) << 16},
++                                 {kRegXyz2, (512ull << 4) | ((512ull << 4) << 16)}}));
+         f.gs.onVsync(0u);
+         f.gs.onVsync(1u); // publishes the previous vsync's picture
+         f.gs.latchHostPresentationFrame();
+@@ -137,6 +200,8 @@ namespace
+             if (frame[i + 1u] > 0x18u && frame[i + 1u] < 0xA8u)
+                 ++presented.partlyCoveredPixels;
+         presented.centreGreen = frame[(static_cast<size_t>(presented.height / 4u) * presented.width + presented.width / 4u) * 4u + 1u];
++        presented.cornerGreen = frame[(8u * static_cast<size_t>(presented.width) + 8u) * 4u + 1u];
++        presented.topRightGreen = frame[(23u * static_cast<size_t>(presented.width) + 400u) * 4u + 1u];
+         return presented;
+     }
+ 
+@@ -241,13 +306,21 @@ void register_ps2_gs_parallel_tests()
+             t.IsFalse(gsParseSuperSampling("").has_value(), "an empty value is rejected");
+         });
+ 
+-        tc.Run("without super-sampling the blitted frame is presented as the display buffer (GPU GS)", [](TestCase &t)
++        tc.Run("without super-sampling the blit's source is presented at the display's resolution (GPU GS)", [](TestCase &t)
+         {
+             const Presented presented = presentBlittedFrame(t, 1u);
++            t.Equals(presented.width, 512u, "the display's width");
++            t.Equals(presented.height, 512u, "the display's height");
++            t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen,
++                     "the blit's 32-bit source buffer is scanned out instead of the 16-bit display buffer");
++        });
++
++        tc.Run("without super-sampling a render pass of edge lines alone presents the display buffer (GPU GS)", [](TestCase &t)
++        {
++            const Presented presented = presentBlittedFrame(t, 1u, EdgeLines::OwnPass);
+             t.Equals(presented.width, 512u, "the display buffer's width");
+-            t.Equals(presented.height, 512u, "the display buffer's height");
+             t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen & 0xF8u,
+-                     "the triangle reaches the screen through the 16-bit display buffer");
++                     "with no blit in the pass the 16-bit display buffer is scanned out");
+         });
+ 
+         tc.Run("with super-sampling the blit's source is presented at twice the resolution (GPU GS)", [](TestCase &t)
+@@ -261,6 +334,42 @@ void register_ps2_gs_parallel_tests()
+             t.IsTrue(eight.partlyCoveredPixels > 100u, "8x super-sampling blends the pixels on the edge");
+         });
+ 
++        tc.Run("lines drawn over the frame's edges after the blit keep its source presented (GPU GS)", [](TestCase &t)
++        {
++            const Presented presented = presentBlittedFrame(t, 4u, EdgeLines::InBlitPass);
++            t.Equals(presented.width, 1024u, "twice the display's width");
++            t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen,
++                     "the blit's 32-bit source buffer is scanned out, not the 16-bit buffer with the trail");
++        });
++
++        tc.Run("a render pass of edge lines alone presents the display buffer (GPU GS)", [](TestCase &t)
++        {
++            const Presented presented = presentBlittedFrame(t, 4u, EdgeLines::OwnPass);
++            t.Equals(presented.width, 1024u, "twice the display's width");
++            t.Equals(static_cast<uint32_t>(presented.centreGreen), kTriangleGreen & 0xF8u,
++                     "with no blit in the pass the 16-bit display buffer is scanned out");
++        });
++
++        tc.Run("a blit that fades the frame presents the display buffer, which shows the fade (GPU GS)", [](TestCase &t)
++        {
++            const Presented plain = presentBlittedFrame(t, 1u, EdgeLines::None, BlitStyle{0x80u});
++            t.Equals(static_cast<uint32_t>(plain.centreGreen), kTriangleGreen,
++                     "a modulation by the identity colour is a plain copy: the 32-bit source is scanned out");
++            const Presented faded = presentBlittedFrame(t, 1u, EdgeLines::None, BlitStyle{0x40u});
++            t.IsTrue(faded.centreGreen < kTriangleGreen - 0x30u,
++                     "a darkening modulation is part of the picture, which the blit's source lacks: the display buffer is scanned out");
++        });
++
++        tc.Run("a blit split over two render passes presents the whole frame (GPU GS)", [](TestCase &t)
++        {
++            const Presented firstTile = presentBlittedFrame(t, 1u, EdgeLines::None, BlitStyle{0u, BlitSplit::FirstTile});
++            t.IsTrue(firstTile.cornerGreen > 0x80u,
++                     "the first tile, drawn in a pass of its own, is in the picture (the second pass's copy of the source lacks it)");
++            const Presented topStrip = presentBlittedFrame(t, 1u, EdgeLines::None, BlitStyle{0u, BlitSplit::TopStrip});
++            t.IsTrue(topStrip.topRightGreen > 0x80u,
++                     "the top rows, drawn in a pass of their own, are in the picture (the second pass's copy of the source lacks them)");
++        });
++
+         tc.Run("the GIF arbiter reports the path each packet came on", [](TestCase &t)
+         {
+             std::vector<GifPathId> paths;

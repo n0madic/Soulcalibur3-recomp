@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 07:28:13 +0200
+Subject: [PATCH] Build: optional LTO and a runtime header without the VU
+ interpreter
+
+Former patches of the series, merged:
+- 0005: Optional LTO
+- 0028: Runtime header without the VU interpreter
+---
+ ps2xRuntime/cmake/ReleaseMode.cmake |  6 +++--
+ ps2xRuntime/include/ps2_runtime.h   | 16 +++++++------
+ ps2xRuntime/src/lib/ps2_runtime.cpp | 35 ++++++++++++++++-------------
+ 3 files changed, 32 insertions(+), 25 deletions(-)
+
+diff --git a/ps2xRuntime/cmake/ReleaseMode.cmake b/ps2xRuntime/cmake/ReleaseMode.cmake
+index 92ef0d5..418e832 100644
+--- a/ps2xRuntime/cmake/ReleaseMode.cmake
++++ b/ps2xRuntime/cmake/ReleaseMode.cmake
+@@ -1,5 +1,7 @@
+ include(CheckIPOSupported)
+ 
++option(PS2X_ENABLE_LTO "Enable link-time optimization for release builds" ON)
++
+ check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+ 
+ function(EnableFastReleaseMode TargetName)
+@@ -34,9 +36,9 @@ function(EnableFastReleaseMode TargetName)
+         endif()
+     endif()
+ 
+-    if(IPO_SUPPORTED)
++    if(IPO_SUPPORTED AND PS2X_ENABLE_LTO)
+         set_property(TARGET ${TargetName} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+-    else()
++    elseif(PS2X_ENABLE_LTO)
+         message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
+     endif()
+ endfunction()
+\ No newline at end of file
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..fa27153 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -28,7 +28,6 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include "runtime/ps2_memory.h"
+ #include "runtime/gs/gs_frontend.h"
+-#include "runtime/ps2_vu1.h"
+ #include "runtime/ps2_audio.h"
+ #include "runtime/ps2_pad.h"
+ #include "runtime/ps2_rom_device.h"
+@@ -41,6 +40,9 @@ namespace ps2x::iop
+ }
+ 
+ class PS2IopHostAdapter;
++// Held by pointer so that the VU interpreter header, which the generated
++// code does not need, stays out of this header.
++class VU1Interpreter;
+ class PS2IopTransport;
+ class EeScheduler;
+ struct EeEvent;
+@@ -442,10 +444,10 @@ public:
+     inline const GS &gs() const { return m_gs; }
+     inline GifArbiter &gifArbiter() { return m_gifArbiter; }
+     inline const GifArbiter &gifArbiter() const { return m_gifArbiter; }
+-    inline VU1Interpreter &vu0() { return m_vu0; }
+-    inline const VU1Interpreter &vu0() const { return m_vu0; }
+-    inline VU1Interpreter &vu1() { return m_vu1; }
+-    inline const VU1Interpreter &vu1() const { return m_vu1; }
++    inline VU1Interpreter &vu0() { return *m_vu0; }
++    inline const VU1Interpreter &vu0() const { return *m_vu0; }
++    inline VU1Interpreter &vu1() { return *m_vu1; }
++    inline const VU1Interpreter &vu1() const { return *m_vu1; }
+ 
+     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
+     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
+@@ -497,8 +499,8 @@ private:
+     PSPadBackend m_padBackend;
+     PS2RomDevice m_romDevice;
+     PS2Vfs m_vfs;
+-    VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
+-    VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
++    std::unique_ptr<VU1Interpreter> m_vu0;
++    std::unique_ptr<VU1Interpreter> m_vu1;
+     R5900Context m_cpuContext;
+     std::unique_ptr<EeScheduler> m_eeScheduler;
+     mutable std::mutex m_eeKernelStateMutex;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..2aa503a 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -6,6 +6,7 @@
+ #include "ps2_runtime_macros.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_vu1.h"
+ #include "ThreadNaming.h"
+ #include "Kernel/Stubs/Audio.h"
+ #include "Kernel/Stubs/GS.h"
+@@ -478,6 +479,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+ }
+ 
+ PS2Runtime::PS2Runtime()
++    : m_vu0(std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU0)),
++      m_vu1(std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU1))
+ {
+     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
+     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+@@ -675,17 +678,17 @@ bool PS2Runtime::syncCoreSubsystems()
+                                      {
+                                          cpuContext = &m_cpuContext;
+                                      }
+-                                     m_vu1.state().dBitEnabled =
++                                     m_vu1->state().dBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+-                                     m_vu1.state().tBitEnabled =
++                                     m_vu1->state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                     m_vu1->execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
++                                         (m_vu1->state().stoppedByD ? 0x0200u : 0u) |
++                                         (m_vu1->state().stoppedByT ? 0x0400u : 0u); });
+     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+@@ -693,20 +696,20 @@ bool PS2Runtime::syncCoreSubsystems()
+                                      {
+                                          cpuContext = &m_cpuContext;
+                                      }
+-                                     m_vu1.state().dBitEnabled =
++                                     m_vu1->state().dBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+-                                     m_vu1.state().tBitEnabled =
++                                     m_vu1->state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                     m_vu1->resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
++                                         (m_vu1->state().stoppedByD ? 0x0200u : 0u) |
++                                         (m_vu1->state().stoppedByT ? 0x0400u : 0u); });
+     resetIop();
+-    m_vu0.reset();
+-    m_vu1.reset();
++    m_vu0->reset();
++    m_vu1->reset();
+ 
+     m_boundRdram = rdram;
+     m_boundGSVram = gsVram;
+@@ -1437,13 +1440,13 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+         return;
+     }
+ 
+-    m_vu0.reset();
+-    copyVu0ContextToState(ctx, m_vu0.state());
+-    m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
++    m_vu0->reset();
++    copyVu0ContextToState(ctx, m_vu0->state());
++    m_vu0->execute(vu0Code, PS2_VU0_CODE_SIZE,
+                   vu0Data, PS2_VU0_DATA_SIZE,
+                   m_gs, &m_memory,
+                   startPC, 0u, ctx->vu0_itop, 4096);
+-    copyVu0StateToContext(m_vu0.state(), ctx);
++    copyVu0StateToContext(m_vu0->state(), ctx);
+ }
+ 
+ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
