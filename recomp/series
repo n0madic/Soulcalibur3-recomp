@@ -17,6 +17,7 @@ upstream/11-pr319-qword-address-mask.patch
 upstream/12-pr321-ps2-float-ordering.patch
 0006-ee-fpu-semantics.patch
 0007-parallel-gs-renderer.patch
+upstream/15-pr380-gif-submit-without-copy.patch
 0008-vu1-interpreter.patch
 0009-runtime-hot-path-speedups.patch
 0010-vu-compiled-programs.patch

@@ -170,7 +170,7 @@ index b02c7ca..e4aff22 100644
                          }
                          else if (maskSpec == 1u)
 diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
-index 6d8baaa..91db72b 100644
+index db4549a..02ecac8 100644
 --- a/ps2xTest/src/ps2_memory_tests.cpp
 +++ b/ps2xTest/src/ps2_memory_tests.cpp
 @@ -10,6 +10,7 @@

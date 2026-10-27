@@ -299,7 +299,7 @@ index 790d4f8..3a5de79 100644
  {
      regs.csr.fetch_or(0x2u, std::memory_order_acq_rel);
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 74903a2..f4c67f6 100644
+index 03422bd..30a1e69 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -165,8 +165,14 @@ namespace
@@ -438,7 +438,7 @@ index 74903a2..f4c67f6 100644
          switch (timerOffset)
          {
 diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
-index 91db72b..cf86ad7 100644
+index 02ecac8..0f4feef 100644
 --- a/ps2xTest/src/ps2_memory_tests.cpp
 +++ b/ps2xTest/src/ps2_memory_tests.cpp
 @@ -310,6 +310,73 @@ void register_ps2_memory_tests()

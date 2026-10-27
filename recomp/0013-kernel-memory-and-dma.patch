@@ -327,7 +327,7 @@ index 67c97e4..dc34436 100644
              t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                       "callback invocation must not reuse the caller stack");
 diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
-index cf86ad7..e38b939 100644
+index 0f4feef..a34bcbe 100644
 --- a/ps2xTest/src/ps2_memory_tests.cpp
 +++ b/ps2xTest/src/ps2_memory_tests.cpp
 @@ -2322,6 +2322,36 @@ void register_ps2_memory_tests()

@@ -1,0 +1,1331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: n0madic <800462+n0madic@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 14:58:43 +0200
+Subject: [PATCH] Run the work for VIF1, VU1 and the GIF on a worker thread
+ (experimental)
+
+PS2_GS_THREAD=1 starts a worker thread (GsPipeline) that runs what a DMA kick
+hands to VIF1 and the GIF: the VIF1 interpreter, the VU1 microprograms it
+starts, and the GIF packets that reach the GS. On the console they run beside
+the EE; here a kick ran them on the EE thread before it could go on.
+
+- DMA kicks copy the data of normal-mode transfers (chains are copied already)
+  and queue it; the kick completes at once, so the guest may reuse its memory.
+  VIF0 and VU0 stay on the EE thread, which shares VU0.
+- The EE thread waits for the worker (PS2Memory::syncGraphicsPipeline) before
+  it touches what the worker touches: GIF and VIF registers and FIFOs, VU1
+  memory, the GS privileged registers, the HLE GS routines (syncCoreSubsystems,
+  processPendingTransfers, the native GIF chain paths), IMR, and each VBlank,
+  before it is stamped.
+- GS events raised by the worker are delivered by the scheduler, and the
+  events are latched when they are raised (GSRegisters::irqLatch): a guest
+  that polls CSR and acknowledges FINISH before the interrupt is polled lost
+  the interrupt, which left the game waiting for its watchdog.
+- A kick runs on the calling thread while the guest has the VU1 D or T break
+  bits set, because the VU1 status they change lives in the EE's context.
+
+Results (README, "Known gaps"): correct, but no faster in the battle, because
+the game polls GS CSR for FINISH right after kicking its display list: the EE
+thread waits for the worker about as long as the worker works.
+---
+ ps2xRuntime/CMakeLists.txt                    |   1 +
+ ps2xRuntime/include/runtime/ps2_gs_pipeline.h |  60 ++++
+ ps2xRuntime/include/runtime/ps2_memory.h      |  54 ++-
+ ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |   8 +
+ .../src/lib/Kernel/Syscalls/System.cpp        |   2 +
+ ps2xRuntime/src/lib/gs/gs_priv_registers.cpp  |   9 +
+ ps2xRuntime/src/lib/ps2_gs_pipeline.cpp       |  78 +++++
+ ps2xRuntime/src/lib/ps2_memory.cpp            | 262 ++++++++++-----
+ ps2xRuntime/src/lib/ps2_runtime.cpp           |  83 +++--
+ ps2xTest/CMakeLists.txt                       |   1 +
+ ps2xTest/src/main.cpp                         |   2 +
+ ps2xTest/src/ps2_gs_pipeline_tests.cpp        | 317 ++++++++++++++++++
+ 12 files changed, 762 insertions(+), 115 deletions(-)
+ create mode 100644 ps2xRuntime/include/runtime/ps2_gs_pipeline.h
+ create mode 100644 ps2xRuntime/src/lib/ps2_gs_pipeline.cpp
+ create mode 100644 ps2xTest/src/ps2_gs_pipeline_tests.cpp
+
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 56c2df8..6e66227 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -382,6 +382,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_host_smaa.cpp
+     src/lib/ps2_audio.cpp
+     src/lib/ps2_pcm_queue.cpp
++    src/lib/ps2_gs_pipeline.cpp
+     src/lib/ps2_audio_vag.cpp
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+diff --git a/ps2xRuntime/include/runtime/ps2_gs_pipeline.h b/ps2xRuntime/include/runtime/ps2_gs_pipeline.h
+new file mode 100644
+index 0000000..630c01a
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_gs_pipeline.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstddef>
++#include <deque>
++#include <functional>
++#include <mutex>
++#include <thread>
++
++// A worker thread for the work the EE hands to VIF1, VU1 and the GIF. On the console they run beside
++// the EE; here a DMA kick used to run them on the calling EE thread before it could go on. Jobs run in
++// the order they were submitted. The EE thread calls drain() before it touches anything a job touches
++// (the VIF1, GIF and GS registers, VU memory, the GS itself), so what it sees is what it would have
++// seen had the job run at once.
++class GsPipeline
++{
++public:
++    using Job = std::function<void()>;
++
++    // The worker holds at most maxQueuedBytes of data, queued and running (the hardware's FIFOs are
++    // finite): submit() blocks while a new job would exceed that, except when nothing is outstanding.
++    explicit GsPipeline(size_t maxQueuedBytes);
++    // Runs the jobs still queued, then stops the worker.
++    ~GsPipeline();
++
++    GsPipeline(const GsPipeline &) = delete;
++    GsPipeline &operator=(const GsPipeline &) = delete;
++
++    // Queues a job; bytes is the size of the data it owns.
++    void submit(Job job, size_t bytes);
++
++    // Returns once every job submitted before the call has run. Does nothing on the worker thread, whose
++    // jobs may call code that drains.
++    void drain();
++
++    // True when no job is queued or running.
++    [[nodiscard]] bool idle() const noexcept { return m_outstanding.load(std::memory_order_acquire) == 0u; }
++    [[nodiscard]] bool onWorkerThread() const noexcept { return std::this_thread::get_id() == m_thread.get_id(); }
++
++private:
++    struct Queued
++    {
++        Job job;
++        size_t bytes = 0;
++    };
++
++    void run();
++
++    const size_t m_maxQueuedBytes;
++    std::mutex m_mutex;
++    std::condition_variable m_workCv;
++    std::condition_variable m_spaceCv;
++    std::condition_variable m_idleCv;
++    std::deque<Queued> m_queue;
++    size_t m_queuedBytes = 0;
++    bool m_stop = false;
++    std::atomic<size_t> m_outstanding{0}; // jobs queued or running
++    std::thread m_thread;                 // last: starts once the rest exists
++};
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 310205e..d7d4451 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -9,9 +9,11 @@
+ #include <unordered_map>
+ #include <atomic>
+ #include <iostream>
++#include <memory>
+ #include <mutex>
+ 
+ #include "gs/ps2_gif_arbiter.h"
++#include "ps2_gs_pipeline.h"
+ #if defined(_MSC_VER)
+ #include <intrin.h>
+ #elif defined(USE_SSE2NEON)
+@@ -207,6 +209,10 @@ struct GSRegisters
+     uint64_t bgcolor;  // Background color
+     std::atomic<uint64_t> csr;
+     std::atomic<uint64_t> vsyncTick;
++    // CSR event bits (SIGNAL, FINISH) raised unmasked since pollGsInterruptEdge last looked, set when
++    // they are raised: the INTC latches an event at once, while the guest may read CSR and acknowledge
++    // the bit before the poll runs when the GS works on another thread (GsPipeline).
++    std::atomic<uint64_t> irqLatch;
+     uint64_t imr;      // Interrupt mask
+     uint64_t busdir;   // Bus direction
+     uint64_t siglblid; // Signal label ID
+@@ -217,7 +223,7 @@ struct GSRegisters
+     uint64_t queuedSignals[kMaxQueuedSignals];
+     uint64_t queuedSignalCount;
+ };
+-static_assert(sizeof(GSRegisters) == (27u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
++static_assert(sizeof(GSRegisters) == (28u * sizeof(uint64_t)), "GSRegisters layout changed unexpectedly");
+ static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
+ static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
+ 
+@@ -372,7 +378,33 @@ public:
+     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
+     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
++    // Runs what DMA kicks queued for VIF0, VIF1 and the GIF before returning (the HLE GS routines need that).
+     void processPendingTransfers();
++    // A DMA kick's end: with the graphics pipeline running, the data for the GIF and VIF1 goes to its
++    // worker and the call returns at once; without it this is processPendingTransfers().
++    void dispatchPendingTransfers();
++    // Starts the graphics pipeline: a worker thread that runs what the EE hands to VIF1, VU1 and the GIF
++    // (GsPipeline). Everything the EE thread does that depends on it waits for the worker first.
++    void startGraphicsPipeline();
++    // Waits for the pipeline's worker to run everything handed to it so far; a no-op without a pipeline.
++    // Call it before reading or writing anything the worker touches.
++    void syncGraphicsPipeline()
++    {
++        if (m_pipeline)
++            m_pipeline->drain();
++    }
++    [[nodiscard]] bool graphicsPipelineRunning() const noexcept { return m_pipeline != nullptr; }
++    [[nodiscard]] bool onGraphicsPipelineWorker() const noexcept { return m_pipeline && m_pipeline->onWorkerThread(); }
++    // Asked at each DMA kick: false makes that kick run on the calling thread. The runtime says no while
++    // the guest has the VU1 D or T break bits set, because the VU1 status they change lives in the EE's
++    // context, which the worker must not touch.
++    void setGraphicsPipelineGate(std::function<bool()> gate) { m_pipelineGate = std::move(gate); }
++    // Called on the worker thread after each job: the job may have raised a GS event (SIGNAL, FINISH),
++    // which the EE thread has to find and deliver as an interrupt, where it used to be raised inside
++    // the kick that the EE thread was making.
++    void setGraphicsPipelineNotify(std::function<void()> notify) { m_pipelineNotify = std::move(notify); }
++    // Drains and stops the pipeline.
++    void stopGraphicsPipeline();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
+     // True while consumeCompletedDmacCauses has something to return. One
+     // atomic load, so callers can test it after every special-address store.
+@@ -397,7 +429,7 @@ public:
+     const GSRegisters &gs() const { return gs_regs; }
+     uint8_t *getGSVRAM() { return m_gsVRAM; }
+     const uint8_t *getGSVRAM() const { return m_gsVRAM; }
+-    bool hasSeenGifCopy() const { return m_seenGifCopy; }
++    bool hasSeenGifCopy() const { return m_seenGifCopy.load(std::memory_order_relaxed); }
+     // Main RAM (32MB)
+     uint8_t *m_rdram;
+ 
+@@ -407,7 +439,7 @@ public:
+     // IOP RAM (2MB)
+     uint8_t *iop_ram;
+ 
+-    bool m_seenGifCopy;
++    std::atomic<bool> m_seenGifCopy;
+     std::atomic<uint64_t> m_dmaStartCount{0};
+     std::atomic<uint64_t> m_gifCopyCount{0};
+     std::atomic<uint64_t> m_gsWriteCount{0};
+@@ -507,6 +539,22 @@ public:
+     bool tryProcessIpuInputDma(uint32_t channelBase, uint32_t chcr);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
++
++    // The three loops of processPendingTransfers, over a list of transfers.
++    void runGifTransfers(std::vector<PendingTransfer> &transfers);
++    void runVifTransfers(std::vector<PendingTransfer> &transfers, bool vif1);
++    // Copies the data of a transfer that names guest memory into the transfer, so that the worker never
++    // reads guest memory. False when the data is not one contiguous range.
++    bool snapshotTransfer(PendingTransfer &transfer);
++    // The end of a kick: DMA status, CHCR and the completion interrupt of the channels that ran.
++    void completeTransfers(bool gif, bool vif0, bool vif1);
++    // The GIF FQC the queued GIF transfers give: what is waiting in the GIF's FIFO.
++    void observeGifQueue();
++
++    std::function<bool()> m_pipelineGate;
++    std::function<void()> m_pipelineNotify;
++    // Last, so that it is stopped before anything its jobs use is destroyed.
++    std::unique_ptr<GsPipeline> m_pipeline;
+ };
+ 
+ #endif // PS2_MEMORY_H
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 56e8515..f361dbf 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1854,6 +1854,11 @@ void EeScheduler::processPendingEvents()
+     {
+         processEvent(event);
+     }
++    // The graphics pipeline's worker raises GS events (SIGNAL, FINISH) outside a guest store.
++    if (m_runtime.memory().graphicsPipelineRunning() && m_runtime.memory().pollGsInterruptEdge())
++    {
++        dispatchIrq(false, 0u);
++    }
+ 
+     {
+         std::lock_guard lock(m_eventMutex);
+@@ -1961,6 +1966,9 @@ void EeScheduler::processEvent(const EeEvent &event)
+         requestStop();
+         break;
+     case EeEventType::VBlankStart:
++        // The picture shown is the one the graphics pipeline's worker has finished. Waiting for it comes
++        // before the VBlank is stamped: the guest's timer reads follow host time since the stamp.
++        m_runtime.memory().syncGraphicsPipeline();
+         m_vblankCycle = m_eeCycle;
+         m_vblankHostTime = std::chrono::steady_clock::now();
+         ++m_vsyncTick;
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 66cacef..9b844a9 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -39,6 +39,7 @@ namespace ps2_syscalls
+         uint64_t imr = 0;
+         if (runtime)
+         {
++            runtime->memory().syncGraphicsPipeline(); // the worker reads IMR when it raises an event
+             imr = runtime->memory().gs().imr;
+         }
+ 
+@@ -61,6 +62,7 @@ namespace ps2_syscalls
+         uint64_t oldImr = 0;
+         if (runtime)
+         {
++            runtime->memory().syncGraphicsPipeline(); // the worker reads IMR when it raises an event
+             oldImr = runtime->memory().gs().imr;
+             runtime->memory().gs().imr = newImr;
+             runtime->drainCompletedDmacHandlers(rdram);
+diff --git a/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp b/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
+index 3a5de79..98733cf 100644
+--- a/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_priv_registers.cpp
+@@ -7,6 +7,13 @@ namespace
+ {
+     constexpr uint64_t kCsrSignal = 0x1u;
+ 
++    // IMR bits 8..12 mask the CSR events; an event raised while its source is unmasked reaches the INTC.
++    void latchEvent(GSRegisters &regs, uint64_t csrBit)
++    {
++        if (((regs.imr >> 8u) & csrBit) == 0u)
++            regs.irqLatch.fetch_or(csrBit);
++    }
++
+     void applySignal(GSRegisters &regs, uint64_t value)
+     {
+         const uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFFu);
+@@ -15,6 +22,7 @@ namespace
+         lo = (lo & ~mask) | (id & mask);
+         regs.siglblid = (regs.siglblid & 0xFFFFFFFF00000000ull) | lo;
+         regs.csr.fetch_or(kCsrSignal);
++        latchEvent(regs, kCsrSignal);
+     }
+ }
+ 
+@@ -63,6 +71,7 @@ bool gsPalTiming(const GSRegisters &regs)
+ void gsWriteFinish(GSRegisters &regs)
+ {
+     regs.csr.fetch_or(0x2u, std::memory_order_acq_rel);
++    latchEvent(regs, 0x2u);
+ }
+ 
+ void gsWriteLabel(GSRegisters &regs, uint64_t value)
+diff --git a/ps2xRuntime/src/lib/ps2_gs_pipeline.cpp b/ps2xRuntime/src/lib/ps2_gs_pipeline.cpp
+new file mode 100644
+index 0000000..d51f12c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_gs_pipeline.cpp
+@@ -0,0 +1,78 @@
++#include "runtime/ps2_gs_pipeline.h"
++
++#include <exception>
++#include <iostream>
++#include <utility>
++
++GsPipeline::GsPipeline(size_t maxQueuedBytes)
++    : m_maxQueuedBytes(maxQueuedBytes), m_thread([this] { run(); })
++{
++}
++
++GsPipeline::~GsPipeline()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_stop = true;
++    }
++    m_workCv.notify_all();
++    m_thread.join();
++}
++
++void GsPipeline::submit(Job job, size_t bytes)
++{
++    std::unique_lock<std::mutex> lock(m_mutex);
++    // m_queuedBytes counts the job that is running too; an idle pipeline takes any job.
++    m_spaceCv.wait(lock, [&] { return m_queuedBytes == 0u || m_queuedBytes + bytes <= m_maxQueuedBytes; });
++    m_queue.push_back(Queued{std::move(job), bytes});
++    m_queuedBytes += bytes;
++    m_outstanding.fetch_add(1u, std::memory_order_release);
++    lock.unlock();
++    m_workCv.notify_one();
++}
++
++void GsPipeline::drain()
++{
++    if (m_outstanding.load(std::memory_order_acquire) == 0u || onWorkerThread())
++        return;
++    std::unique_lock<std::mutex> lock(m_mutex);
++    m_idleCv.wait(lock, [&] { return m_outstanding.load(std::memory_order_acquire) == 0u; });
++}
++
++void GsPipeline::run()
++{
++    for (;;)
++    {
++        Queued next;
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            m_workCv.wait(lock, [&] { return m_stop || !m_queue.empty(); });
++            if (m_queue.empty())
++                return;
++            next = std::move(m_queue.front());
++            m_queue.pop_front();
++        }
++
++        try
++        {
++            next.job();
++        }
++        catch (const std::exception &error)
++        {
++            std::cerr << "[GsPipeline] job failed: " << error.what() << std::endl;
++        }
++        catch (...)
++        {
++            std::cerr << "[GsPipeline] job failed" << std::endl;
++        }
++        next.job = nullptr; // release what the job owns before anyone waits for it
++
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            m_queuedBytes -= next.bytes;
++            m_outstanding.fetch_sub(1u, std::memory_order_release);
++        }
++        m_spaceCv.notify_all();
++        m_idleCv.notify_all();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 9642bc4..eb095e3 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -267,6 +267,7 @@ PS2Memory::PS2Memory()
+ 
+ PS2Memory::~PS2Memory()
+ {
++    m_pipeline.reset();
+     if (m_rdram)
+     {
+         delete[] m_rdram;
+@@ -316,6 +317,7 @@ PS2Memory::~PS2Memory()
+ 
+ bool PS2Memory::initialize(size_t ramSize)
+ {
++    m_pipeline.reset();
+     auto cleanup = [this]()
+     {
+         delete[] m_rdram;
+@@ -385,6 +387,7 @@ bool PS2Memory::initialize(size_t ramSize)
+         // memset zero-fills std::atomic<uint64_t>::csr's bytes, which is not itself
+         // a guaranteed-valid atomic store; make the zero-initialization explicit.
+         gs_regs.csr.store(0);
++        gs_regs.irqLatch.store(0);
+         gs_regs.imr = 0x7F00u; // every GS interrupt source masked, as after a hardware reset
+         m_gsInterruptEvents = 0u;
+         gs_regs.dispfb1 = (0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43);
+@@ -586,6 +589,9 @@ bool PS2Memory::isScratchpad(uint32_t address) const
+ 
+ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
+ {
++    // VU1 memory is the worker's: it runs the microprograms and VIF1 UNPACKs into it.
++    if (physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
++        syncGraphicsPipeline();
+     return const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
+ }
+ 
+@@ -801,6 +807,7 @@ uint32_t PS2Memory::read32(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
++        syncGraphicsPipeline();
+         uint32_t off = address & 7;
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+@@ -849,6 +856,7 @@ uint64_t PS2Memory::read64(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
++        syncGraphicsPipeline();
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+         {
+@@ -1010,6 +1018,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
+ 
+     if (isGsPrivReg(address))
+     {
++        syncGraphicsPipeline();
+         uint32_t off = address & 7;
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+@@ -1071,6 +1080,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+ 
+     if (isGsPrivReg(address))
+     {
++        syncGraphicsPipeline();
+         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+         if (regOff == kGsCsrRegOffset)
+         {
+@@ -1138,6 +1148,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     }
+     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
+     {
++        syncGraphicsPipeline();
+         alignas(16) uint8_t fifoData[16];
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+         processVIF1Data(fifoData, sizeof(fifoData));
+@@ -1183,6 +1194,9 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+ 
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    // The GIF and VIF registers and FIFOs belong to the worker's state.
++    if (address >= 0x10003000u && address < 0x10007000u)
++        syncGraphicsPipeline();
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -1222,6 +1236,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+     if (isGsPrivReg(address))
+     {
++        syncGraphicsPipeline();
+         // NB: unreachable from write8/16/32/64 today since those all funnel IO
+         // register writes through addresses in PS2_IO_BASE's range, which is
+         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
+@@ -1632,7 +1647,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
+                 if (autoProcessTransfers)
+                 {
+-                    processPendingTransfers();
++                    dispatchPendingTransfers();
+                 }
+             }
+         }
+@@ -1862,31 +1877,14 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+     queueCompletedDmacCause(cause);
+ }
+ 
+-void PS2Memory::processPendingTransfers()
++void PS2Memory::runGifTransfers(std::vector<PendingTransfer> &transfers)
+ {
+-    const bool hadGif = !m_pendingGifTransfers.empty();
+-    uint32_t observedGifQwc = 0u;
+-    for (const auto &transfer : m_pendingGifTransfers)
++    for (size_t idx = 0; idx < transfers.size(); ++idx)
+     {
+-        const uint64_t transferQwc = !transfer.chainData.empty()
+-                                         ? (transfer.chainData.size() / 16u)
+-                                         : transfer.qwc;
+-        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
+-    }
+-    if (observedGifQwc != 0u)
+-    {
+-        constexpr uint32_t kGifStat = 0x10003020u;
+-        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+-        uint32_t &gifStat = m_ioRegisters[kGifStat];
+-        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+-    }
+-
+-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+-    {
+-        auto &p = m_pendingGifTransfers[idx];
++        auto &p = transfers[idx];
+         if (!p.chainData.empty())
+         {
+-            m_seenGifCopy = true;
++            m_seenGifCopy.store(true, std::memory_order_relaxed);
+             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+             submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
+         }
+@@ -1915,7 +1913,7 @@ void PS2Memory::processPendingTransfers()
+                         chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                     if (chunk == 0)
+                         break;
+-                    m_seenGifCopy = true;
++                    m_seenGifCopy.store(true, std::memory_order_relaxed);
+                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                     submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
+                     bytesLeft -= chunk;
+@@ -1934,7 +1932,7 @@ void PS2Memory::processPendingTransfers()
+                         chunk = PS2_RAM_SIZE - srcPhys;
+                     if (chunk == 0)
+                         break;
+-                    m_seenGifCopy = true;
++                    m_seenGifCopy.store(true, std::memory_order_relaxed);
+                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+                     submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
+                     bytesLeft -= chunk;
+@@ -1943,14 +1941,22 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
+-    m_pendingGifTransfers.clear();
++}
+ 
+-    const bool hadVif0 = !m_pendingVif0Transfers.empty();
+-    for (auto &p : m_pendingVif0Transfers)
++void PS2Memory::runVifTransfers(std::vector<PendingTransfer> &transfers, bool vif1)
++{
++    const auto process = [&](const uint8_t *data, uint32_t sizeBytes)
++    {
++        if (vif1)
++            processVIF1Data(data, sizeBytes);
++        else
++            processVIF0Data(data, sizeBytes);
++    };
++    for (auto &p : transfers)
+     {
+         if (!p.chainData.empty())
+         {
+-            processVIF0Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
++            process(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+         }
+         else if (p.qwc > 0)
+         {
+@@ -1977,7 +1983,7 @@ void PS2Memory::processPendingTransfers()
+                         chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                     if (chunk == 0)
+                         break;
+-                    processVIF0Data(m_scratchpad + srcPhys, chunk);
++                    process(m_scratchpad + srcPhys, chunk);
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+                 }
+@@ -1994,76 +2000,152 @@ void PS2Memory::processPendingTransfers()
+                         chunk = PS2_RAM_SIZE - srcPhys;
+                     if (chunk == 0)
+                         break;
+-                    processVIF0Data(srcPhys, chunk);
++                    process(m_rdram + srcPhys, chunk);
+                     bytesLeft -= chunk;
+                     srcPhys += chunk;
+                 }
+             }
+         }
+     }
+-    m_pendingVif0Transfers.clear();
++}
+ 
+-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
+-    for (auto &p : m_pendingVif1Transfers)
++bool PS2Memory::snapshotTransfer(PendingTransfer &transfer)
++{
++    if (!transfer.chainData.empty() || transfer.qwc == 0u)
++        return true;
++
++    uint32_t srcPhys = 0;
++    try
+     {
+-        if (!p.chainData.empty())
+-        {
+-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+-        }
+-        else if (p.qwc > 0)
+-        {
+-            uint32_t srcPhys = 0;
+-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+-            try
+-            {
+-                srcPhys = translateAddress(p.srcAddr);
+-            }
+-            catch (const std::exception &)
+-            {
+-                continue;
+-            }
+-            if (p.fromScratchpad)
+-            {
+-                uint32_t bytesLeft = sizeBytes;
+-                while (bytesLeft > 0)
+-                {
+-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+-                        srcPhys = 0;
+-                    uint32_t chunk = bytesLeft;
+-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+-                    if (chunk == 0)
+-                        break;
+-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+-                    bytesLeft -= chunk;
+-                    srcPhys += chunk;
+-                }
+-            }
+-            else
+-            {
+-                uint32_t bytesLeft = sizeBytes;
+-                while (bytesLeft > 0)
+-                {
+-                    if (srcPhys >= PS2_RAM_SIZE)
+-                        srcPhys = 0;
+-                    uint32_t chunk = bytesLeft;
+-                    if (srcPhys + chunk > PS2_RAM_SIZE)
+-                        chunk = PS2_RAM_SIZE - srcPhys;
+-                    if (chunk == 0)
+-                        break;
+-                    processVIF1Data(srcPhys, chunk);
+-                    bytesLeft -= chunk;
+-                    srcPhys += chunk;
+-                }
+-            }
+-        }
++        srcPhys = translateAddress(transfer.srcAddr);
+     }
++    catch (const std::exception &)
++    {
++        return false;
++    }
++    const uint64_t sizeBytes = static_cast<uint64_t>(transfer.qwc) * 16ull;
++    const uint64_t limit = transfer.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++    const uint8_t *base = transfer.fromScratchpad ? m_scratchpad : m_rdram;
++    if (!base || srcPhys >= limit || srcPhys + sizeBytes > limit)
++        return false;
++    transfer.chainData.assign(base + srcPhys, base + srcPhys + sizeBytes);
++    return true;
++}
++
++void PS2Memory::processPendingTransfers()
++{
++    // Jobs the worker still has touch the state this runs on.
++    syncGraphicsPipeline();
++
++    const bool hadGif = !m_pendingGifTransfers.empty();
++    observeGifQueue();
++    runGifTransfers(m_pendingGifTransfers);
++    m_pendingGifTransfers.clear();
++
++    const bool hadVif0 = !m_pendingVif0Transfers.empty();
++    runVifTransfers(m_pendingVif0Transfers, false);
++    m_pendingVif0Transfers.clear();
++
++    const bool hadVif1 = !m_pendingVif1Transfers.empty();
++    runVifTransfers(m_pendingVif1Transfers, true);
+     m_pendingVif1Transfers.clear();
+ 
+     if (m_gifArbiter)
+         m_gifArbiter->drain();
+ 
++    completeTransfers(hadGif, hadVif0, hadVif1);
++}
++
++void PS2Memory::dispatchPendingTransfers()
++{
++    if (!m_pipeline || (m_pipelineGate && !m_pipelineGate()))
++    {
++        processPendingTransfers();
++        return;
++    }
++
++    // Transfers that name guest memory are copied now: the guest may reuse the memory as soon as the
++    // DMA is complete, and the worker runs later.
++    bool copied = true;
++    for (auto &transfer : m_pendingGifTransfers)
++        copied = snapshotTransfer(transfer) && copied;
++    for (auto &transfer : m_pendingVif1Transfers)
++        copied = snapshotTransfer(transfer) && copied;
++    if (!copied)
++    {
++        processPendingTransfers();
++        return;
++    }
++
++    const bool hadGif = !m_pendingGifTransfers.empty();
++    const bool hadVif0 = !m_pendingVif0Transfers.empty();
++    const bool hadVif1 = !m_pendingVif1Transfers.empty();
++    observeGifQueue();
++
++    if (hadGif || hadVif1)
++    {
++        size_t bytes = 0;
++        for (const auto &transfer : m_pendingGifTransfers)
++            bytes += transfer.chainData.size();
++        for (const auto &transfer : m_pendingVif1Transfers)
++            bytes += transfer.chainData.size();
++        m_pipeline->submit(
++            [this, gif = std::move(m_pendingGifTransfers), vif1 = std::move(m_pendingVif1Transfers)]() mutable
++            {
++                runGifTransfers(gif);
++                runVifTransfers(vif1, true);
++                if (m_gifArbiter)
++                    m_gifArbiter->drain();
++                if (m_pipelineNotify)
++                    m_pipelineNotify();
++            },
++            bytes);
++        m_pendingGifTransfers.clear();
++        m_pendingVif1Transfers.clear();
++    }
++
++    // VIF0 feeds VU0, which the EE thread shares, so it stays here.
++    runVifTransfers(m_pendingVif0Transfers, false);
++    m_pendingVif0Transfers.clear();
++
++    completeTransfers(hadGif, hadVif0, hadVif1);
++}
++
++void PS2Memory::startGraphicsPipeline()
++{
++    if (m_pipeline)
++        return;
++    // Enough for a few display lists; a kick blocks when the worker is further behind than that.
++    constexpr size_t kMaxQueuedBytes = 16u * 1024u * 1024u;
++    m_pipeline = std::make_unique<GsPipeline>(kMaxQueuedBytes);
++}
++
++void PS2Memory::stopGraphicsPipeline()
++{
++    m_pipeline.reset();
++}
++
++void PS2Memory::observeGifQueue()
++{
++    uint32_t observedGifQwc = 0u;
++    for (const auto &transfer : m_pendingGifTransfers)
++    {
++        const uint64_t transferQwc = !transfer.chainData.empty()
++                                         ? (transfer.chainData.size() / 16u)
++                                         : transfer.qwc;
++        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
++    }
++    if (observedGifQwc != 0u)
++    {
++        constexpr uint32_t kGifStat = 0x10003020u;
++        constexpr uint32_t kGifFqcMask = 0x1F000000u;
++        uint32_t &gifStat = m_ioRegisters[kGifStat];
++        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
++    }
++}
++
++void PS2Memory::completeTransfers(bool hadGif, bool hadVif0, bool hadVif1)
++{
+     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
+     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
+@@ -2130,8 +2212,11 @@ bool PS2Memory::pollGsInterruptEdge()
+     // The INTC latches every GS event that is raised unmasked, also while another
+     // one is still pending in CSR: FINISH from the last packet of a frame arrives
+     // before the handler has acknowledged the SIGNAL that kicked that packet.
+-    const uint64_t events = gs_regs.csr.load(std::memory_order_acquire) & kCsrEventMask & ~(gs_regs.imr >> 8u);
+-    const bool raised = (events & ~m_gsInterruptEvents) != 0u;
++    const uint64_t unmasked = kCsrEventMask & ~(gs_regs.imr >> 8u);
++    const uint64_t events = gs_regs.csr.load(std::memory_order_acquire) & unmasked;
++    // An event the guest acknowledged before this poll still counts: it was raised.
++    const uint64_t latched = gs_regs.irqLatch.exchange(0u, std::memory_order_acq_rel);
++    const bool raised = ((events & ~m_gsInterruptEvents) | latched) != 0u;
+     m_gsInterruptEvents = events;
+     return raised;
+ }
+@@ -2505,6 +2590,8 @@ int PS2Memory::pollDmaRegisters()
+ 
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    if (address >= 0x10003000u && address < 0x10007000u)
++        syncGraphicsPipeline();
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -2530,6 +2617,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+ 
+     if (isGsPrivReg(address))
+     {
++        syncGraphicsPipeline();
+         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
+         // path above; kept correct for direct callers.
+         const uint32_t off = address & 7u;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5808483..5df9567 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -533,6 +533,7 @@ PS2Runtime::~PS2Runtime()
+     try
+     {
+         requestStop();
++        m_memory.stopGraphicsPipeline();
+         m_iopSubsystem.reset();
+         m_iopHost.reset();
+ #if defined(PLATFORM_VITA)
+@@ -656,6 +657,8 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
+ 
+ bool PS2Runtime::syncCoreSubsystems()
+ {
++    // Every HLE routine that works on the GS starts here: the pipeline's worker must be done first.
++    m_memory.syncGraphicsPipeline();
+     uint8_t *const rdram = m_memory.getRDRAM();
+     uint8_t *const gsVram = m_memory.getGSVRAM();
+     if (!rdram || !gsVram)
+@@ -672,42 +675,64 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
+     m_memory.setGifArbiter(&m_gifArbiter);
+-    m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+-                                 {
+-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+-                                     if (!cpuContext)
++    // The EE thread's context, which holds FBRST and VPU_STAT; null on the graphics pipeline's worker,
++    // which does not run while the D and T break bits are set (see the gate below).
++    const auto vu1EeContext = [this]() -> R5900Context *
++    {
++        if (m_memory.onGraphicsPipelineWorker())
++        {
++            return nullptr;
++        }
++        R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
++        return cpuContext ? cpuContext : &m_cpuContext;
++    };
++    // A finished job may have raised a GS event: make the EE thread look (EeEventType::Dmac does nothing
++    // else); EeScheduler::processPendingEvents then delivers the interrupt.
++    m_memory.setGraphicsPipelineNotify([this]()
++                                       {
++                                           if (m_eeScheduler)
++                                           {
++                                               m_eeScheduler->postEvent(EeEvent{EeEventType::Dmac, 0u, 0u});
++                                           } });
++    constexpr uint32_t kVu1BreakBits = (1u << 10) | (1u << 11); // FBRST DE1, TE1
++    m_memory.setGraphicsPipelineGate([vu1EeContext]()
+                                      {
+-                                         cpuContext = &m_cpuContext;
+-                                     }
++                                         const R5900Context *cpuContext = vu1EeContext();
++                                         return cpuContext && (cpuContext->vu0_fbrst & kVu1BreakBits) == 0u; });
++    m_memory.setVu1MscalCallback([this, vu1EeContext](uint32_t startPC, uint32_t top, uint32_t itop)
++                                 {
++                                     R5900Context *cpuContext = vu1EeContext();
+                                      m_vu1->state().dBitEnabled =
+-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
++                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1->state().tBitEnabled =
+-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                      m_vu1->execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+-                                     cpuContext->vu0_vpu_stat =
+-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
+-                                         (m_vu1->state().stoppedByD ? 0x0200u : 0u) |
+-                                         (m_vu1->state().stoppedByT ? 0x0400u : 0u); });
+-    m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
+-                                 {
+-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+-                                     if (!cpuContext)
++                                     if (cpuContext)
+                                      {
+-                                         cpuContext = &m_cpuContext;
+-                                     }
++                                         cpuContext->vu0_vpu_stat =
++                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
++                                             (m_vu1->state().stoppedByD ? 0x0200u : 0u) |
++                                             (m_vu1->state().stoppedByT ? 0x0400u : 0u);
++                                     } });
++    m_memory.setVu1MscntCallback([this, vu1EeContext](uint32_t top, uint32_t itop)
++                                 {
++                                     R5900Context *cpuContext = vu1EeContext();
+                                      m_vu1->state().dBitEnabled =
+-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
++                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1->state().tBitEnabled =
+-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                         cpuContext && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                      m_vu1->resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
+-                                     cpuContext->vu0_vpu_stat =
+-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
+-                                         (m_vu1->state().stoppedByD ? 0x0200u : 0u) |
+-                                         (m_vu1->state().stoppedByT ? 0x0400u : 0u); });
++                                     if (cpuContext)
++                                     {
++                                         cpuContext->vu0_vpu_stat =
++                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
++                                             (m_vu1->state().stoppedByD ? 0x0200u : 0u) |
++                                             (m_vu1->state().stoppedByT ? 0x0400u : 0u);
++                                     } });
+     resetIop();
+     m_vu0->reset();
+     m_vu1->reset();
+@@ -781,6 +806,12 @@ bool PS2Runtime::initialize(const char *title)
+         }
+         if (!selectGsRenderer())
+             return false;
++        // PS2_GS_THREAD=1 runs the work for VIF1, VU1 and the GIF on a worker thread beside the EE.
++        if (const char *thread = std::getenv("PS2_GS_THREAD"); thread && std::string(thread) != "0")
++        {
++            m_memory.startGraphicsPipeline();
++            std::cout << "[gs] VIF1, VU1 and GIF work runs on a worker thread (PS2_GS_THREAD)" << std::endl;
++        }
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+@@ -2234,6 +2265,8 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
+     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
+     m_memory.writeIORegister(GIF_TADR, tadr);
+     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
++    // The native paths below work on the GS directly.
++    m_memory.syncGraphicsPipeline();
+     if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+     {
+         drainCompletedDmacHandlers(rdram);
+@@ -2245,7 +2278,7 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
+         return;
+     }
+     m_memory.writeIORegister(GIF_CHCR, chcr);
+-    m_memory.processPendingTransfers();
++    m_memory.dispatchPendingTransfers();
+     drainCompletedDmacHandlers(rdram);
+ }
+ 
+diff --git a/ps2xTest/CMakeLists.txt b/ps2xTest/CMakeLists.txt
+index 968dddc..2d14ac0 100644
+--- a/ps2xTest/CMakeLists.txt
++++ b/ps2xTest/CMakeLists.txt
+@@ -48,6 +48,7 @@ add_library(ps2_test_lib STATIC
+     src/ps2_qword_access_tests.cpp
+     src/ps2_fpu_order_tests.cpp
+     src/ps2_gs_parallel_tests.cpp
++    src/ps2_gs_pipeline_tests.cpp
+ )
+ 
+ target_include_directories(ps2_test_lib PRIVATE
+diff --git a/ps2xTest/src/main.cpp b/ps2xTest/src/main.cpp
+index d7270cc..82e9cd8 100644
+--- a/ps2xTest/src/main.cpp
++++ b/ps2xTest/src/main.cpp
+@@ -29,6 +29,7 @@ void register_ps2_vu0_ftoi_tests();
+ void register_ps2_qword_access_tests();
+ void register_ps2_fpu_order_tests();
+ void register_ps2_gs_parallel_tests();
++void register_ps2_gs_pipeline_tests();
+ void reset_ps2_test_function_table();
+ 
+ int main()
+@@ -62,6 +63,7 @@ int main()
+     register_ps2_qword_access_tests();
+     register_ps2_fpu_order_tests();
+     register_ps2_gs_parallel_tests();
++    register_ps2_gs_pipeline_tests();
+     int res = MiniTest::Run();
+     std::cout.flush();
+     std::cerr.flush();
+diff --git a/ps2xTest/src/ps2_gs_pipeline_tests.cpp b/ps2xTest/src/ps2_gs_pipeline_tests.cpp
+new file mode 100644
+index 0000000..5b34f70
+--- /dev/null
++++ b/ps2xTest/src/ps2_gs_pipeline_tests.cpp
+@@ -0,0 +1,317 @@
++#include "MiniTest.h"
++#include "runtime/ps2_gs_pipeline.h"
++#include "runtime/ps2_memory.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace
++{
++    using namespace std::chrono_literals;
++
++    constexpr uint32_t kGifChannel = 0x1000A000u;
++    constexpr uint32_t kVif1Channel = 0x10009000u;
++    constexpr uint32_t kGsCsr = 0x12001000u;
++
++    uint32_t makeVifCmd(uint8_t opcode, uint8_t num, uint16_t imm)
++    {
++        return (static_cast<uint32_t>(opcode) << 24) | (static_cast<uint32_t>(num) << 16) | static_cast<uint32_t>(imm);
++    }
++
++    // Kicks a mode 0 DMA of qwc quadwords at src on the channel.
++    void kickDma(PS2Memory &mem, uint32_t channel, uint32_t src, uint32_t qwc)
++    {
++        mem.writeIORegister(channel + 0x10u, src);
++        mem.writeIORegister(channel + 0x20u, qwc);
++        mem.writeIORegister(channel + 0x00u, 0x101u);
++    }
++
++    // What the GIF's packet callback saw, in order, and on which thread.
++    struct GifLog
++    {
++        std::mutex mutex;
++        std::vector<std::vector<uint8_t>> packets;
++        std::vector<std::thread::id> threads;
++        std::chrono::milliseconds firstPacketDelay{0};
++        std::atomic<bool> firstPacketDone{false};
++
++        void add(const uint8_t *data, uint32_t sizeBytes)
++        {
++            const bool first = [&]
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                return packets.empty();
++            }();
++            if (first)
++                std::this_thread::sleep_for(firstPacketDelay);
++            std::lock_guard<std::mutex> lock(mutex);
++            packets.emplace_back(data, data + sizeBytes);
++            threads.push_back(std::this_thread::get_id());
++            if (first)
++                firstPacketDone.store(true);
++        }
++    };
++}
++
++void register_ps2_gs_pipeline_tests()
++{
++    MiniTest::Case("GsPipeline", [](TestCase &tc)
++    {
++        tc.Run("jobs run in order on the worker and drain waits for them", [](TestCase &t)
++        {
++            GsPipeline pipeline(1024u);
++            std::vector<int> order;
++            std::vector<std::thread::id> threads;
++            std::atomic<bool> firstDone{false};
++            pipeline.submit([&]
++            {
++                std::this_thread::sleep_for(50ms);
++                order.push_back(1);
++                threads.push_back(std::this_thread::get_id());
++                firstDone.store(true);
++            }, 1u);
++            pipeline.submit([&] { order.push_back(2); }, 1u);
++            pipeline.submit([&] { order.push_back(3); }, 1u);
++
++            t.IsFalse(firstDone.load(), "submit returns before the first job has run");
++            t.IsFalse(pipeline.idle(), "the pipeline is busy");
++            pipeline.drain();
++            t.IsTrue(pipeline.idle(), "drain leaves the pipeline idle");
++            t.Equals(order.size(), static_cast<size_t>(3u), "all jobs ran");
++            t.IsTrue(order[0] == 1 && order[1] == 2 && order[2] == 3, "jobs run in submission order");
++            t.IsTrue(threads.size() == 1u && threads[0] != std::this_thread::get_id(), "jobs run on the worker thread");
++        });
++
++        tc.Run("drain on the worker thread returns at once", [](TestCase &t)
++        {
++            GsPipeline pipeline(1024u);
++            std::atomic<bool> returned{false};
++            pipeline.submit([&]
++            {
++                pipeline.drain();
++                returned.store(true);
++            }, 1u);
++            pipeline.drain();
++            t.IsTrue(returned.load(), "a job that drains does not wait for itself");
++        });
++
++        tc.Run("submit blocks while the queue holds more than its limit", [](TestCase &t)
++        {
++            GsPipeline pipeline(100u);
++            std::atomic<bool> release{false};
++            std::atomic<bool> secondSubmitted{false};
++            std::atomic<int> ran{0};
++            pipeline.submit([&]
++            {
++                while (!release.load())
++                    std::this_thread::sleep_for(1ms);
++                ran.fetch_add(1);
++            }, 100u);
++
++            std::thread submitter([&]
++            {
++                pipeline.submit([&] { ran.fetch_add(1); }, 100u);
++                secondSubmitted.store(true);
++            });
++            std::this_thread::sleep_for(50ms);
++            t.IsFalse(secondSubmitted.load(), "the second job waits for room");
++            release.store(true);
++            submitter.join();
++            pipeline.drain();
++            t.IsTrue(secondSubmitted.load(), "the second job is queued once the first has run");
++            t.Equals(ran.load(), 2, "both jobs ran");
++        });
++
++        tc.Run("destroying the pipeline runs the jobs still queued", [](TestCase &t)
++        {
++            std::atomic<int> ran{0};
++            {
++                GsPipeline pipeline(1024u);
++                for (int i = 0; i < 5; ++i)
++                {
++                    pipeline.submit([&]
++                    {
++                        std::this_thread::sleep_for(5ms);
++                        ran.fetch_add(1);
++                    }, 1u);
++                }
++            }
++            t.Equals(ran.load(), 5, "all queued jobs ran before the destructor returned");
++        });
++    });
++
++    MiniTest::Case("PS2Memory graphics pipeline", [](TestCase &tc)
++    {
++        tc.Run("a GIF DMA kick returns before the worker has run the packet and a GS register read waits for it", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GifLog log;
++            log.firstPacketDelay = 60ms;
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes) { log.add(data, sizeBytes); });
++            mem.setGifArbiter(&arbiter);
++            mem.startGraphicsPipeline();
++
++            uint8_t *rdram = mem.getRDRAM();
++            for (uint32_t i = 0; i < 16u; ++i)
++                rdram[0x22000u + i] = static_cast<uint8_t>(0x40u + i);
++            kickDma(mem, kGifChannel, 0x22000u, 1u);
++
++            t.IsFalse(log.firstPacketDone.load(), "the kick returned before the packet reached the GS");
++            (void)mem.read64(kGsCsr);
++            t.IsTrue(log.firstPacketDone.load(), "reading a GS register waited for the worker");
++            mem.syncGraphicsPipeline(); // keeps what follows sound should the check above fail
++            t.Equals(log.packets.size(), static_cast<size_t>(1u), "the packet arrived once");
++            t.IsTrue(log.threads[0] != std::this_thread::get_id(), "the packet was processed on the worker thread");
++            t.IsTrue(std::memcmp(log.packets[0].data(), rdram + 0x22000u, 16u) == 0, "the packet has the DMA's bytes");
++            t.IsTrue((mem.readIORegister(kGifChannel + 0x00u) & 0x100u) == 0u, "the kick completed the channel at once");
++        });
++
++        tc.Run("the guest can reuse the memory of a DMA as soon as it has been kicked", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GifLog log;
++            log.firstPacketDelay = 60ms; // keeps the worker busy while the guest rewrites its buffer
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes) { log.add(data, sizeBytes); });
++            mem.setGifArbiter(&arbiter);
++            mem.startGraphicsPipeline();
++
++            uint8_t *rdram = mem.getRDRAM();
++            std::vector<uint8_t> second(32u);
++            for (uint32_t i = 0; i < 16u; ++i)
++                rdram[0x22000u + i] = static_cast<uint8_t>(0x10u + i);
++            for (uint32_t i = 0; i < 32u; ++i)
++            {
++                second[i] = static_cast<uint8_t>(0x60u + i);
++                rdram[0x23000u + i] = second[i];
++            }
++            kickDma(mem, kGifChannel, 0x22000u, 1u);
++            kickDma(mem, kGifChannel, 0x23000u, 2u);
++            std::memset(rdram + 0x23000u, 0xFF, 32u);
++
++            mem.syncGraphicsPipeline();
++            t.Equals(log.packets.size(), static_cast<size_t>(2u), "both packets arrived");
++            t.IsTrue(log.packets.size() == 2u && log.packets[1] == second, "the second packet has the bytes of the kick, not the rewritten ones");
++        });
++
++        tc.Run("kicks reach the GS in the order they were made", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GifLog log;
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes) { log.add(data, sizeBytes); });
++            mem.setGifArbiter(&arbiter);
++            mem.startGraphicsPipeline();
++
++            uint8_t *rdram = mem.getRDRAM();
++            constexpr uint32_t kKicks = 40u;
++            for (uint32_t k = 0; k < kKicks; ++k)
++            {
++                std::memset(rdram + 0x30000u + k * 16u, static_cast<int>(k + 1u), 16u);
++                kickDma(mem, kGifChannel, 0x30000u + k * 16u, 1u);
++            }
++            mem.syncGraphicsPipeline();
++
++            t.Equals(log.packets.size(), static_cast<size_t>(kKicks), "every kick reached the GS");
++            bool inOrder = log.packets.size() == kKicks;
++            for (uint32_t k = 0; inOrder && k < kKicks; ++k)
++                inOrder = log.packets[k][0] == static_cast<uint8_t>(k + 1u);
++            t.IsTrue(inOrder, "the packets arrived in kick order");
++        });
++
++        tc.Run("a VIF1 UNPACK DMA is in VU1 memory by the time the guest reads it", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GifLog log;
++            log.firstPacketDelay = 60ms; // the UNPACKs below queue up behind this packet
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes) { log.add(data, sizeBytes); });
++            mem.setGifArbiter(&arbiter);
++            mem.startGraphicsPipeline();
++
++            uint8_t *rdram = mem.getRDRAM();
++            std::memset(rdram + 0x22000u, 0x11, 16u);
++            kickDma(mem, kGifChannel, 0x22000u, 1u);
++            // Three NOPs pad the UNPACK V4-32 (NUM 1, VU address 0x10) and its quadword to two quadwords.
++            const uint32_t words[8] = {0u, 0u, 0u, makeVifCmd(0x6Cu, 1u, 0x10u), 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
++            std::memcpy(rdram + 0x24000u, words, sizeof(words));
++            kickDma(mem, kVif1Channel, 0x24000u, 2u);
++
++            // The second kick overwrites the quadword; the guest must see the last one.
++            const uint32_t again[8] = {0u, 0u, 0u, makeVifCmd(0x6Cu, 1u, 0x10u), 0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
++            std::memcpy(rdram + 0x25000u, again, sizeof(again));
++            kickDma(mem, kVif1Channel, 0x25000u, 2u);
++
++            const uint32_t vu1Qword = PS2_VU1_DATA_BASE + 0x10u * 16u;
++            t.Equals(mem.read32(vu1Qword + 0u), 0xAAAAAAAAu, "VU1 memory word 0 holds the last UNPACK");
++            t.Equals(mem.read32(vu1Qword + 12u), 0xDDDDDDDDu, "VU1 memory word 3 holds the last UNPACK");
++        });
++
++        tc.Run("the gate makes a kick run on the calling thread", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GifLog log;
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes) { log.add(data, sizeBytes); });
++            mem.setGifArbiter(&arbiter);
++            mem.startGraphicsPipeline();
++            bool open = false;
++            mem.setGraphicsPipelineGate([&] { return open; });
++
++            std::memset(mem.getRDRAM() + 0x22000u, 0x5A, 16u);
++            kickDma(mem, kGifChannel, 0x22000u, 1u);
++            t.Equals(log.packets.size(), static_cast<size_t>(1u), "a closed gate delivers the packet before the kick returns");
++            t.IsTrue(log.threads[0] == std::this_thread::get_id(), "a closed gate runs the kick on the calling thread");
++
++            open = true;
++            kickDma(mem, kGifChannel, 0x22000u, 1u);
++            mem.syncGraphicsPipeline();
++            t.Equals(log.packets.size(), static_cast<size_t>(2u), "an open gate delivers the next packet too");
++            t.IsTrue(log.threads[1] != std::this_thread::get_id(), "an open gate runs the kick on the worker");
++        });
++
++        tc.Run("a GS event the guest acknowledges before the interrupt is polled still raises it", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            mem.gs().imr = 0x7C00u; // SIGNAL and FINISH unmasked
++            t.IsFalse(mem.pollGsInterruptEdge(), "nothing was raised yet");
++
++            // The worker raises FINISH; the guest's own poll reads CSR, sees it and writes it back
++            // before the scheduler looks.
++            gsWriteFinish(mem.gs());
++            mem.write32(kGsCsr, 0x2u);
++            t.Equals(mem.gs().csr.load() & 0x2u, 0ull, "the guest cleared FINISH");
++            t.IsTrue(mem.pollGsInterruptEdge(), "the interrupt of the cleared FINISH is still raised");
++            t.IsFalse(mem.pollGsInterruptEdge(), "and raised once");
++
++            mem.gs().imr = 0x7F00u; // everything masked: an event raised now raises no interrupt
++            gsWriteFinish(mem.gs());
++            mem.write32(kGsCsr, 0x2u);
++            mem.gs().imr = 0x7C00u;
++            t.IsFalse(mem.pollGsInterruptEdge(), "a masked event raises nothing once it is unmasked and cleared");
++        });
++
++        tc.Run("a synchronous processPendingTransfers leaves nothing with the worker", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            GifLog log;
++            log.firstPacketDelay = 40ms;
++            GifArbiter arbiter([&](GifPathId, const uint8_t *data, uint32_t sizeBytes) { log.add(data, sizeBytes); });
++            mem.setGifArbiter(&arbiter);
++            mem.startGraphicsPipeline();
++
++            std::memset(mem.getRDRAM() + 0x22000u, 0x33, 16u);
++            kickDma(mem, kGifChannel, 0x22000u, 1u);
++            mem.processPendingTransfers();
++            t.IsTrue(log.firstPacketDone.load(), "the HLE entry point waits for the worker");
++        });
++    });
++}

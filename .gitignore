@@ -21,11 +21,14 @@
 !/recomp/sc3.toml
 !/recomp/skip_intro.toml
 !/recomp/debug/
+!/recomp/experimental/
 !/recomp/ghidra_scripts/
 !/recomp/parallel-gs/
 
 /recomp/debug/*
 !/recomp/debug/diagnostics-*.patch
+/recomp/experimental/*
+!/recomp/experimental/*.patch
 /recomp/upstream/*
 !/recomp/upstream/[0-9][0-9]-*.patch
 /recomp/ghidra_scripts/*

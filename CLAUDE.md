@@ -9,10 +9,11 @@ A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ra
 ## Layout
 
 - `Makefile` has three targets: `make build` (runs `recomp/build.sh`), `make run` and `make ghidra`.
-- `recomp/series` lists the patch series that `build.sh` applies, in that order, to PS2Recomp at the commit in `recomp/PS2Recomp.commit`: 20 local patches `recomp/NNNN-<area>.patch` (the fixes of one problem area in one patch) and 14 upstream PRs in `recomp/upstream/NN-prNNN-*.patch`, interleaved. An upstream patch stays as the PR has it and is dropped when the PR is merged; local fixes of it go into a local patch after it. Until 2026-10-27 the series had 72 patches; `recomp/README.md` maps the former numbers (used in its investigation notes) to the current patches.
+- `recomp/series` lists the patch series that `build.sh` applies, in that order, to PS2Recomp at the commit in `recomp/PS2Recomp.commit`: 20 local patches `recomp/NNNN-<area>.patch` (the fixes of one problem area in one patch) and 15 upstream PRs in `recomp/upstream/NN-prNNN-*.patch`, interleaved. An upstream patch stays as the PR has it and is dropped when the PR is merged; local fixes of it go into a local patch after it. Until 2026-10-27 the series had 72 patches; `recomp/README.md` maps the former numbers (used in its investigation notes) to the current patches.
 - `recomp/debug/*.patch` are diagnostics that are never applied by default.
   - `diagnostics-scene-state.patch`: frame dumps and the `[TEMP-DEBUG globals]` scene/tick line.
   - `diagnostics-vu1-verify.patch`: `PS2_VU_VERIFY=1` shadows each compiled VU run with the interpreter.
+- `recomp/experimental/*.patch` are experiments that are never applied by default and are not in `series`; each applies on top of the whole series, and `recomp/README.md` says what it showed. `gs-pipeline-thread.patch` runs the VIF1, VU1 and GIF work on a worker thread (`PS2_GS_THREAD=1`) and is no faster in battle.
 - `recomp/parallel-gs/` holds patches to the paraLLEl-GS clone in `work/deps/parallel-gs`: `*.patch` for its Granite submodule, `gs/*.patch` for paraLLEl-GS itself. `build.sh` applies them only when it clones.
 - `recomp/sc3.toml` is the recompiler config, including the stub list that maps library functions to runtime HLE stubs. `recomp/display_mode.toml` holds instruction patches that answer the display-mode dialog with PAL60 (`DISPLAY_DIALOG=1` keeps it), and `recomp/skip_intro.toml` those that skip the movies (`SKIP_INTRO=0` keeps them).
 - `recomp/work/` is local only and must never be committed:
@@ -87,7 +88,7 @@ PS2_TEST_REQUIRE_GPU=1 PS2_VU_PROGRAM_FIXTURES=<fixture dir> PS2_VU_REQUIRE_PROG
 
 ## Measuring and debugging
 
-- **Speed.** Measure speed as VSyncs (displayed frames) per second. The game's counter at `0x4f3814` counts logic steps and is not a speed measure. Measure on mains power; macOS Low Power Mode cuts speed by about 25%. Compare builds with alternating A/B runs, because run-to-run noise is several percent.
+- **Speed.** Measure speed as VSyncs (displayed frames) per second, and read the game's counter at `0x4f3814` (logic steps) beside it. VSyncs follow the emulator's clock, so they can stay at 60 while the game itself runs slowly: with the worker-thread experiment a lost GS interrupt left the title at 60 VSyncs/s and 14 logic steps/s. The counter alone is not a speed measure either (it moves with the scene and the game's frame skip: the demo battle shows ~56 steps/s at ~59 VSyncs/s), so a run is healthy when both are near their usual values for the scene (title: both ~60). Measure on mains power; macOS Low Power Mode cuts speed by about 25%. Compare builds with alternating A/B runs, because run-to-run noise is several percent.
 - **Keep your hands off the game window.** It takes the keyboard focus, and the keyboard is the pad (Enter = Start, Space = Cross, most letters). Keys typed while it is in front skip the movies and change the attract loop, which looks like speed or movie bugs. Runs that must not be disturbed can be made so by testing a build that ignores the keyboard (TEMP-DEBUG).
 - **One instance at a time.** Run one game instance at a time; parallel runs slow each other down.
 - **Profiling.** Use `sample <pid> 15` and read the "GameThread" section.

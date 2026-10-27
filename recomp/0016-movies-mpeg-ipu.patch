@@ -875,7 +875,7 @@ index 27c18c8..689c9b5 100644
          uint8_t *base = getMemPtr(rdram, param_1);
          if (!base)
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index f4c67f6..1fa2caf 100644
+index 30a1e69..9642bc4 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -349,6 +349,7 @@ bool PS2Memory::initialize(size_t ramSize)
@@ -1263,7 +1263,7 @@ index dc34436..fb444d5 100644
          {
              std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
 diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
-index e38b939..60ae1d3 100644
+index a34bcbe..83ebbef 100644
 --- a/ps2xTest/src/ps2_memory_tests.cpp
 +++ b/ps2xTest/src/ps2_memory_tests.cpp
 @@ -2352,6 +2352,154 @@ void register_ps2_memory_tests()
