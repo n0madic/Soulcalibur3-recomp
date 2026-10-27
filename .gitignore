@@ -28,6 +28,9 @@
 !/recomp/ghidra_scripts/*.java
 /recomp/parallel-gs/*
 !/recomp/parallel-gs/*.patch
+!/recomp/parallel-gs/gs/
+/recomp/parallel-gs/gs/*
+!/recomp/parallel-gs/gs/*.patch
 
 # Original game files, local checkouts, generated code, VU recordings,
 # dependencies, captures, analysis projects and build outputs stay here.

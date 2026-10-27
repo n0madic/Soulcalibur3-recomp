@@ -1,0 +1,108 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index d9e0731..de67c63 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -4470,6 +4470,50 @@ void GSInterface::invalidate_promoted_backbuffer(uint32_t fbp)
+ 			promoted_backbuffers[i].img.reset();
+ }
+ 
++// Whether sprites (rectangles in subpixels) draw the whole display: they span its size (to a few pixels,
++// the blit may leave out the margins) and leave no gap as big as a cell between them. The cells let the
++// seams between the tiles of a blit be, while a tile that is missing is found.
++static bool blit_covers_display(const std::vector<ivec4> &rects, ivec2 display_size)
++{
++	constexpr int cell_bits = 3 + PGS_SUBPIXEL_BITS; // 8x8 pixels
++	constexpr int slack_pixels = 8;
++
++	if (rects.empty())
++		return false;
++
++	ivec2 lo = ivec2(INT32_MAX);
++	ivec2 hi = ivec2(INT32_MIN);
++	for (auto &rect : rects)
++	{
++		lo = muglm::min(lo, rect.xy());
++		hi = muglm::max(hi, rect.zw());
++	}
++
++	ivec2 size = (hi - lo) >> PGS_SUBPIXEL_BITS;
++	if (size.x + slack_pixels < display_size.x || size.y + slack_pixels < display_size.y)
++		return false;
++
++	int cells_x = ((hi.x - lo.x) >> cell_bits) + 1;
++	int cells_y = ((hi.y - lo.y) >> cell_bits) + 1;
++	std::vector<uint8_t> covered(size_t(cells_x) * size_t(cells_y), 0);
++	for (auto &rect : rects)
++	{
++		ivec2 first = (rect.xy() - lo) >> cell_bits;
++		ivec2 last = (rect.zw() - lo - 1) >> cell_bits;
++		for (int y = first.y; y <= last.y; y++)
++			for (int x = first.x; x <= last.x; x++)
++				covered[size_t(y) * size_t(cells_x) + size_t(x)] = 1;
++	}
++
++	// The cells at the far edges are partial; the ones inside the rectangle must all be covered.
++	for (int y = 0; y < cells_y; y++)
++		for (int x = 0; x < cells_x; x++)
++			if (!covered[size_t(y) * size_t(cells_x) + size_t(x)] && x + 1 < cells_x && y + 1 < cells_y)
++				return false;
++
++	return true;
++}
++
+ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ {
+ 	if (!hacks.backbuffer_promotion)
+@@ -4490,6 +4534,9 @@ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ 		bool is_valid_blit = true;
+ 		uint32_t promoted_tex_index = UINT32_MAX;
+ 
++		// The blit's destination, to tell a whole frame from a part of one.
++		std::vector<ivec4> dst_rects;
++
+ 		for (uint32_t prim = 0; prim < rp.num_primitives; prim++)
+ 		{
+ 			uint32_t state = render_pass.prim[prim].state;
+@@ -4522,6 +4569,22 @@ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ 				break;
+ 			}
+ 
++			// A blit that darkens the picture (a fade to black, as the game's screens do) is not a copy:
++			// the fade is part of what the display shows and its source lacks it.
++			if (((s.combiner >> COMBINER_MODE_OFFSET) & ((1u << COMBINER_MODE_BITS) - 1u)) != COMBINER_DECAL)
++			{
++				uint32_t rgba = render_pass.attributes[3 * prim + 1].rgba;
++				if ((rgba & 0xffu) < 0x80u || ((rgba >> 8) & 0xffu) < 0x80u || ((rgba >> 16) & 0xffu) < 0x80u)
++				{
++					is_valid_blit = false;
++					break;
++				}
++			}
++
++			auto &dst0 = render_pass.positions[3 * prim + 0].pos;
++			auto &dst1 = render_pass.positions[3 * prim + 1].pos;
++			dst_rects.push_back(ivec4(muglm::min(dst0, dst1), muglm::max(dst0, dst1)));
++
+ 			uint32_t tex_index = (render_pass.prim[prim].tex >> TEX_TEXTURE_INDEX_OFFSET) &
+ 			                     ((1 << TEX_TEXTURE_INDEX_BITS) - 1);
+ 
+@@ -4572,6 +4635,19 @@ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ 			hi = muglm::max(hi, uv1);
+ 		}
+ 
++		// A blit that the GS flushed in the middle is in two passes, each with part of the frame, and
++		// the copy of the source is cached for the sprites a pass samples: neither is the frame (the
++		// second pass's copy lacks the first tile). Such a frame is scanned out from the display
++		// buffer, which has both parts.
++		if (is_valid_blit && promoted_tex_index != UINT32_MAX)
++		{
++			const bool is_display1 = priv_registers.pmode.EN1 && priv_registers.dispfb1.FBP == fbp;
++			const auto &display = is_display1 ? priv_registers.display1 : priv_registers.display2;
++			is_valid_blit = blit_covers_display(dst_rects,
++			                                    ivec2(int((display.DW + 1) / (display.MAGH + 1)),
++			                                          int((display.DH + 1) / (display.MAGV + 1))));
++		}
++
+ 		if (!is_valid_blit || promoted_tex_index == UINT32_MAX)
+ 			continue;
+ 

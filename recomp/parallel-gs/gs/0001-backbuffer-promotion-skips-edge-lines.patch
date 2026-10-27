@@ -1,0 +1,29 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index ea00016..d9e0731 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -4509,6 +4509,15 @@ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ 			auto &s = render_pass.state_vectors[state_index];
+ 			if ((s.combiner & COMBINER_TME_BIT) == 0)
+ 			{
++				// Games shade the edge lines of the frame after the blit (Soulcalibur III darkens the
++				// first and last line). Losing such a sprite is harmless; giving up the promotion is not.
++				auto &pos0 = render_pass.positions[3 * prim + 0].pos;
++				auto &pos1 = render_pass.positions[3 * prim + 1].pos;
++				constexpr int max_edge_line_thickness = 2 << PGS_SUBPIXEL_BITS;
++				if (std::abs(pos1.x - pos0.x) <= max_edge_line_thickness ||
++				    std::abs(pos1.y - pos0.y) <= max_edge_line_thickness)
++					continue;
++
+ 				is_valid_blit = false;
+ 				break;
+ 			}
+@@ -4563,7 +4572,7 @@ void GSInterface::promote_render_pass_to_backbuffer(const RenderPass &rp)
+ 			hi = muglm::max(hi, uv1);
+ 		}
+ 
+-		if (!is_valid_blit)
++		if (!is_valid_blit || promoted_tex_index == UINT32_MAX)
+ 			continue;
+ 
+ 		auto &img = render_pass.tex_infos[promoted_tex_index].view->get_image();
