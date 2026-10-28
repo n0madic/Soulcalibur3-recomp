@@ -23,12 +23,17 @@
 !/recomp/sc3.toml
 !/recomp/skip_intro.toml
 !/recomp/debug/
+!/recomp/docker/
 !/recomp/experimental/
 !/recomp/ghidra_scripts/
 !/recomp/parallel-gs/
 
 /recomp/debug/*
 !/recomp/debug/diagnostics-*.patch
+/recomp/docker/*
+!/recomp/docker/Dockerfile
+!/recomp/docker/build-mingw.sh
+!/recomp/docker/llvm-mingw-toolchain.cmake
 /recomp/experimental/*
 !/recomp/experimental/*.patch
 /recomp/upstream/*

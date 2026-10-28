@@ -27,6 +27,28 @@ With the Ghidra export (`make ghidra`, then `make build` again) the recompiler t
 
 For the movie path, install FFmpeg (`brew install ffmpeg`) and build with `ENABLE_FFMPEG=ON SKIP_INTRO=0 ./recomp/build.sh`; by default both movies are skipped. The PAL release's display-mode dialog (PAL50/PAL60) is answered with PAL60 by `display_mode.toml`; `DISPLAY_DIALOG=1` keeps the dialog.
 
+### Linux (Docker) and Windows (llvm-mingw) builds
+
+Trial builds on other platforms; neither is part of `make build`.
+
+**Linux arm64 in Docker** (`docker/Dockerfile`: Ubuntu 24.04, clang, the raylib/Vulkan/FFmpeg development packages, xvfb, Mesa lavapipe). Pass `--platform linux/arm64` explicitly: with `DOCKER_DEFAULT_PLATFORM=linux/amd64` the image is x86_64 under emulation, and **Linux x86_64 does not build** (the x86 path of the CMake files adds no `-msse4.1`, and the generated MMI code needs it: `_mm_max_epi32 requires target feature 'sse4.1'`).
+
+```sh
+docker build --platform linux/arm64 -t sc3-linux-build recomp/docker
+docker volume create sc3-linux-work
+docker run --rm --platform linux/arm64 -v "$PWD":/src:ro -v sc3-linux-work:/work sc3-linux-build ./recomp/build.sh /work
+```
+
+The work directory is the volume (the disc image is read from the mounted repository). Copy `work/ghidra-export` into `/work/ghidra-export` before the build: without the Ghidra map the game stops on a `missing-target` jump. The runner builds with no errors. To run it headless, start `Xvfb :99`, then `LP_NUM_THREADS=0 ps2EntryRunner SCES_533.12` from `/work/game` with `DISPLAY=:99` (2026-10-28, 4 CPUs and 8 GB for the Docker VM): the game reaches the title screen ("PRESS START BUTTON") in about 2 minutes on lavapipe. lavapipe's own render threads crash with SIGSEGV inside `libvulkan_lvp.so` (not in the game), hence `LP_NUM_THREADS=0`; the resident memory of the game grew from 2.4 GB to 7 GB in 150 s, close to the VM's limit, and a longer run was killed (cause not examined).
+
+**Windows x86_64 cross-compiled on macOS** with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (release 20261020, unpacked anywhere; GCC's mingw-w64 from Ubuntu 24.04 is not enough: its headers lack `ID3D12Device4` and one generated unit took over an hour). It builds the runner from an `out/mingw` directory of the tree that `build.sh` has patched and fed with the generated code, and uses the paraLLEl-GS and `PS2_VULKAN_LIBRARY` changes of `0007` (see its details):
+
+```sh
+LLVM_MINGW_ROOT=<llvm-mingw dir> ./recomp/docker/build-mingw.sh recomp/work
+```
+
+The result is `recomp/work/PS2Recomp/out/mingw/ps2xRuntime/ps2EntryRunner.exe` (PE32+ x86-64, imports `libc++.dll` and `libunwind.dll`; no FFmpeg, no VU profiles). It has not been run on Windows.
+
 Runtime environment variables:
 
 | Variable | Effect |
@@ -51,6 +73,7 @@ Files:
 | `display_mode.toml` | Instruction patches that answer the start-up display-mode dialog with PAL60 (appended by `build.sh`; `DISPLAY_DIALOG=1` disables). |
 | `skip_intro.toml` | Instruction patches that skip the two start-up movies (appended by `build.sh`; `SKIP_INTRO=0` disables). |
 | `build.sh`, `test_build_iso.sh` | End-to-end build script, and a test of how it finds the disc image (fake `7z` and `git`, nothing is built). |
+| `docker/Dockerfile`, `docker/build-mingw.sh`, `docker/llvm-mingw-toolchain.cmake` | The Linux build and headless run image, and the llvm-mingw cross-build of the runner for Windows (see "Linux (Docker) and Windows (llvm-mingw) builds"). |
 | `ghidra_export.sh`, `ghidra_scripts/` | Ghidra import/export and analysis helpers (see below). |
 | `pointer_entries.py` | Generates entry points for data-pointer targets (used by `build.sh`). |
 | `debug/diagnostics-vu1-verify.patch` | `PS2_VU_VERIFY=1` shadows every compiled VU0 and VU1 program run with the interpreter and prints differences (see "Compiled VU microprograms"). Applies on top of the whole series (checked 2026-10-28). |
@@ -144,6 +167,7 @@ The investigation notes below were written while the series had one patch per fi
 
 - **0023**: [paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs) (Vulkan compute, LGPL-3.0+) as the default GS renderer, selected by `PS2_GS_BACKEND` (see above); built when `PS2X_PARALLEL_GS_DIR` points at a checkout. The GIF arbiter passes the path id to the GS, SIGNAL/FINISH/LABEL reach CSR/SIGLBLID from the GPU GS too, local-to-host transfers read back from it, and the scanout is read back once per vsync for the host window. Also fix 11 and fix 12. GPU tests in `ps2_gs_parallel_tests.cpp` (skipped without Vulkan unless `PS2_TEST_REQUIRE_GPU=1`).
 - **Frame context ring (2026-10-27)**: the Vulkan device has `kFrameContexts = 16` Granite frame contexts instead of 4. paraLLEl-GS takes the next frame context in every flush it submits (`GSRenderer::flush_submit`), not once per vsync, and Granite then waits for the GPU work of the context it takes. With 4 the game thread waited for the GPU every fourth flush: a 15 s `sample` of the demo battle put 17.5% of the game thread in `vkWaitSemaphores` under `flush_submit` (4-5 ms per vsync inside `ParallelRenderer::vsync`), although a battle frame costs the GPU only a few ms (a `wait_idle` after each frame waited 1.3-1.6 ms more once the thread had done its own wait). A/B on mains power, 170 s attract-loop runs, two runs per setting: the demo battle ran at 40 game ticks/s with 42-54 new pictures/s with 4 contexts, at 52-60 and 56-60 with 16, at 50-60 and 58-60 with 64; the wait in `vsync` fell from 4-5 ms to 0.6-0.7 ms. `GSParallelRenderer::frameContexts()` reports the device's count and `ps2_gs_parallel_tests.cpp` requires at least 16 (with 4 the test fails).
+- **Windows build (2026-10-28)**: `gs_parallel.cpp` loads the Vulkan loader with `LoadLibraryA("vulkan-1.dll")`/`GetProcAddress` on Windows (`PS2_VULKAN_LIBRARY` still overrides), and the runner's CMake turns Granite's `GRANITE_VULKAN_DXGI_INTEROP` off (its `wsi_dxgi.cpp` needs `ID3D12Device4`, which mingw-w64's headers lack; the runtime does not use Granite's WSI). With both, `ps2EntryRunner.exe` cross-compiles on macOS arm64 with llvm-mingw 20261020 (clang 23.1.4, `x86_64-w64-mingw32`, `-msse4.1`: the generated MMI code uses `_mm_max_epi32` and friends, and the x86 path of the CMake files adds no SSE4.1 flag). It has not been run on Windows. The exe imports `libc++.dll` and `libunwind.dll` from llvm-mingw's `x86_64-w64-mingw32/bin`.
 
 **`0008-vu1-interpreter.patch`**
 

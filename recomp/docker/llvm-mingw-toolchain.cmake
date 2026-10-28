@@ -1,0 +1,11 @@
+# llvm-mingw (https://github.com/mstorsjo/llvm-mingw): LLVM_MINGW_ROOT is its unpacked directory.
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(_triple x86_64-w64-mingw32)
+set(CMAKE_C_COMPILER "$ENV{LLVM_MINGW_ROOT}/bin/${_triple}-clang")
+set(CMAKE_CXX_COMPILER "$ENV{LLVM_MINGW_ROOT}/bin/${_triple}-clang++")
+set(CMAKE_RC_COMPILER "$ENV{LLVM_MINGW_ROOT}/bin/${_triple}-windres")
+set(CMAKE_FIND_ROOT_PATH "$ENV{LLVM_MINGW_ROOT}/${_triple}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

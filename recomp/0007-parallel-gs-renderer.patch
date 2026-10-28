@@ -6,17 +6,17 @@ Subject: [PATCH] paraLLEl-GS as the default GS renderer
 Former patches of the series, merged:
 - 0023: paraLLEl-GS renderer
 ---
- ps2xRuntime/CMakeLists.txt                    |  18 ++
+ ps2xRuntime/CMakeLists.txt                    |  21 ++
  ps2xRuntime/include/ps2_runtime.h             |   1 +
  ps2xRuntime/include/runtime/gs/gs_frontend.h  |  14 +-
  ps2xRuntime/include/runtime/gs/gs_parallel.h  |  48 +++
  .../include/runtime/gs/ps2_gif_arbiter.h      |   2 +-
  ps2xRuntime/include/runtime/ps2_memory.h      |   6 +
  ps2xRuntime/src/lib/Kernel/EeScheduler.cpp    |   1 +
- ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp       |  50 +---
+ ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp       |  50 +--
  .../src/lib/Kernel/Syscalls/System.cpp        |   9 +-
- ps2xRuntime/src/lib/gs/gs_frontend.cpp        | 133 ++++++++-
- ps2xRuntime/src/lib/gs/gs_parallel.cpp        | 282 ++++++++++++++++++
+ ps2xRuntime/src/lib/gs/gs_frontend.cpp        | 133 +++++++-
+ ps2xRuntime/src/lib/gs/gs_parallel.cpp        | 308 ++++++++++++++++++
  ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp   |   7 +
  ps2xRuntime/src/lib/gs/gs_priv_registers.cpp  |  80 +++++
  ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp    |   2 +-
@@ -27,12 +27,12 @@ Former patches of the series, merged:
  ps2xTest/gs_cache/CMakeLists.txt              |   2 +
  ps2xTest/src/gpu_gs_test_support.h            |  23 ++
  ps2xTest/src/main.cpp                         |   2 +
- ps2xTest/src/ps2_gs_parallel_tests.cpp        | 234 +++++++++++++++
+ ps2xTest/src/ps2_gs_parallel_tests.cpp        | 234 +++++++++++++
  ps2xTest/src/ps2_gs_tests.cpp                 |  60 +++-
  ps2xTest/src/ps2_memory_tests.cpp             |  10 +-
  ps2xTest/src/ps2_runtime_interrupt_tests.cpp  |  13 +-
  ps2xTest/src/ps2_vu1_tests.cpp                |   2 +-
- 26 files changed, 964 insertions(+), 118 deletions(-)
+ 26 files changed, 993 insertions(+), 118 deletions(-)
  create mode 100644 ps2xRuntime/include/runtime/gs/gs_parallel.h
  create mode 100644 ps2xRuntime/src/lib/gs/gs_parallel.cpp
  create mode 100644 ps2xRuntime/src/lib/gs/gs_parallel_stub.cpp
@@ -41,7 +41,7 @@ Former patches of the series, merged:
  create mode 100644 ps2xTest/src/ps2_gs_parallel_tests.cpp
 
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..024ffcb 100644
+index 589d768..c38d193 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
@@ -52,7 +52,7 @@ index 589d768..024ffcb 100644
      src/lib/ps2_iop_host.cpp
      src/lib/ps2_memory.cpp
      src/lib/ps2_pad.cpp
-@@ -507,6 +508,23 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -507,6 +508,26 @@ target_include_directories(ps2_runtime PUBLIC
  )
  
  target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
@@ -63,6 +63,9 @@ index 589d768..024ffcb 100644
 +set(PS2X_PARALLEL_GS_DIR "" CACHE PATH "paraLLEl-GS source checkout (empty: CPU GS only)")
 +if(PS2X_PARALLEL_GS_DIR)
 +    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
++    # Granite's DXGI interop (swapchain sharing for its own WSI) is not used here and needs
++    # Windows SDK headers newer than mingw-w64's.
++    set(GRANITE_VULKAN_DXGI_INTEROP OFF CACHE BOOL "" FORCE)
 +    add_subdirectory(${PS2X_PARALLEL_GS_DIR} ${CMAKE_CURRENT_BINARY_DIR}/parallel-gs EXCLUDE_FROM_ALL)
 +    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_parallel.cpp)
 +    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_PARALLEL_GS=1)
@@ -535,10 +538,10 @@ index 1d4ae16..2aa0c92 100644
      if (!backend)
 diff --git a/ps2xRuntime/src/lib/gs/gs_parallel.cpp b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
 new file mode 100644
-index 0000000..39fa3ac
+index 0000000..9e18d5c
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_parallel.cpp
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,308 @@
 +#include "runtime/gs/gs_parallel.h"
 +#include "runtime/ps2_memory.h"
 +
@@ -549,16 +552,40 @@ index 0000000..39fa3ac
 +
 +#include <cstdlib>
 +#include <cstring>
-+#include <dlfcn.h>
 +#include <mutex>
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
 +
 +namespace
 +{
++#if defined(_WIN32)
++    using LibraryHandle = HMODULE;
++    LibraryHandle openLibrary(const std::string &name) { return LoadLibraryA(name.c_str()); }
++    void *findSymbol(LibraryHandle module, const char *name)
++    {
++        return reinterpret_cast<void *>(GetProcAddress(module, name));
++    }
++#else
++    using LibraryHandle = void *;
++    LibraryHandle openLibrary(const std::string &name) { return dlopen(name.c_str(), RTLD_LOCAL | RTLD_LAZY); }
++    void *findSymbol(LibraryHandle module, const char *name) { return dlsym(module, name); }
++#endif
++
 +    // The Vulkan loader is not on the default dyld path on macOS (Homebrew installs it under
 +    // /opt/homebrew/lib), so look in the usual places; PS2_VULKAN_LIBRARY overrides the search.
 +    PFN_vkGetInstanceProcAddr loadVulkan(std::string &error)
 +    {
-+        static void *module = nullptr;
++        static LibraryHandle module = nullptr;
 +        if (!module)
 +        {
 +            std::vector<std::string> candidates;
@@ -569,12 +596,14 @@ index 0000000..39fa3ac
 +                                                 "/usr/local/lib/libvulkan.1.dylib", "libMoltenVK.dylib",
 +                                                 "/opt/homebrew/lib/libMoltenVK.dylib",
 +                                                 "/usr/local/lib/libMoltenVK.dylib"});
++#elif defined(_WIN32)
++            candidates.emplace_back("vulkan-1.dll");
 +#else
 +            candidates.insert(candidates.end(), {"libvulkan.so.1", "libvulkan.so"});
 +#endif
 +            for (const std::string &candidate : candidates)
 +            {
-+                module = dlopen(candidate.c_str(), RTLD_LOCAL | RTLD_LAZY);
++                module = openLibrary(candidate);
 +                if (module)
 +                    break;
 +            }
@@ -584,7 +613,7 @@ index 0000000..39fa3ac
 +                return nullptr;
 +            }
 +        }
-+        auto addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(module, "vkGetInstanceProcAddr"));
++        auto addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(findSymbol(module, "vkGetInstanceProcAddr"));
 +        if (!addr)
 +            error = "the Vulkan library has no vkGetInstanceProcAddr";
 +        return addr;
