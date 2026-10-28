@@ -29,7 +29,7 @@ For the movie path, install FFmpeg (`brew install ffmpeg`) and build with `ENABL
 
 ### Linux (Docker) and Windows (llvm-mingw) builds
 
-Trial builds on other platforms; neither is part of `make build`.
+Trial builds on other platforms; neither is part of `make build`. Both compile, but they have hardly been tested: macOS on Apple Silicon is the only platform the game has been run and measured on (on Linux it was only started once, headless and on a software Vulkan driver; nothing was run on Windows; no tests, no battle, no sound check).
 
 **Linux arm64 in Docker** (`docker/Dockerfile`: Ubuntu 24.04, clang, the raylib/Vulkan/FFmpeg development packages, xvfb, Mesa lavapipe). Pass `--platform linux/arm64` explicitly: with `DOCKER_DEFAULT_PLATFORM=linux/amd64` the image is x86_64 under emulation, and **Linux x86_64 does not build** (the x86 path of the CMake files adds no `-msse4.1`, and the generated MMI code needs it: `_mm_max_epi32 requires target feature 'sse4.1'`).
 

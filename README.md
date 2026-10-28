@@ -10,6 +10,7 @@ This repository holds the patches to PS2Recomp, the recompiler configuration and
 - Graphics use [paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs), a Vulkan GS renderer (MoltenVK on macOS), with optional anti-aliasing and bicubic scaling in the window.
 - Sound, the start-up and menu movies (optional, needs FFmpeg), the display-mode choice (PAL60 by default) and two-player controls are in place.
 - On an M1 Pro on mains power the demo battle runs at 58–59 frames per second (60 is the target). Speed depends on recorded VU microprograms, see [Speed](#speed).
+- It also compiles for Linux (arm64, in Docker) and for Windows (x86_64, cross-compiled with llvm-mingw), but those builds have hardly been tested: on Linux the game only reached the title screen on a software Vulkan driver, and the Windows executable has never been run. macOS on Apple Silicon is the only tested platform; see `recomp/README.md`, "Linux (Docker) and Windows (llvm-mingw) builds".
 - Known gaps include the menu and battle background music and some rare issues. `recomp/README.md` lists them with the measurements behind them.
 
 This is a work in progress, not a finished port.
@@ -158,6 +159,7 @@ Set these as environment variables, for example `PS2_HOST_AA=fxaa make run`.
 | `recomp/series`, `recomp/NNNN-*.patch`, `recomp/upstream/` | The patches applied to PS2Recomp, in order: one local patch per problem area, plus open upstream pull requests taken as they are. |
 | `recomp/sc3.toml`, `recomp/display_mode.toml`, `recomp/skip_intro.toml` | The recompiler configuration and the instruction patches for the display-mode dialog and the start-up movies. |
 | `recomp/parallel-gs/` | Patches to the paraLLEl-GS renderer. |
+| `recomp/docker/` | Trial builds for Linux (Docker) and Windows (llvm-mingw cross-build); they compile but are hardly tested. |
 | `recomp/debug/`, `recomp/experimental/` | Diagnostics and experiments that are never applied by default. |
 | `recomp/README.md` | The technical record: what each patch does, findings, measurements and known gaps. |
 | `CLAUDE.md` | Notes for working on the code: how to run the tests and produce a patch. |
