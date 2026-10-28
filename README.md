@@ -125,7 +125,7 @@ Set these as environment variables, for example `PS2_HOST_AA=fxaa make run`.
 
 ## Speed
 
-- **Use mains power.** macOS Low Power Mode on battery cuts the speed by about a quarter.
+- **Use mains power.** Low Power Mode on battery cuts the speed by about a quarter.
 - **Record the VU microprograms once.** The game uploads its VU0 and VU1 microcode at run time, so it cannot be recompiled with the ELF. The build compiles the programs you have recorded into the runner; programs that are not recorded are interpreted, which is several times slower in battle (a 3.6x difference was measured for VU1). A fresh checkout has no recording, so do this after the first build:
 
   ```sh
