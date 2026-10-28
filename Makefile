@@ -6,7 +6,7 @@ RUNNER  := $(WORK)/PS2Recomp/out/build/ps2xRuntime/ps2EntryRunner
 .PHONY: run build ghidra help
 
 help:
-	@echo "make build  - extract disc, build PS2Recomp, recompile the ELF, build the runner"
+	@echo "make build  - extract disc, build PS2Recomp, recompile the ELF, build the runner (ISO=<path> when the disc image is not the only .iso here)"
 	@echo "make ghidra - import the ELF into Ghidra and export the function map used by make build"
 	@echo "make run    - launch the recompiled game"
 

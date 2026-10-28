@@ -4,6 +4,7 @@
 !/.gitignore
 !/AGENTS.md
 !/CLAUDE.md
+!/LICENSE
 !/Makefile
 !/README.md
 !/recomp/
@@ -16,6 +17,7 @@
 !/recomp/parallel-gs.commit
 !/recomp/README.md
 !/recomp/build.sh
+!/recomp/test_build_iso.sh
 !/recomp/ghidra_export.sh
 !/recomp/pointer_entries.py
 !/recomp/sc3.toml

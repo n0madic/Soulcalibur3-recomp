@@ -1,21 +1,37 @@
 #!/usr/bin/env bash
 # Reproduces the static recompilation of Soulcalibur III (PAL, SCES_533.12) with PS2Recomp.
 # Usage: ./recomp/build.sh [WORK_DIR]   (default: ./recomp/work, ~7 GB free space needed)
+# The disc image is ISO=<path>; without it the only *.iso in the repository root is used.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$HERE")"
 WORK="${1:-$HERE/work}"
-ISO="$ROOT/Soulcalibur III (Europe, Australia) (En,Fr,De,Es,It) (v2.00).iso"
 COMMIT="$(cat "$HERE/PS2Recomp.commit")"
+
+ISO="${ISO:-}"
+if [ -n "$ISO" ]; then
+  [ -f "$ISO" ] || { echo "Disc image not found: $ISO" >&2; exit 1; }
+  ISO="$(cd "$(dirname "$ISO")" && pwd)/$(basename "$ISO")" # the script changes directory below
+fi
 
 mkdir -p "$WORK"
 cd "$WORK"
 
 # 1. Extract the disc (the runtime resolves cdrom0: relative to the ELF directory).
 if [ ! -f game/SCES_533.12 ]; then
+  if [ -z "$ISO" ]; then
+    ISOS=()
+    while IFS= read -r image; do ISOS+=("$image"); done < <(find "$ROOT" -maxdepth 1 -type f -iname '*.iso')
+    case "${#ISOS[@]}" in
+      1) ISO="${ISOS[0]}" ;;
+      0) echo "No disc image found: put your .iso in $ROOT or run ISO=/path/to/disc.iso ./recomp/build.sh" >&2; exit 1 ;;
+      *) echo "More than one .iso in $ROOT: choose one with ISO=/path/to/disc.iso" >&2; exit 1 ;;
+    esac
+  fi
   mkdir -p game
   7z x -y -ogame "$ISO"
+  [ -f game/SCES_533.12 ] || { echo "$ISO has no SCES_533.12: only the PAL release (SCES-53312) is supported" >&2; exit 1; }
 fi
 
 # 2. Fetch PS2Recomp at the tested commit and apply local patches.

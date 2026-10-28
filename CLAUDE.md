@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp), on macOS arm64. This repository tracks a series of patches against PS2Recomp (one per problem area), recompiler configuration, build/analysis scripts, and progress documentation. PS2Recomp itself, the original disc image, extracted game files, generated game code, recorded VU microcode, captures, working directories, and caches stay local and are excluded from Git by the root `.gitignore` source allowlist. `recomp/README.md` is the main document: it lists the patches and the problem areas they belong to, records findings and measurements, and lists the known gaps. Read it before changing anything, and add or update its row (and its details) for every patch you change.
+A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp), on macOS arm64. This repository tracks a series of patches against PS2Recomp (one per problem area), recompiler configuration, build/analysis scripts, and progress documentation. PS2Recomp itself, the original disc image, extracted game files, generated game code, recorded VU microcode, captures, working directories, and caches stay local and are excluded from Git by the root `.gitignore` source allowlist. The root `README.md` is the user-facing guide (what the project is, how to build and run it, controls, options, troubleshooting); keep it in step with `Makefile`, `recomp/build.sh`, the pad mapping and the environment variables whenever those change. `recomp/README.md` is the main technical document: it lists the patches and the problem areas they belong to, records findings and measurements, and lists the known gaps. Read it before changing anything, and add or update its row (and its details) for every patch you change. The repository is licensed under the GPL-3.0 (`LICENSE`), like PS2Recomp.
 
 ## Layout
 
@@ -13,6 +13,7 @@ A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ra
 - `recomp/debug/*.patch` are diagnostics that are never applied by default.
   - `diagnostics-scene-state.patch`: frame dumps and the `[TEMP-DEBUG globals]` scene/tick line.
   - `diagnostics-vu1-verify.patch`: `PS2_VU_VERIFY=1` shadows each compiled VU run with the interpreter.
+  - Both apply on top of the whole series. `diagnostics-full.patch` and `diagnostics-loader-threads.patch` are historical records of the early investigations and no longer apply to the series.
 - `recomp/experimental/*.patch` are experiments that are never applied by default and are not in `series`; each applies on top of the whole series, and `recomp/README.md` says what it showed. `gs-pipeline-thread.patch` runs the VIF1, VU1 and GIF work on a worker thread (`PS2_GS_THREAD=1`) and is no faster in battle.
 - `recomp/parallel-gs/` holds patches to the paraLLEl-GS clone in `work/deps/parallel-gs`: `*.patch` for its Granite submodule, `gs/*.patch` for paraLLEl-GS itself. `build.sh` applies them only when it clones.
 - `recomp/sc3.toml` is the recompiler config, including the stub list that maps library functions to runtime HLE stubs. `recomp/display_mode.toml` holds instruction patches that answer the display-mode dialog with PAL60 (`DISPLAY_DIALOG=1` keeps it), and `recomp/skip_intro.toml` those that skip the movies (`SKIP_INTRO=0` keeps them).
@@ -28,7 +29,7 @@ A static recompilation of Soulcalibur III (PAL, boot ELF `SCES_533.12`) with [ra
 
 The first full build of the runner takes about 5 minutes (since the Ghidra far-chunk fix in `0001-recompiler-function-boundaries-and-delay-slots`). Changing any runtime header recompiles all ~2100 generated units; ccache helps with this.
 
-Full build: extract the ISO, clone and patch PS2Recomp, recompile, build the runner.
+Full build: extract the disc image (the only `*.iso` in the repository root, or `ISO=<path>`), clone and patch PS2Recomp, recompile, build the runner.
 ```sh
 make build
 ```
@@ -56,6 +57,7 @@ PS2_TEST_REQUIRE_GPU=1 PS2_VU_PROGRAM_FIXTURES=<fixture dir> PS2_VU_REQUIRE_PROG
 - **Fixtures.** The VU fixtures come from `python3 ps2xTest/data/vu_programs.py <dir>`. Configure CMake with that directory and pass the same directory at run time.
 - **Single test.** The MiniTest runner has no filter. Run the whole binary and grep the output for the test case name; failures print as `[Failed]` followed by `- message` lines.
 - **Other suites.**
+  - Disc image lookup of `build.sh`: `./recomp/test_build_iso.sh` (fake `7z` and `git`, nothing is built).
   - Generator tests: `python3 -m unittest discover tools/tests`.
   - `gs_cache` suites: `ctest` in `ps2xTest`.
   - IOP suites: `ctest` in `ps2xIOP`, after configuring with `-DPS2X_IOP_BUILD_TESTS=ON`.
