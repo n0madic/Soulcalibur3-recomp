@@ -4,3 +4,4 @@ patches/02-pr36-vu0-aot.patch
 patches/03-pr37-audio-recovery.patch
 patches/04-window-poll-diagnostics.patch
 patches/05-host-input-and-audio.patch
+patches/06-window-title-and-macos-ram.patch

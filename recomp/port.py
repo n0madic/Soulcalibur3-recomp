@@ -192,6 +192,7 @@ def run(work, extra):
         raise RuntimeError("Build does not match the current pin/patches: run make build")
     install_default_keys(engine)
     env = environment(work)
+    env.setdefault("PS2_WINDOW_TITLE", "Soulcalibur III")
     env.setdefault("PS2_HITCH_LOG", "30")
     env.setdefault("PS2_VU0_RECORD", str(engine / "games/sc3/vu0"))
     env.setdefault("PS2_VU_RECORD", str(engine / "games/sc3/vu1"))

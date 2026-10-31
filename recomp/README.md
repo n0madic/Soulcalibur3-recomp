@@ -21,6 +21,7 @@ Upstream pin: **`b98334b2c9b5cac112661dc5a94afb1afafb1321`**, stored in `ps2-nat
 | `03-pr37-audio-recovery.patch` | Fast recovery after isolated producer pauses, [#37](https://github.com/exoteric33/ps2-native-recomp/pull/37); follows merged #33. |
 | `04-window-poll-diagnostics.patch` | SDL event details and a bounded macOS stall sampler; local diagnostic commit `32c8fd7`. |
 | `05-host-input-and-audio.patch` | Stop unused IME text input, request 512-frame audio blocks on macOS, log the obtained block size. |
+| `06-window-title-and-macos-ram.patch` | Optional `PS2_WINDOW_TITLE` prefix (launcher default: `Soulcalibur III`), and current resident process memory via Mach on macOS. |
 
 The PR labels above describe what is absent from the pinned commit, not a live merge-status check. When updating the pin, remove a patch if its change is now upstream; never apply both copies. The build fingerprint includes the pin, ordered patch names and contents.
 
