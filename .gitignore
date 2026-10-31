@@ -1,5 +1,4 @@
-# Only port sources and tooling belong in this repository.
-# New files/directories stay local until explicitly allowed below.
+# Track only port sources and tooling. Game-derived material stays local.
 /*
 !/.gitignore
 !/AGENTS.md
@@ -7,62 +6,29 @@
 !/LICENSE
 !/Makefile
 !/README.md
+!/launch.command
 !/recomp/
-
 /recomp/*
-!/recomp/[0-9][0-9][0-9][0-9]-*.patch
-!/recomp/series
-!/recomp/upstream/
-!/recomp/PS2Recomp.commit
-!/recomp/parallel-gs.commit
 !/recomp/README.md
 !/recomp/build.sh
-!/recomp/test_build_iso.sh
-!/recomp/ghidra_export.sh
-!/recomp/pointer_entries.py
-!/recomp/sc3.toml
-!/recomp/skip_intro.toml
-!/recomp/debug/
-!/recomp/docker/
-!/recomp/experimental/
-!/recomp/ghidra_scripts/
-!/recomp/parallel-gs/
-
-/recomp/debug/*
-!/recomp/debug/diagnostics-*.patch
-/recomp/docker/*
-!/recomp/docker/Dockerfile
-!/recomp/docker/build-mingw.sh
-!/recomp/docker/llvm-mingw-toolchain.cmake
-/recomp/experimental/*
-!/recomp/experimental/*.patch
-/recomp/upstream/*
-!/recomp/upstream/[0-9][0-9]-*.patch
-/recomp/ghidra_scripts/*
-!/recomp/ghidra_scripts/*.java
-/recomp/parallel-gs/*
-!/recomp/parallel-gs/*.patch
-!/recomp/parallel-gs/gs/
-/recomp/parallel-gs/gs/*
-!/recomp/parallel-gs/gs/*.patch
-
-# Original game files, local checkouts, generated code, VU recordings,
-# dependencies, captures, analysis projects and build outputs stay here.
+!/recomp/run.sh
+!/recomp/port.py
+!/recomp/ps2-native-recomp.commit
+!/recomp/series
+!/recomp/patches/
+!/recomp/tests/
+/recomp/patches/*
+!/recomp/patches/*.patch
+/recomp/tests/*
+!/recomp/tests/test_*.py
 /recomp/work/
-
-# Local caches and editor/OS temporary files, including allowed directories.
 **/__pycache__/
 **/.cache/
 **/.ccache/
-**/CMakeFiles/
-**/node_modules/
 *.py[cod]
 *.log
 *.tmp
-*.bak
 *.orig
 *.rej
-*.swp
-*.swo
 .DS_Store
 ._*

@@ -1,22 +1,18 @@
-WORK    := $(CURDIR)/recomp/work
-GAME    := $(WORK)/game
-ELF     := $(GAME)/SCES_533.12
-RUNNER  := $(WORK)/PS2Recomp/out/build/ps2xRuntime/ps2EntryRunner
+WORK ?= $(CURDIR)/recomp/work
+EXPLORE ?= 1
+export ISO EXPLORE PS2_JOBS
 
-.PHONY: run build ghidra help
-
+.PHONY: help build run test test-runtime
 help:
-	@echo "make build  - extract disc, build PS2Recomp, recompile the ELF, build the runner (ISO=<path> when the disc image is not the only .iso here)"
-	@echo "make ghidra - import the ELF into Ghidra and export the function map used by make build"
-	@echo "make run    - launch the recompiled game"
-
+	@echo 'make build         - build SC3 with ps2-native-recomp (ISO=<path>, EXPLORE=0 skips exploration)'
+	@echo 'make run           - launch SC3 (ARGS="--fullscreen" passes runner options)'
+	@echo 'make test          - test build/launch tooling without a disc'
+	@echo 'make test-runtime  - run synthetic audio, VU0 and window-watchdog tests'
 build:
 	./recomp/build.sh "$(WORK)"
-
-ghidra:
-	./recomp/ghidra_export.sh "$(WORK)"
-
 run:
-	@test -x "$(RUNNER)" || { echo "Runner not built: run 'make build' first"; exit 1; }
-	@test -f "$(ELF)" || { echo "Disc not extracted: run 'make build' first"; exit 1; }
-	cd "$(GAME)" && "$(RUNNER)" "$(ELF)"
+	./recomp/run.sh "$(WORK)" $(ARGS)
+test:
+	python3 -m unittest discover -s recomp/tests -v
+test-runtime:
+	python3 recomp/port.py test-runtime --work "$(WORK)"
