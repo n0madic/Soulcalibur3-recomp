@@ -157,6 +157,7 @@ def build(work, no_explore=False, frames=3600, rounds=8):
     if cached.is_symlink() and not cached.exists():
         cached.unlink()
     call([bash, engine / "scripts/setup.sh", "--native-only"], env=env)
+    install_default_keys(engine)
     args = [bash, engine / "scripts/port.sh", "sc3", iso, "--native-only",
             "--frames", frames, "--rounds", rounds]
     if no_explore or os.environ.get("EXPLORE") == "0":
@@ -176,12 +177,20 @@ def runner_command(engine, extra=()):
             str(engine / "games/sc3/play.ps2"), *extra]
 
 
+def install_default_keys(engine):
+    destination = engine / "games/sc3/keys.ini"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        shutil.copyfile(HERE / "keys.ini", destination)
+
+
 def run(work, extra):
     engine = work / "ps2-native-recomp"
     args = runner_command(engine, extra)
     stamp = engine / "build/sc3-port-build.json"
     if not stamp.is_file() or json.loads(stamp.read_text())["fingerprint"] != configuration()[2]:
         raise RuntimeError("Build does not match the current pin/patches: run make build")
+    install_default_keys(engine)
     env = environment(work)
     env.setdefault("PS2_HITCH_LOG", "30")
     env.setdefault("PS2_VU0_RECORD", str(engine / "games/sc3/vu0"))

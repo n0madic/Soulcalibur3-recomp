@@ -66,13 +66,15 @@ The launcher uses the original extracted ELF and ISO. Saves go to `games/sc3/pla
 
 ### Controls
 
-The active game window receives keyboard and mouse input. These are the upstream defaults; existing local `keys.ini` settings take precedence.
+The active game window receives keyboard input. On first launch the port installs its fighting layout from `recomp/keys.ini`; existing local `keys.ini` settings take precedence.
 
 | Action | Input |
 | --- | --- |
 | Start / Select | **Esc** / Tab or Backspace |
-| Cross / Circle | Space or Enter / E or middle mouse |
-| Square / Triangle | Left mouse / right mouse |
+| Square: horizontal attack (A) | **Z** |
+| Triangle: vertical attack (B) | **V** |
+| Circle: kick (K) | **C** |
+| Cross: guard (G) / menu confirm | **X**, Enter or Keypad Enter |
 | D-pad / left stick | Arrow keys / W A S D |
 | L1 / R1 | Left Shift / F |
 | L2 / R2 | Q / R |
@@ -80,7 +82,7 @@ The active game window receives keyboard and mouse input. These are the upstream
 | Quick save / quick load | F5 / F8 |
 | Problem report | F9 |
 
-Edit `games/sc3/keys.ini` to remap controls; the runtime reloads it when the game regains focus. Controllers are supported by the runtime, but keyboard/mouse input is the locally tested path.
+L3, R3 and the combined rage shortcut are unbound to free X/C/V. Edit `games/sc3/keys.ini` to remap controls; the runtime reloads it when the game regains focus. Delete that file and launch with `make run` to restore the port defaults. Controllers are supported by the runtime, but keyboard input is the locally tested path.
 
 ### Useful runtime options
 
