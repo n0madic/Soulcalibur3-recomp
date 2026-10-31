@@ -22,6 +22,9 @@ Upstream pin: **`b98334b2c9b5cac112661dc5a94afb1afafb1321`**, stored in `ps2-nat
 | `04-window-poll-diagnostics.patch` | SDL event details and a bounded macOS stall sampler; local diagnostic commit `32c8fd7`. |
 | `05-host-input-and-audio.patch` | Stop unused IME text input, request 512-frame audio blocks on macOS, log the obtained block size. |
 | `06-window-title-and-macos-ram.patch` | Optional `PS2_WINDOW_TITLE` prefix (launcher default: `Soulcalibur III`), and current resident process memory via Mach on macOS. |
+| `07-compact-raster-setup.patch` | Load GS setup fields on demand and keep only three words live; preserves shading arithmetic and texture quality. |
+| `08-upscaled-metal-latency.patch` | Prefer one presentation frame in flight on Metal when `PS2_SCALE>1`; an explicit `PS2_FRAME_LATENCY=1..8` overrides this. |
+| `09-readback-diagnostics.patch` | Opt-in `PS2_READBACK_LOG=1` separates readback encoding, map wait and CPU copy time, and logs waits for asynchronous transfers. |
 
 The PR labels above describe what is absent from the pinned commit, not a live merge-status check. When updating the pin, remove a patch if its change is now upstream; never apply both copies. The build fingerprint includes the pin, ordered patch names and contents.
 
@@ -71,3 +74,9 @@ The previous experimental source patches and long investigation notes remain ava
 The new pinned checkout plus the five-patch series was built through `make build EXPLORE=0`. All 12 disc-free wrapper tests pass, including repeat preparation, source-edit preservation, rollback, image selection, native-only arguments and failed-build stamp invalidation. `make test-runtime` passes 232/232 audio checks, the watchdog gate test and the exact VU0 differential/CLI/negative-control suite. The pinned base also passes its 84 IOP thread-manager checks and SIF completion checks.
 
 The new root `make run` completed all 8723 frames of the private input playback (exit 0), using a copied card, original ELF/ISO and no VU0 verifier. Audio reported zero dry events, zero dropped samples and 0.29 s stretched output, slowest ratio x1.57. This checks startup/menu/battle progression through the new entry point; it retains the known continue-on-hash-divergence limitation. Local evidence is in `work/migration-validation/`, with build/test logs under `work/`. The executable is about 44.6 MiB on arm64; no executable or game-derived data is tracked.
+
+## Graphics performance
+
+`PS2_SCALE=2 make run` renders at twice the native width and height. This increases pixel work fourfold; it can still exceed the PAL 20 ms frame budget on an M1 Pro. `PS2_LOOK=soft_edges` only softens the final image and does not replace texture minification filtering.
+
+The compact GS setup patch reduced the sampled scene's raster benchmark from 19.2 to 16.1 ms at 2× (6.8 to 6.5 ms at 1×), with unchanged framebuffer checks in the test scene. These are measurements of one captured scene on Metal, not a guarantee for every scene or GPU. The shorter upscaled Metal presentation queue reduces work ahead of synchronous VRAM reads; it does not make those reads free. Set `PS2_FRAME_LATENCY=2` to compare the previous presentation queue setting.

@@ -1,0 +1,20 @@
+--- a/runtime/src/gs/gpu/gpu.cpp
++++ b/runtime/src/gs/gpu/gpu.cpp
+@@ -2294,6 +2294,17 @@
+         else std::fprintf(stderr, "[gpu] PS2_PRESENT_MODE=%s is not fifo, relaxed, mailbox or immediate, or this surface does not offer it: ignored\n", want.c_str());
+     }
+     if (const int latency = std::atoi(os::env("PS2_FRAME_LATENCY").c_str()); latency >= 1 && latency <= 8) g_frame_latency = static_cast<std::uint32_t>(latency);
++#ifndef __EMSCRIPTEN__
++    // Upscaling can leave several expensive frames ahead of a CPU-visible VRAM
++    // read. Prefer a shorter presentation queue on Metal; an explicit setting wins.
++    if (g_scale > 1 && os::env("PS2_FRAME_LATENCY").empty()) {
++        WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
++        if (wgpuAdapterGetInfo(g_adapter, &info) == WGPUStatus_Success) {
++            if (info.backendType == WGPUBackendType_Metal) g_frame_latency = 1;
++            wgpuAdapterInfoFreeMembers(info);
++        }
++    }
++#endif
+     {
+         std::string offers;
+         for (std::size_t i = 0; i < caps.presentModeCount; ++i) offers += std::string(i ? ", " : "") + present_mode_name(caps.presentModes[i]);
