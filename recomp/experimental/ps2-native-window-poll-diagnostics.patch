@@ -1,0 +1,195 @@
+diff --git a/docs/window-poll-diagnostics.md b/docs/window-poll-diagnostics.md
+new file mode 100644
+index 0000000..6ba55f5
+--- /dev/null
++++ b/docs/window-poll-diagnostics.md
+@@ -0,0 +1,9 @@
++# Short Cocoa event-loop stalls
++
++SC3's 2026-10-31 13:56:18 log contains 47 emulation frames over 30 ms. At frames 4112 and 7260, SDL_PollEvent takes 365.7/362.8 ms and the emulation thread waits for the window for 323.8/319.6 ms. Audio runs dry at both points. The owner reports the game window stayed active; switching or resizing must not be assumed. There are also 39 slow frames with at least 10 ms of audio pacing and six without a substantial window/audio wait. No live compilation occurred.
++
++The old log records only event type 0x200 (SDL_WINDOWEVENT). It cannot identify the native call that blocked, and the returned event need not itself be the cause of a long event pump. Slow polls now report window subtype/data/flags or keyboard scancode, as applicable.
++
++On macOS, when PS2_HITCH_LOG is enabled, a separate watchdog notices a poll still running after 120 ms and starts `/usr/bin/sample` on this process. It captures one second at 5 ms intervals, into the game's logs folder. The `[window-sample]` log line names the `.sample.txt`; a matching `.status.txt` records sampler errors. Captures are limited to four attempts per run, separated by at least ten seconds. This is diagnostic instrumentation, not a claim that the native stall has been fixed.
++
++Validation: `clang++ -std=c++20 -O2 -g -I. tests/poll_watchdog_test.cpp -o /tmp/poll_watchdog_test`, then run it without arguments to test threshold, once-per-poll behavior, cooldown and the cap. On macOS pass a temporary directory to exercise a real sample of the test process during a deliberate blocking interval. The local check produced a symbolicated report showing the test thread inside nanosleep while blocked. No game data is needed.
+diff --git a/host/poll_watchdog.hpp b/host/poll_watchdog.hpp
+new file mode 100644
+index 0000000..12917be
+--- /dev/null
++++ b/host/poll_watchdog.hpp
+@@ -0,0 +1,87 @@
++#pragma once
++
++#include <cstdint>
++
++namespace windowdiag {
++
++// Sample each long poll once, with a bounded number of captures and a cooldown.
++struct StallGate {
++    std::int64_t previous_poll = 0, previous_capture = 0;
++    unsigned captures = 0;
++    bool capture(std::int64_t now, std::int64_t poll_started) {
++        if (!poll_started || now < poll_started || now - poll_started < 120'000'000 || poll_started == previous_poll || captures >= 4) return false;
++        if (captures && now - previous_capture < 10'000'000'000ll) return false;
++        previous_poll = poll_started;
++        previous_capture = now;
++        ++captures;
++        return true;
++    }
++};
++
++}  // namespace windowdiag
++
++#ifdef __APPLE__
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <spawn.h>
++#include <string>
++#include <thread>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++extern char **environ;
++
++namespace windowdiag {
++
++class PollWatchdog {
++public:
++    std::atomic<std::int64_t> polling_since{0};
++
++    void start(const std::filesystem::path &directory) {
++        if (worker_.joinable()) return;
++        worker_ = std::jthread([this, directory](std::stop_token stop) {
++            StallGate gate;
++            pid_t sampler = -1;
++            while (!stop.stop_requested()) {
++                if (sampler > 0) {
++                    const pid_t result = waitpid(sampler, nullptr, WNOHANG);
++                    if (result == sampler || (result < 0 && errno == ECHILD)) sampler = -1;
++                }
++                const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++                if (sampler < 0 && gate.capture(now, polling_since.load(std::memory_order_acquire))) {
++                    std::error_code error;
++                    std::filesystem::create_directories(directory, error);
++                    if (!error) {
++                        const std::string pid = std::to_string(getpid());
++                        const std::string base = (directory / ("window-stall-" + pid + "-" + std::to_string(now))).string();
++                        const std::string output = base + ".sample.txt", status = base + ".status.txt";
++                        const char *args[] = {"/usr/bin/sample", pid.c_str(), "1", "5", "-file", output.c_str(), nullptr};
++                        posix_spawn_file_actions_t actions;
++                        int result = posix_spawn_file_actions_init(&actions);
++                        if (!result) {
++                            result = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, status.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
++                            if (!result) result = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
++                            if (!result) result = posix_spawn(&sampler, args[0], &actions, nullptr, const_cast<char **>(args), environ);
++                            posix_spawn_file_actions_destroy(&actions);
++                        }
++                        std::fprintf(stderr, "[window-sample] SDL polling exceeded 120 ms; capture %u/4: %s (spawn %d)\n",
++                                     gate.captures, output.c_str(), result);
++                        if (result) sampler = -1;
++                    }
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(10));
++            }
++            if (sampler > 0) while (waitpid(sampler, nullptr, 0) < 0 && errno == EINTR) {}
++        });
++    }
++
++private:
++    std::jthread worker_;
++};
++
++}  // namespace windowdiag
++#endif
+diff --git a/host/window.cpp b/host/window.cpp
+index 1159ccc..4dfe100 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -42,6 +42,7 @@
+ #include <vector>
+ 
+ #include "keymap.hpp"
++#include "poll_watchdog.hpp"
+ #include "ps2/hitch.hpp"
+ #include "ps2/os.hpp"
+ #include "ps2/video.hpp"
+@@ -74,6 +75,7 @@ constexpr PadBinding kPadButtons[] = {
+ SDL_Window *g_window = nullptr;
+ #ifdef __APPLE__
+ SDL_MetalView g_metal_view = nullptr;
++windowdiag::PollWatchdog g_poll_watchdog;
+ #endif
+ SDL_Renderer *g_renderer = nullptr;
+ SDL_Texture *g_texture = nullptr;
+@@ -797,10 +799,22 @@ bool timed_poll_event(SDL_Event &e) {
+     window_stage("asking the system for window events (SDL_PollEvent)");
+     if (!ps2::hitch::on()) return SDL_PollEvent(&e) != 0;
+     const auto t0 = ps2::hitch::Clock::now();
++#ifdef __APPLE__
++    g_poll_watchdog.polling_since.store(ps2::hitch::now_ns(), std::memory_order_release);
++#endif
+     const bool got = SDL_PollEvent(&e) != 0;
++#ifdef __APPLE__
++    g_poll_watchdog.polling_since.store(0, std::memory_order_release);
++#endif
+     const double ms = ps2::hitch::ms_since(t0);
+-    if (ms > ps2::hitch::threshold_ms() / 3)
+-        std::fprintf(stderr, "[hitch] SDL_PollEvent took %.1f ms (it returned %s, event type 0x%x)%s", ms, got ? "an event" : "nothing", got ? e.type : 0u, "\n");
++    if (ms > ps2::hitch::threshold_ms() / 3) {
++        std::fprintf(stderr, "[hitch] SDL_PollEvent took %.1f ms (it returned %s, event type 0x%x)", ms, got ? "an event" : "nothing", got ? e.type : 0u);
++        if (got && e.type == SDL_WINDOWEVENT)
++            std::fprintf(stderr, "; window subtype %u, data %d/%d, flags 0x%x", e.window.event, e.window.data1, e.window.data2, SDL_GetWindowFlags(g_window));
++        if (got && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP))
++            std::fprintf(stderr, "; key scancode %d repeat %u", e.key.keysym.scancode, e.key.repeat);
++        std::fputc('\n', stderr);
++    }
+     return got;
+ }
+ 
+@@ -1419,6 +1433,9 @@ void watchdog() {
+ #endif
+ 
+ int run_window(const std::function<int()> &emulate) {
++#ifdef __APPLE__
++    if (ps2::hitch::on()) g_poll_watchdog.start(ps2::os::path(ps2::quick_folder("logs")));
++#endif
+     ps2::init_graphics();
+     g_gpu_present = attach_gpu();
+     std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
+diff --git a/tests/poll_watchdog_test.cpp b/tests/poll_watchdog_test.cpp
+new file mode 100644
+index 0000000..d00b107
+--- /dev/null
++++ b/tests/poll_watchdog_test.cpp
+@@ -0,0 +1,26 @@
++#include "host/poll_watchdog.hpp"
++#include <cassert>
++#include <chrono>
++#include <thread>
++#include <cstdio>
++int main(int argc, char **argv) {
++    windowdiag::StallGate g;
++    assert(!g.capture(200000000, 0));
++    assert(!g.capture(200000000, 100000000));
++    assert(g.capture(230000000, 100000000));
++    assert(!g.capture(300000000, 100000000));
++    assert(!g.capture(800000000, 600000000));
++    for (int i=1; i<4; ++i) assert(g.capture(230000000 + i*11000000000ll, 100000000 + i*11000000000ll));
++    assert(!g.capture(50000000000ll, 49000000000ll));
++    std::puts("Stall threshold, once per poll, cooldown and capture limit passed");
++#ifdef __APPLE__
++    if (argc > 1) {
++        windowdiag::PollWatchdog watch;
++        watch.start(argv[1]);
++        watch.polling_since.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++        std::this_thread::sleep_for(std::chrono::milliseconds(700));
++        watch.polling_since.store(0);
++        std::this_thread::sleep_for(std::chrono::milliseconds(1400));
++    }
++#endif
++}

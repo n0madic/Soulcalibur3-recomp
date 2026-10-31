@@ -1,0 +1,115 @@
+diff --git a/docs/audio-pacing.md b/docs/audio-pacing.md
+index 966805d..0303718 100644
+--- a/docs/audio-pacing.md
++++ b/docs/audio-pacing.md
+@@ -9,3 +9,11 @@ The macOS host also requests 512-frame callbacks (10.67 ms at 48 kHz) to reduce
+ Considered alternatives were smaller device blocks, a continuous queue allowance, pacing to a wall clock, and asynchronous unstretched output. The first two preserve the existing audio-clock synchronization and pitch-preserving stretcher; the latter two change synchronization behavior and were not selected.
+ 
+ Validation: the added recovery checks fail against the original header (40/42 virtual-time checks pass) and pass with the fix. The full stretcher/pipe suite passes 99/99 checks, including pitch, continuity, sustained slow production, a long stall, flushing on load and the stretch limit. Alternating 700-frame saved-state SC3 runs obtained 512-frame callbacks and had no dry queue or dropped samples. Aggregate run-time differences were within run-to-run variation; the isolated recovery test establishes the specific pacing fix, not a general FPS increase.
++
++## Single-frame recovery in PAL50 and NTSC60
++
++The 14:09:51 SC3 report exposed a remaining feedback loop in the continuous tempo-derived allowance. A 72 ms frame makes the gap guard reserve about 111 ms of audio (72 ms plus the stretcher's lookahead/floor). The previous allowance shrank below that reserve while tempo was below normal, preventing replenishment and sustaining stretching until the old gap aged out.
++
++The producer now retains the configured stretched allowance while playback recovers, then lowers that allowance toward its normal value at 100 ms per wall-clock second. Only the producer accesses this state, and the threshold stays fixed during each pacing wait. This preserves headroom and avoids the original instantaneous 40 ms queue drain.
++
++New virtual-time cases use both 800 and 960 audio frames per video frame (60/50 Hz), 512-frame device blocks, a single 72 ms frame and otherwise 11 ms CPU work. Previously recovery took 1.675/1.941 seconds; PAL50 added 26 frames over 30 ms and a 54 ms pacing wait. With the fix both recover in 0.864 seconds; PAL50 has seven frames over 30 ms and a maximum 32 ms pacing wait, with no dry audio. The previous build fails three new checks (45/48 simulation checks); the updated full suite passes 105/105. The initial long CPU/host frame itself remains a separate cause to investigate.
+diff --git a/host/stretch.cpp b/host/stretch.cpp
+index 6cef952..88e502d 100644
+--- a/host/stretch.cpp
++++ b/host/stretch.cpp
+@@ -236,7 +236,7 @@ void Tap::take(std::vector<std::int16_t> &out) {
+     data_.clear();
+ }
+ 
+-SoundPipe::SoundPipe(const PipeConfig &config) : config_(config), marks_(512) {}
++SoundPipe::SoundPipe(const PipeConfig &config) : config_(config), marks_(512), pace_limit_ms_(config.pace_ms) {}
+ 
+ // ---- emulation thread
+ 
+@@ -258,6 +258,14 @@ void SoundPipe::push(const std::int16_t *lr, std::size_t frames, double now) {
+ }
+ 
+ void SoundPipe::frame(double now) {
++    const double dt = pace_frame_time_ < 0.0 ? 0.0 : std::max(0.0, now - pace_frame_time_);
++    pace_frame_time_ = now;
++    // The gap guard needs space to replenish audio after a long frame. Tying
++    // the allowance to tempo makes pacing hold the queue below that space and
++    // prolongs stretching. Keep the stretched allowance, then drain it gradually
++    // in wall time once playback has recovered, without a 40 ms threshold jump.
++    if (tempo() < kEnter) pace_limit_ms_ = config_.pace_stretch_ms;
++    else pace_limit_ms_ = std::max(config_.pace_ms, pace_limit_ms_ - 100.0 * dt);
+     double alive = alive_;
+     if (last_push_t_ >= 0.0 && now - last_push_t_ < kStall) alive += std::max(0.0, now - last_push_t_ - wait_since_);
+     const std::size_t size = marks_.size();
+diff --git a/host/stretch.hpp b/host/stretch.hpp
+index abd65ce..dbe7719 100644
+--- a/host/stretch.hpp
++++ b/host/stretch.hpp
+@@ -111,12 +111,7 @@ public:
+     // Sound waiting, in milliseconds of game time (what the title bar shows).
+     double queued_ms() const { return (static_cast<double>(stretcher_.head()) - position_.load(std::memory_order_relaxed)) / (kRate / 1000.0); }
+     // The emulation waits while this is true.
+-    bool full() const {
+-        // Recovering from a slowdown must not abruptly remove 40 ms of queue
+-        // allowance when tempo reaches 1: that turns recovery into another hitch.
+-        const double limit = config_.pace_ms + (config_.pace_stretch_ms - config_.pace_ms) * (1.0 - tempo());
+-        return queued_ms() > limit;
+-    }
++    bool full() const { return queued_ms() > pace_limit_ms_; }
+     // The tempo now: 1 plays as made, 0.5 twice as slow.
+     double tempo() const { return tempo_.load(std::memory_order_relaxed); }
+     // Drop what is waiting (a state was loaded); the device thread does it before its next block.
+@@ -153,6 +148,7 @@ private:
+     std::vector<Mark> marks_;
+     std::size_t marks_next_ = 0, marks_count_ = 0;
+     double alive_ = 0.0, last_push_t_ = -1.0, wait_since_ = 0.0;
++    double pace_limit_ms_, pace_frame_time_ = -1.0;
+     std::uint64_t pushed_ = 0, dropped_ = 0;
+ 
+     // device thread only
+diff --git a/tests/stretch_test.cpp b/tests/stretch_test.cpp
+index c3d0b66..a8843a1 100644
+--- a/tests/stretch_test.cpp
++++ b/tests/stretch_test.cpp
+@@ -332,12 +332,12 @@ struct Sim {
+         result.input.insert(result.input.end(), buf, buf + 64);
+         pipe.push(buf, 32, at);
+     }
+-    void run_frame(double frame_s) {
++    void run_frame(double frame_s, unsigned sound_frames = 800) {
+         const double start = t, cluster = uniform(0.35, 0.85) * frame_s;
+-        double times[25];
++        std::vector<double> times(sound_frames / 32);
+         for (int i = 0; i < 5; ++i) times[i] = uniform(0.0002, std::max(0.0003, cluster));
+-        std::sort(times, times + 5);
+-        for (int i = 5; i < 25; ++i) times[i] = cluster + 0.00005 * (i - 5);
++        std::sort(times.begin(), times.begin() + 5);
++        for (std::size_t i = 5; i < times.size(); ++i) times[i] = cluster + 0.00005 * (i - 5);
+         for (double off : times) push32(start + off);
+         device_until(start + frame_s);
+         t = start + frame_s;
+@@ -454,6 +454,23 @@ int simulation_main() {
+         check(sim.pipe.stats().dry == 0, "recovery keeps audio supplied");
+         check(sim.pipe.tempo() == 1.0, "recovery reaches normal tempo");
+     }
++    for (const unsigned sound_frames : {800u, 960u}) {
++        std::printf("one 72 ms frame, then CPU headroom (%u audio frames per video frame):\n", sound_frames);
++        Sim sim(on, 512);
++        for (int i = 0; i < 300; ++i) sim.run_frame(0.011, sound_frames);
++        const double begin = sim.t;
++        sim.run_frame(0.072, sound_frames);
++        double recovery = -1.0, longest_wait = 0.0;
++        for (int i = 0; i < 120; ++i) {
++            const double start = sim.t;
++            sim.run_frame(0.011, sound_frames);
++            longest_wait = std::max(longest_wait, (sim.t - start) * 1000.0 - 11.0);
++            if (recovery < 0.0 && sim.t - begin > 0.1 && sim.pipe.tempo() >= 0.995) recovery = sim.t - begin;
++        }
++        check(recovery >= 0.0 && recovery < 1.0, "one long frame does not sustain slow playback", fmt("recovered in %.3f s", recovery).c_str());
++        check(longest_wait < 40.0, "no large pacing drain after one long frame", fmt("longest wait %.1f ms", longest_wait).c_str());
++        check(sim.pipe.stats().dry == 0, "single-frame recovery keeps audio supplied");
++    }
+     for (const double fps : {45.0, 33.0, 20.0}) {
+         std::printf("steady %.0f frames a second:\n", fps);
+         Sim sim(on);

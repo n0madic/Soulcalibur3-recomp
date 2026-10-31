@@ -1,0 +1,620 @@
+diff --git a/docs/vu0-native.md b/docs/vu0-native.md
+new file mode 100644
+index 0000000..848cafd
+--- /dev/null
++++ b/docs/vu0-native.md
+@@ -0,0 +1,19 @@
++# Native VU0 microprograms
++
++VU0 keeps the reference interpreter's truncating arithmetic and externally visible final MAC/status flags. It uses a separate program registry, 4 KiB code/data masks and a generation cache. VU1's vector arithmetic and keys are unchanged. The generator ABI fingerprint has been bumped so old live libraries are rebuilt.
++
++Unknown VU0 programs run in the exact interpreter. `PS2_VU0_RECORD=<directory>` records their 4 KiB code images using the existing key/entry filename convention. Compile recordings with:
++
++```
++vurecomp <vu1-directory> <generated-directory> --vu0-dir <vu0-directory>
++```
++
++`port.sh` also records and compiles `games/<id>/vu0`. The normal runner does not compile VU0 on the fly. Entries with unsupported instructions, register jumps or XGKICK remain entirely interpreted, preserving the pipeline and avoiding duplicate external side effects during verification.
++
++- `PS2_VU0_INTERPRET=1`: force the exact interpreter for A/B comparisons.
++- `PS2_VU0_VERIFY=1`: compare every compiled call with exact interpretation from identical registers and memory. Compare the entire register structure, including TPC, and all 4096 data bytes. Keep the reference result and blacklist an entry on mismatch.
++- `PS2_VU0_STATS=1`: report compiled/interpreted counts every million calls. The final atexit report is available to hosts that exit normally; the window host uses `_Exit`.
++
++Run `python3 scripts/test_vu0_codegen.py` without a game disc. It reuses the shared synthetic instruction fixtures to check 150 random programs and the pipeline cases, full state, code/data wrapping, final flags without a reader, a zero destination mask, per-unit key isolation, code replacement, unknown/register-jump fallback, and a deliberately wrong function to exercise verification and blacklisting. `python3 scripts/test_vu_codegen.py` retains the native VU1 and Wasm regressions.
++
++Local SC3 validation: seven recorded VU0 entries compiled; a complete 5538-frame input replay checked at least 14,940,000 compiled calls with zero state mismatches. The input recording itself has a pre-existing hash divergence at frame 1875, so this is a call-level semantic check, not a claim that the old input recording reproduced the original run exactly. Generated game code, recordings, memory cards and measurement files are kept outside the source patch.
+diff --git a/recomp/vurecomp.cpp b/recomp/vurecomp.cpp
+index f51d5bc..c7b182d 100644
+--- a/recomp/vurecomp.cpp
++++ b/recomp/vurecomp.cpp
+@@ -33,22 +33,27 @@ int main(int argc, char **argv) {
+     }
+ #endif
+     if (argc < 3) {
+-        std::fprintf(stderr, "usage: vurecomp <recorded programs dir> <out dir>\n");
++        std::fprintf(stderr, "usage: vurecomp <recorded VU1 dir> <out dir> [--vu0-dir <recorded VU0 dir>]\n");
+         return 1;
+     }
+     const fs::path in_dir = ps2::os::path(argv[1]), out_dir = ps2::os::path(argv[2]);
+     std::vector<ps2::vurecomp::Input> inputs;
+-    for (const auto &e : fs::directory_iterator(in_dir)) {
++    const auto load = [&](const fs::path &dir, int unit) {
++      if (!fs::exists(dir)) return;
++      for (const auto &e : fs::directory_iterator(dir)) {
+         if (e.path().extension() != ".bin") continue;
+         unsigned long long key = 0;
+         unsigned entry = 0;
+         if (std::sscanf(ps2::os::utf8(e.path().stem()).c_str(), "%llx_%x", &key, &entry) != 2) continue;
+         std::ifstream f(e.path(), std::ios::binary);
+-        ps2::vurecomp::Input in{key, entry, std::vector<std::uint8_t>(16384)};
+-        f.read(reinterpret_cast<char *>(in.code.data()), static_cast<std::streamsize>(in.code.size()));
++        ps2::vurecomp::Input in{key, entry, std::vector<std::uint8_t>(unit == 0 ? 4096 : 16384), unit};
++        if (!f.read(reinterpret_cast<char *>(in.code.data()), static_cast<std::streamsize>(in.code.size()))) continue;
+         inputs.push_back(std::move(in));
+-    }
++      }
++    };
++    load(in_dir, 1);
++    if (argc == 5 && std::string(argv[3]) == "--vu0-dir") load(ps2::os::path(argv[4]), 0);
+     const ps2::vurecomp::Result result = ps2::vurecomp::generate_files(std::move(inputs), out_dir, 0);
+-    std::printf("%zu VU1 programs, %zu of them jump targets%s\n", result.programs, result.jump_targets, result.skipped ? ", the rest left to the interpreter" : "");
++    std::printf("%zu VU programs, %zu of them jump targets%s\n", result.programs, result.jump_targets, result.skipped ? ", the rest left to the interpreter" : "");
+     return 0;
+ }
+diff --git a/recomp/vurecomp_gen.cpp b/recomp/vurecomp_gen.cpp
+index d5934d2..9e6b116 100644
+--- a/recomp/vurecomp_gen.cpp
++++ b/recomp/vurecomp_gen.cpp
+@@ -26,11 +26,12 @@ struct Program {
+     std::uint64_t key;
+     std::uint32_t entry;
+     std::vector<std::uint8_t> code;
++    int unit = 1;
+ };
+ 
+ std::uint32_t word(const std::vector<std::uint8_t> &code, std::uint32_t at) {
+     std::uint32_t v;
+-    std::memcpy(&v, code.data() + (at & kMask), 4);
++    std::memcpy(&v, code.data() + (at & (code.size() - 1u)), 4);
+     return v;
+ }
+ 
+@@ -65,7 +66,7 @@ std::string lane_mask(unsigned d) {
+     return mask + "}";
+ }
+ 
+-Upper upper(std::uint32_t hi, bool flags_live) {
++Upper upper(std::uint32_t hi, bool flags_live, bool exact = false) {
+     Upper u;
+     const unsigned dest = (hi >> 21) & 15u, ft = (hi >> 16) & 31u, fs = (hi >> 11) & 31u, fd = (hi >> 6) & 31u, bc = hi & 3u;
+     const unsigned funct = hi & 63u;
+@@ -151,7 +152,7 @@ Upper upper(std::uint32_t hi, bool flags_live) {
+     }
+     unsigned d = dest;
+     if (kind == Opmula || kind == Opmsub) d = 0xE;
+-    if (d == 0 || (target == 0 && !(flags && flags_live))) return u;
++    if ((d == 0 && !(exact && flags)) || (target == 0 && !(flags && flags_live))) return u;
+     const auto b = [&](int i) -> std::string {
+         switch (src) {
+         case Vec: return vf(ft, i);
+@@ -161,14 +162,14 @@ Upper upper(std::uint32_t hi, bool flags_live) {
+         }
+     };
+     const std::string dst = target == kAcc ? "r.acc" : std::format("r.vf[{}]", target);
+-    const bool vector = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof;
++    const bool vector = !exact && (kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub || kind == Max || kind == Min || kind == Abs || kind == Ftoi || kind == Itof);
+     const bool arithmetic = kind == Add || kind == Sub || kind == Mul || kind == Madd || kind == Msub;
+     if (target != 0) {
+         u.target = target;
+         u.mask = d;
+         u.normalized = vector && arithmetic;
+     }
+-    if (arithmetic) {
++    if (arithmetic && !exact) {
+         const auto operand = [&](unsigned reg) -> std::string {
+             if (!reg) return vreg(0);
+             u.shadow_reads.push_back(static_cast<int>(reg));
+@@ -236,24 +237,24 @@ Upper upper(std::uint32_t hi, bool flags_live) {
+         if (!lane(d, i)) continue;
+         std::string e;
+         switch (kind) {
+-        case Add: e = std::format("add({}, {})", vf(fs, i), b(i)); break;
+-        case Sub: e = std::format("sub({}, {})", vf(fs, i), b(i)); break;
+-        case Mul: e = std::format("mul({}, {})", vf(fs, i), b(i)); break;
+-        case Madd: e = std::format("madd(r.acc.w[{}], {}, {})", i, vf(fs, i), b(i)); break;
+-        case Msub: e = std::format("msub(r.acc.w[{}], {}, {})", i, vf(fs, i), b(i)); break;
+-        case Max: e = std::format("max({}, {})", vf(fs, i), b(i)); break;
+-        case Min: e = std::format("min({}, {})", vf(fs, i), b(i)); break;
++        case Add: e = std::format("{}({}, {})", exact ? "fp::add" : "add", vf(fs, i), b(i)); break;
++        case Sub: e = std::format("{}({}, {})", exact ? "fp::sub" : "sub", vf(fs, i), b(i)); break;
++        case Mul: e = std::format("{}({}, {})", exact ? "fp::mul" : "mul", vf(fs, i), b(i)); break;
++        case Madd: e = (exact ? std::format("fp::add(r.acc.w[{}], fp::mul({}, {}))", i, vf(fs, i), b(i)) : std::format("madd(r.acc.w[{}], {}, {})", i, vf(fs, i), b(i))); break;
++        case Msub: e = (exact ? std::format("fp::sub(r.acc.w[{}], fp::mul({}, {}))", i, vf(fs, i), b(i)) : std::format("msub(r.acc.w[{}], {}, {})", i, vf(fs, i), b(i))); break;
++        case Max: e = std::format("{}({}, {})", exact ? "fp::max" : "max", vf(fs, i), b(i)); break;
++        case Min: e = std::format("{}({}, {})", exact ? "fp::min" : "min", vf(fs, i), b(i)); break;
+         case Abs: e = std::format("({} & 0x7FFFFFFFu)", vf(fs, i)); break;
+         case Ftoi: e = std::format("fp::to_fixed({}, {})", vf(fs, i), frac); break;
+         case Itof: e = std::format("fp::from_fixed(r.vf[{}].sw[{}], {})", fs, i, frac); break;
+         case Opmula: {
+             static const int a[3] = {1, 2, 0}, c[3] = {2, 0, 1};
+-            e = std::format("mul({}, {})", vf(fs, a[i]), vf(ft, c[i]));
++            e = std::format("{}({}, {})", exact ? "fp::mul" : "mul", vf(fs, a[i]), vf(ft, c[i]));
+             break;
+         }
+         case Opmsub: {
+             static const int a[3] = {1, 2, 0}, c[3] = {2, 0, 1};
+-            e = std::format("msub(r.acc.w[{}], {}, {})", i, vf(fs, a[i]), vf(ft, c[i]));
++            e = (exact ? std::format("fp::sub(r.acc.w[{}], fp::mul({}, {}))", i, vf(fs, a[i]), vf(ft, c[i])) : std::format("msub(r.acc.w[{}], {}, {})", i, vf(fs, a[i]), vf(ft, c[i])));
+             break;
+         }
+         default: break;
+@@ -300,7 +301,7 @@ struct Lower {
+     bool supported = true;
+ };
+ 
+-Lower lower(std::uint32_t w, std::uint32_t pc) {
++Lower lower(std::uint32_t w, std::uint32_t pc, std::uint32_t kMask = 16383u) {
+     Lower l;
+     const unsigned dest = (w >> 21) & 15u, it = (w >> 16) & 15u, is = (w >> 11) & 15u, id = (w >> 6) & 15u;
+     const unsigned ft = (w >> 16) & 31u, fs = (w >> 11) & 31u;
+@@ -494,19 +495,21 @@ int vi_written(const std::string &code) {
+ 
+ std::string generate(const Program &p, std::string &name) {
+     name.clear();
++    const std::uint32_t kMask = p.unit == 0 ? 4095u : 16383u;
+     const std::vector<std::uint32_t> pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
+     const ps2::vu::StallPlan plan = ps2::vu::stall_plan(p.code.data(), kMask, pcs, p.entry);
+     if (!plan.ok) return {};
+     std::set<std::uint32_t> in(pcs.begin(), pcs.end());
+     std::map<std::uint32_t, Lower> lowers;
+-    bool any_status = false, any_flags = false, any_q = false;
++    bool any_status = p.unit == 0, any_flags = false, any_q = false;
+     for (std::uint32_t pc : pcs) {
+         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+         Lower l;
+-        if (!(hi & 0x80000000u)) l = lower(lo, pc);
++        if (!(hi & 0x80000000u)) l = lower(lo, pc, kMask);
+         any_status = any_status || l.reads_status;
+         any_flags = any_flags || l.reads_flags;
+         any_q = any_q || l.code.find("fl.end_q(") != std::string::npos;
++        if (p.unit == 0 && (!l.supported || l.jump || l.code.find("vu::kick(") != std::string::npos)) return {};
+         lowers[pc] = l;
+     }
+     std::map<std::uint32_t, bool> live_in;
+@@ -573,8 +576,8 @@ std::string generate(const Program &p, std::string &name) {
+     }
+     std::set<int> shadowed;
+     for (std::uint32_t pc : pcs)
+-        for (int reg : upper(word(p.code, pc + 4), true).shadow_reads) shadowed.insert(reg);
+-    name = std::format("vu1_{:016X}", p.key);
++        for (int reg : upper(word(p.code, pc + 4), true, p.unit == 0).shadow_reads) shadowed.insert(reg);
++    name = std::format("vu{}_{:016X}", p.unit, p.key);
+     std::string o = std::format("void {}(Vu0Regs &r, std::uint8_t *mem) {{\n    FlagPipe fl;\n    fl.start(r);\n    bool pend = false, pendj = false, ending = false;\n    std::uint32_t jpc = 0;\n    (void)pend;\n    (void)pendj;\n    (void)ending;\n    (void)jpc;\n",
+                                 name);
+     if (!delay.empty()) o += "    std::uint16_t bk = 0, next_bk = 0;\n    unsigned bi = 0;\n    (void)bk;\n    (void)next_bk;\n    (void)bi;\n";
+@@ -597,7 +600,7 @@ std::string generate(const Program &p, std::string &name) {
+         const std::uint32_t lo = word(p.code, pc), hi = word(p.code, pc + 4);
+         bool out_live = false;
+         for (std::int64_t s : successors(pc)) out_live = out_live || s < 0 || !in.count(static_cast<std::uint32_t>(s)) || live_in[static_cast<std::uint32_t>(s)];
+-        const Upper u = upper(hi, any_status ? true : (any_flags && out_live));
++        const Upper u = upper(hi, any_status ? true : (any_flags && out_live), p.unit == 0);
+         const Lower &l = lowers[pc];
+         std::string body;
+         if (keep_bk.count(pc)) body += std::format("next_bk = r.vi[{}]; ", def[pc]);
+@@ -661,6 +664,11 @@ std::string generate(const Program &p, std::string &name) {
+         replace_all(o, "vu::interpret(", "fl.flush_q(r); vu::interpret(");
+         replace_all(o, "r.tpc = ", "fl.flush_q(r); r.tpc = ");
+     }
++    if (p.unit == 0) {
++        replace_all(o, "qword(mem,", "qword<255u>(mem,");
++        replace_all(o, "vu::kick(1,", "vu::kick(0,");
++        replace_all(o, "vu::interpret(1,", "vu::interpret(0,");
++    }
+     return local_vi(o);
+ }
+ 
+@@ -670,24 +678,28 @@ namespace ps2::vurecomp {
+ 
+ // Bump this when the generated code changes in a way the headers do not show (a change in this file): libraries made earlier
+ // are then left alone and built again (vu_live.cpp).
+-const char *const kGeneratorVersion = "vurecomp 2";
++const char *const kGeneratorVersion = "vurecomp 3";
+ 
+ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::uint64_t live_stamp, std::size_t per_file, bool with_targets) {
+     std::vector<Program> programs;
++    std::set<std::pair<int, std::uint64_t>> recorded_keys;
+     for (Input &in : inputs) {
+-        Program p{in.key, in.entry, std::move(in.code)};
++        Program p{in.key, in.entry, std::move(in.code), in.unit};
++        const std::uint32_t kMask = p.unit == 0 ? 4095u : 16383u;
+         p.code.resize(kMask + 1);
+         const auto pcs = ps2::vu::reachable(p.code.data(), kMask, p.entry);
+         if (ps2::vu::program_key(p.code.data(), pcs, p.entry) != p.key) {
+             std::fprintf(stderr, "%016llX_%04X: key mismatch, skipped\n", static_cast<unsigned long long>(p.key), p.entry);
+             continue;
+         }
+-        programs.push_back(std::move(p));
++        if (recorded_keys.emplace(p.unit, p.key).second) programs.push_back(std::move(p));
+     }
+-    std::set<std::uint64_t> keys;
+-    for (const Program &p : programs) keys.insert(p.key);
++    std::set<std::pair<int, std::uint64_t>> keys;
++    for (const Program &p : programs) keys.emplace(p.unit, p.key);
+     const std::size_t recorded = programs.size();
+     for (std::size_t i = 0; i < (with_targets ? recorded : 0); ++i) {
++        if (programs[i].unit == 0) continue;  // VU0 entries are called by the EE and recorded individually.
++        const std::uint32_t kMask = 16383u;
+         std::set<std::uint32_t> targets;
+         for (std::uint32_t pc : ps2::vu::reachable(programs[i].code.data(), kMask, programs[i].entry)) {
+             const std::uint32_t lo = word(programs[i].code, pc), hi = word(programs[i].code, pc + 4);
+@@ -698,7 +710,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
+         }
+         for (std::uint32_t target : targets) {
+             const std::uint64_t key = ps2::vu::program_key(programs[i].code.data(), ps2::vu::reachable(programs[i].code.data(), kMask, target), target);
+-            if (keys.insert(key).second) programs.push_back(Program{key, target, programs[i].code});
++            if (keys.emplace(programs[i].unit, key).second) programs.push_back(Program{key, target, programs[i].code, programs[i].unit});
+         }
+     }
+     std::sort(programs.begin(), programs.end(), [](const Program &a, const Program &b) { return a.key < b.key; });
+@@ -709,7 +721,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
+     for (std::size_t i = 0; i < programs.size(); ++i) {
+         std::string name, body = generate(programs[i], name);
+         if (name.empty()) {
+-            std::fprintf(stderr, "vu1 %016llX at %04X: too many pipeline states to compile, it stays with the interpreter\n", static_cast<unsigned long long>(programs[i].key), programs[i].entry);
++            std::fprintf(stderr, "vu%d %016llX at %04X: unsupported control flow or pipeline plan; using interpreter\n", programs[i].unit, static_cast<unsigned long long>(programs[i].key), programs[i].entry);
+             continue;
+         }
+         if (names.size() != i) programs[names.size()] = std::move(programs[i]);
+@@ -729,7 +741,7 @@ Result generate_files(std::vector<Input> inputs, const fs::path &out_dir, std::u
+     std::string table = "#include \"ps2/vu_ops.hpp\"\n\nnamespace gen {\n";
+     for (const auto &n : names) table += std::format("void {}(ps2::Vu0Regs &r, std::uint8_t *mem);\n", n);
+     table += "\nconst ps2::vu::Program kVuPrograms[] = {\n";
+-    for (std::size_t i = 0; i < programs.size(); ++i) table += std::format("    {{0x{:016X}ull, {}}},\n", programs[i].key, names[i]);
++    for (std::size_t i = 0; i < programs.size(); ++i) table += std::format("    {{0x{:016X}ull, {}, {}}},\n", programs[i].key, names[i], programs[i].unit);
+     if (programs.empty()) table += "    {0, nullptr},\n";
+     table += "};\n\n}\n\n";
+     if (live_stamp == 0) {
+diff --git a/recomp/vurecomp_gen.hpp b/recomp/vurecomp_gen.hpp
+index 6ac3eed..a6aff92 100644
+--- a/recomp/vurecomp_gen.hpp
++++ b/recomp/vurecomp_gen.hpp
+@@ -13,11 +13,12 @@
+ namespace ps2::vurecomp {
+ 
+ // One program to compile: its key and entry (the file name of a recording is %016llX_%04X.bin) and the whole 16 KiB of
+-// vector unit code memory it was recorded from.
++// vector unit code memory it was recorded from (4 KiB for unit 0, 16 KiB for unit 1).
+ struct Input {
+     std::uint64_t key = 0;
+     std::uint32_t entry = 0;
+     std::vector<std::uint8_t> code;
++    int unit = 1;
+ };
+ 
+ struct Result {
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index 6288fdf..ac53a73 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -31,6 +31,7 @@ using ProgramFn = void (*)(Vu0Regs &r, std::uint8_t *mem);
+ struct Program {
+     std::uint64_t key;
+     ProgramFn function;
++    int unit = 1;
+ };
+ 
+ void register_programs(const Program *programs, std::uint32_t count);
+@@ -806,7 +807,8 @@ struct FlagPipe {
+     }
+ };
+ 
+-PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & 1023u) * 16u; }
++template <std::uint32_t Mask = 1023u>
++PS2_VU_INLINE std::uint8_t *qword(std::uint8_t *mem, std::uint32_t index) { return mem + (index & Mask) * 16u; }
+ PS2_VU_INLINE void set_vi(Vu0Regs &r, unsigned i, std::uint32_t v) {
+     if (i) r.vi[i] = static_cast<std::uint16_t>(v);
+ }
+diff --git a/runtime/src/vu_micro.cpp b/runtime/src/vu_micro.cpp
+index a15f080..28cdf18 100644
+--- a/runtime/src/vu_micro.cpp
++++ b/runtime/src/vu_micro.cpp
+@@ -686,6 +686,73 @@ void set_tops(std::uint32_t top, std::uint32_t itop) {
+ void run_fast(int n, std::uint32_t address);
+ 
+ std::unordered_map<std::uint64_t, ProgramFn> g_programs;
++std::unordered_map<std::uint64_t, ProgramFn> g_vu0_programs;
++void run_reference(int n, std::uint32_t address);
++struct Vu0Entry {
++    std::uint32_t generation = 0;
++    std::uint64_t key = 0;
++    ProgramFn function = nullptr;
++};
++Vu0Entry g_vu0_entries[512];
++std::unordered_set<std::uint64_t> g_vu0_rejected;
++std::uint64_t g_vu0_compiled = 0, g_vu0_interpreted = 0, g_vu0_checked = 0, g_vu0_mismatches = 0;
++
++ProgramFn lookup_vu0(std::uint32_t address) {
++    address &= 4095u;
++    Vu0Entry &e = g_vu0_entries[address >> 3];
++    if (e.generation == g_generation[0]) return e.function;
++    e.generation = g_generation[0];
++    e.key = program_key(g_vu0_code, reachable(g_vu0_code, 4095u, address), address);
++    const auto it = g_vu0_programs.find(e.key);
++    e.function = it == g_vu0_programs.end() || g_vu0_rejected.count(e.key) ? nullptr : it->second;
++    static const std::string record = ps2::os::env("PS2_VU0_RECORD");
++    if (!e.function && !record.empty()) {
++        char name[64];
++        std::snprintf(name, sizeof name, "%016llX_%04X.bin", static_cast<unsigned long long>(e.key), address);
++        const auto path = ps2::os::path(record) / name;
++        if (!std::filesystem::exists(path)) {
++            std::filesystem::create_directories(ps2::os::path(record));
++            std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_vu0_code), 4096);
++        }
++    }
++    return e.function;
++}
++
++bool run_compiled_vu0(std::uint32_t address) {
++    const ProgramFn fn = lookup_vu0(address);
++    static const bool interpret_only = std::getenv("PS2_VU0_INTERPRET") != nullptr;
++    if (!fn || interpret_only) return false;
++    static const bool verify = std::getenv("PS2_VU0_VERIFY") != nullptr;
++    if (!verify) { fn(g_cpu.vu0, g_vu0_mem); return true; }
++    // Both executions start from identical state. Retain the exact result on a
++    // mismatch and blacklist the program, so verification never installs bad state.
++    const Vu0Regs before = g_cpu.vu0;
++    std::uint8_t memory[4096], after_memory[4096];
++    std::memcpy(memory, g_vu0_mem, sizeof memory);
++    fn(g_cpu.vu0, g_vu0_mem);
++    const Vu0Regs after = g_cpu.vu0;
++    std::memcpy(after_memory, g_vu0_mem, sizeof after_memory);
++    g_cpu.vu0 = before;
++    std::memcpy(g_vu0_mem, memory, sizeof memory);
++    run_reference(0, address);
++    auto &checked = g_vu0_checked;
++    auto &mismatches = g_vu0_mismatches;
++    ++checked;
++    if (std::memcmp(&after, &g_cpu.vu0, sizeof after) || std::memcmp(after_memory, g_vu0_mem, sizeof after_memory)) {
++        ++mismatches;
++        Vu0Entry &e = g_vu0_entries[(address & 4095u) >> 3];
++        std::fprintf(stderr, "[vu0-check] key %016llX entry %04X mismatch: regs %d mem %d; using reference\n",
++                     static_cast<unsigned long long>(e.key), address,
++                     std::memcmp(&after, &g_cpu.vu0, sizeof after) != 0,
++                     std::memcmp(after_memory, g_vu0_mem, sizeof after_memory) != 0);
++        g_vu0_rejected.insert(e.key);
++        for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
++    }
++    if (checked == 1 || checked % 10000 == 0)
++        std::fprintf(stderr, "[vu0-check-summary] %llu calls, %llu mismatches\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatches));
++    return true;
++}
++
+ 
+ struct Candidate {
+     std::vector<std::uint32_t> runs;
+@@ -746,7 +813,8 @@ void code_changed(int unit) {
+ 
+ void register_programs(const Program *programs, std::uint32_t count) {
+     for (std::uint32_t i = 0; i < count; ++i)
+-        if (programs[i].function) g_programs[programs[i].key] = programs[i].function;
++        if (programs[i].function) (programs[i].unit == 0 ? g_vu0_programs : g_programs)[programs[i].key] = programs[i].function;
++    for (Vu0Entry &entry : g_vu0_entries) entry.generation = 0;
+ }
+ 
+ // Programs the background thread compiled and loaded (vu_live.cpp) join the table of built-in ones. A program the build knew keeps
+@@ -829,7 +897,7 @@ void interpret(int unit, std::uint32_t pc) {
+         return;
+     }
+     if (unit != 1) {
+-        run_entry(unit, pc);
++        run_reference(unit, pc);
+         return;
+     }
+     if (g_chaining) {
+@@ -1136,11 +1204,29 @@ void run_fast(int n, std::uint32_t address) {
+ }
+ 
+ void run(int n, std::uint32_t address) {
+-    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
+-    if (n == 1 && !exact) {
+-        interpret(n, address);
+-        return;
++    if (n == 0) {
++        static const bool report = [] {
++            if (std::getenv("PS2_VU0_STATS") || std::getenv("PS2_VU0_VERIFY")) std::atexit([] {
++                std::fprintf(stderr, "[vu0] compiled %llu interpreted %llu checked %llu mismatches %llu\n",
++                    static_cast<unsigned long long>(g_vu0_compiled), static_cast<unsigned long long>(g_vu0_interpreted),
++                    static_cast<unsigned long long>(g_vu0_checked), static_cast<unsigned long long>(g_vu0_mismatches));
++            });
++            return true;
++        }();
++        (void)report;
++        const bool compiled = run_compiled_vu0(address);
++        if (compiled) ++g_vu0_compiled; else ++g_vu0_interpreted;
++        static const bool stats = std::getenv("PS2_VU0_STATS") != nullptr;
++        if (stats && (g_vu0_compiled + g_vu0_interpreted) % 1000000 == 0)
++            std::fprintf(stderr, "[vu0] compiled %llu interpreted %llu\n", static_cast<unsigned long long>(g_vu0_compiled), static_cast<unsigned long long>(g_vu0_interpreted));
++        if (compiled) return;
+     }
++    static const bool exact = std::getenv("PS2_VU_EXACT") != nullptr;
++    if (n == 1 && !exact) { interpret(n, address); return; }
++    run_reference(n, address);
++}
++
++void run_reference(int n, std::uint32_t address) {
+     Unit u = unit_of(n);
+     Vu0Regs &r = *u.regs;
+     if (g_scan[n]) scan_flags(n, u.code, u.code_mask + 1);
+diff --git a/scripts/port.sh b/scripts/port.sh
+index e0a8745..9550fdd 100755
+--- a/scripts/port.sh
++++ b/scripts/port.sh
+@@ -74,7 +74,7 @@ export EMSDK="${EMSDK:-$ROOT/tools/emsdk}"
+ setup=()
+ [ "$web" = 1 ] || setup=(--native-only)
+ if { [ "$web" = 1 ] && [ ! -f "$EMSDK/emsdk_env.sh" ]; } || [ ! -x "$tools/eerecomp" ] || [ ! -x "$tools/vurecomp" ]; then "$here/setup.sh" "${setup[@]}"; fi
+-mkdir -p "$game/disc" "$game/vu1" "$game/shots" "$generated"
++mkdir -p "$game/disc" "$game/vu1" "$game/vu0" "$game/shots" "$generated"
+ 
+ echo "== [1/6] disc"
+ iso="$game/disc.iso"
+@@ -182,7 +182,7 @@ if [ "$explore" = 1 ]; then
+     build_native
+     rm -f "$game/misses.txt" "$game/explore.ps2" "$game/explore_ram.bin"
+     code=0
+-    PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
++    PS2_DUMP="$game/explore_ram.bin" PS2_GPU_LOW_POWER=1 PS2_VU0_RECORD="$game/vu0" PS2_VU_RECORD="$game/vu1" "$native/ps2run" "$elf" --disc "$iso" --misses "$game/misses.txt" --memcard "$game/explore.ps2" \
+       "${wide[@]}" "${patches[@]}" --frames "$frames" "${presses[@]}" --frames-dir "$game/shots" --frame-every 300 > "$game/explore.log" 2>&1 || code=$?
+     [ "$code" = 0 ] || echo "[port] ps2run exited with code $code" | tee -a "$game/explore.log"
+     captured=0
+@@ -216,8 +216,8 @@ else
+ fi
+ 
+ echo "== [5/6] vector unit programs"
+-if compgen -G "$game/vu1/*.bin" > /dev/null; then
+-  "$tools/vurecomp" "$game/vu1" "$generated" | tail -1
++if compgen -G "$game/vu1/*.bin" > /dev/null || compgen -G "$game/vu0/*.bin" > /dev/null; then
++  "$tools/vurecomp" "$game/vu1" "$generated" --vu0-dir "$game/vu0" | tail -1
+ else
+   # vurecomp replaces the old files itself; with nothing recorded it never runs, so programs of an earlier run would stay in the build.
+   rm -f "$generated"/vu1_*.cpp
+diff --git a/scripts/test_vu0_codegen.py b/scripts/test_vu0_codegen.py
+new file mode 100644
+index 0000000..0e6b2c1
+--- /dev/null
++++ b/scripts/test_vu0_codegen.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""Exact VU0 differential tests, using the shared synthetic VU instruction fixtures.
++
++No disc or graphics dependency. Runs real generated code through the runtime's
++unit registry, cache, fallback and full-state verifier, including code replacement.
++"""
++import ast
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++CXX = os.environ.get('CXX', 'clang++')
++# Read fixture literals without importing the executable VU1/Wasm test driver.
++module = ast.parse((ROOT / 'scripts/test_vu_codegen.py').read_text())
++fixtures = {n.targets[0].id: ast.literal_eval(n.value) for n in module.body
++            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
++            and isinstance(n.value.value, str)}
++GENERATOR = r'''
++#include "recomp/vurecomp_gen.cpp"
++#include "cases.h"
++int main(int argc, char **argv) {
++    std::vector<ps2::vurecomp::Input> inputs;
++    const auto add = [&](const std::vector<tc::Pair> &pairs, unsigned entry = 0) {
++        ps2::vurecomp::Input p{0, entry, std::vector<std::uint8_t>(4096), 0};
++        for (unsigned i = 0; i < pairs.size(); ++i) std::memcpy(p.code.data() + ((entry + i * 8) & 4095), pairs[i].data(), 8);
++        p.key = ps2::vu::program_key(p.code.data(), ps2::vu::reachable(p.code.data(), 4095, entry), entry);
++        inputs.push_back(p);
++    };
++    for (const auto &c : tc::cases()) add(c.pairs);
++    for (unsigned i = 0; i < 150; ++i) add(tc::random_program(i));
++    // Code wrap and 4 KiB data wrap, plus final flags with no microcode reader.
++    add({{tc::sq(15, 1, 0, 256), tc::add(3, 1, 2) | tc::kEnd}, {tc::lq(15, 4, 0, 256), tc::kUnop}}, 4088);
++    add({{tc::kLnop, tc::fmac(0x28, 0, 3, 1, 2) | tc::kEnd}, tc::kNop});
++    // Dynamic jumps retain the interpreter's pipeline; reject the whole entry.
++    Program jump{1, 0, std::vector<std::uint8_t>(4096), 0};
++    const tc::Pair pair{(0x24u << 25) | (1u << 11), tc::kUnop | tc::kEnd};
++    std::memcpy(jump.code.data(), pair.data(), 8);
++    std::string name;
++    if (!generate(jump, name).empty() || !name.empty()) return 2;
++    const auto result = ps2::vurecomp::generate_files(inputs, argv[1], 0);
++    return result.skipped ? 1 : 0;
++}
++'''
++# Shared interpreter and stubs; replace its main with a full-state differential driver.
++INTERP = fixtures['INTERP'].split('int main(int argc, char **argv) {')[0]
++STUBS = r'''
++#include <atomic>
++#include "ps2/vu_live.hpp"
++namespace ps2 {
++std::uint64_t frame_count() { return 0; } bool halted() { return false; }
++namespace vif { std::uint32_t itop(int) { return 0; } }
++namespace vu::live {
++std::atomic<bool> g_ready{false}; bool active() { return false; }
++void note_call(std::uint64_t) {} std::vector<Program> take() { return {}; }
++void unknown(std::uint64_t, std::uint32_t, const std::uint8_t *) {}
++}}
++'''
++DRIVER = r'''
++void register_generated_vu();
++static unsigned calls = 0;
++static void wrong(Vu0Regs &r, std::uint8_t *) { ++calls; r.vi[7] = 0xBAD; }
++static void compare(const std::vector<tc::Pair> &pairs, unsigned seed, unsigned entry = 0) {
++    std::memset(g_vu0_code, 0, 4096);
++    for (unsigned i = 0; i < pairs.size(); ++i) std::memcpy(g_vu0_code + ((entry + i * 8) & 4095), pairs[i].data(), 8);
++    vu::code_changed(0);
++    auto &r = vu::regs(0);
++    tc::random_init(r, g_vu0_mem, seed);
++    const auto before = r;
++    std::uint8_t memory[4096]; std::memcpy(memory, g_vu0_mem, 4096);
++    vu::run(0, entry);
++    const auto actual = r;
++    std::uint8_t after[4096]; std::memcpy(after, g_vu0_mem, 4096);
++    r = before; std::memcpy(g_vu0_mem, memory, 4096);
++    // interpret(0) is the exact reference, never the compiled dispatch.
++    vu::interpret(0, entry);
++    if (std::memcmp(&actual, &r, sizeof r) || std::memcmp(after, g_vu0_mem, 4096)) {
++        std::fprintf(stderr, "VU0 differential mismatch seed %u entry %u tpc %u/%u\n", seed, entry, actual.tpc, r.tpc);
++        std::fputs(tc::describe(actual, after).c_str(), stderr);
++        std::fputs(tc::describe(r, g_vu0_mem).c_str(), stderr);
++        std::exit(1);
++    }
++}
++int main(int argc, char **argv) {
++    register_generated_vu();
++    for (unsigned i = 0; i < 150; ++i) compare(tc::random_program(i), i);
++    unsigned i = 0;
++    for (const auto &c : tc::cases()) compare(c.pairs, ++i);
++    compare({{tc::sq(15, 1, 0, 256), tc::add(3, 1, 2) | tc::kEnd}, {tc::lq(15, 4, 0, 256), tc::kUnop}}, 7, 4088);
++    compare({{tc::kLnop, tc::fmac(0x28, 0, 3, 1, 2) | tc::kEnd}, tc::kNop}, 17);
++    compare({{(0x24u << 25) | (1u << 11), tc::kUnop | tc::kEnd}, tc::kNop}, 17);
++    // Unknown code and a known code replacement at the same entry.
++    compare({{tc::kLnop, tc::kUnop | tc::kEnd}, tc::kNop}, 17);
++    compare(tc::random_program(0), 0);
++    const auto key = vu::program_key(g_vu0_code, vu::reachable(g_vu0_code, 4095, 0), 0);
++    // Identical key in VU1 must not replace VU0's exact function.
++    const vu::Program collision{key, wrong, 1}; vu::register_programs(&collision, 1);
++    compare(tc::random_program(0), 0);
++    if (calls) return 2;
++    if (argc > 1) {
++        const vu::Program bad{key, wrong, 0}; vu::register_programs(&bad, 1);
++        compare(tc::random_program(0), 0); // verifier rejects and keeps exact result
++        compare(tc::random_program(0), 0); // blacklisted, never called again
++        if (calls != 1) return 3;
++    }
++    std::puts("VU0 exact full-state, wrap, registry, invalidation and fallback checks passed");
++}
++'''
++
++def run(args, **kw):
++    result = subprocess.run(args, cwd=ROOT, text=True, capture_output=True, **kw)
++    if result.returncode:
++        sys.exit(result.stdout + result.stderr)
++    return result
++
++with tempfile.TemporaryDirectory(prefix='vu0-codegen-') as tmp:
++    tmp = Path(tmp)
++    (tmp / 'cases.h').write_text(fixtures['CASES_H'])
++    (tmp / 'generator.cpp').write_text(GENERATOR)
++    (tmp / 'driver.cpp').write_text('#define RANDOM_PROGRAMS 150\n' + STUBS + INTERP + DRIVER)
++    base = [CXX, '-std=c++20', '-O1', '-I.', '-Iruntime/include', '-Iruntime/src', '-I' + str(tmp)]
++    run(base + [str(tmp / 'generator.cpp'), '-o', str(tmp / 'generator')])
++    run([str(tmp / 'generator'), str(tmp)])
++    run(base + [str(tmp / 'driver.cpp'), 'runtime/src/vu_micro.cpp', 'runtime/src/vu_jit_web.cpp']
++        + [str(p) for p in sorted(tmp.glob('vu1_*.cpp'))] + ['-o', str(tmp / 'check')])
++    normal = run([str(tmp / 'check')])
++    print(normal.stdout, end='')
++    checked = run([str(tmp / 'check'), 'negative-control'], env={**os.environ, 'PS2_VU0_VERIFY': '1'})
++    if checked.stderr.count('mismatch:') != 1:
++        sys.exit('verifier must report exactly the injected mismatch:\n' + checked.stderr)
++    print(checked.stdout, end='')
++    print('Verifier negative control: one injected mismatch detected and blacklisted')

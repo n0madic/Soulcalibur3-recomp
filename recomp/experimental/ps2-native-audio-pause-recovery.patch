@@ -1,0 +1,151 @@
+diff --git a/host/stretch.cpp b/host/stretch.cpp
+index be82c30..ba8f3d2 100644
+--- a/host/stretch.cpp
++++ b/host/stretch.cpp
+@@ -218,6 +218,7 @@ constexpr double kLevelTau = 0.12;     // smoothing of the level the controller
+ constexpr double kFloorMs = Stretcher::lookahead() * 1000.0 / kRate + 4.0;  // below this waiting a step may not be possible
+ constexpr double kHealthy = 0.98;      // a game that makes this much sound per second of running time needs no stretching
+ constexpr double kEnter = 0.995;       // stretching starts only when it asks for less than this
++constexpr double kRecoveredUp = 0.03;  // a healthy producer with enough buffered sound can recover promptly
+ constexpr double kSmoothUp = 0.15;     // the tempo may rise only this fast (seconds); it may fall at once
+ constexpr std::size_t kFade = 96;      // 2 ms: the fade at the edges of a stretch of sound, so a start or a cut does not click
+ constexpr double kDropAbove = 500.0 * (kRate / 1000.0);  // more than this waiting: the new sound is dropped (the device stopped)
+@@ -263,8 +264,16 @@ void SoundPipe::frame(double now) {
+     // Keep room to replenish audio while playback is stretched. Once tempo
+     // recovers, lower the allowance gradually in wall time: dropping it by
+     // 40 ms at once makes the producer wait and introduces another hitch.
+-    if (tempo() < kEnter) pace_limit_ms_ = config_.pace_stretch_ms;
+-    else pace_limit_ms_ = std::max(config_.pace_ms, pace_limit_ms_ - 100.0 * dt);
++    double target = config_.pace_ms;
++    if (tempo() < kEnter) {
++        // A recent gap must fit together with WSOLA lookahead and one device
++        // block. Otherwise pacing can pin the queue below the gap guard's
++        // unity-tempo threshold even after the producer has recovered.
++        const double reserve = frame_gap_.load(std::memory_order_relaxed) * 1000.0 + kFloorMs + device_block_ms_.load(std::memory_order_relaxed);
++        target = std::max(config_.pace_stretch_ms, reserve);
++    }
++    // Ageing out a long gap must not abruptly drain its extra headroom either.
++    pace_limit_ms_ = std::max(target, pace_limit_ms_ - 100.0 * dt);
+     double alive = alive_;
+     if (last_push_t_ >= 0.0 && now - last_push_t_ < kStall) alive += std::max(0.0, now - last_push_t_ - wait_since_);
+     const std::size_t size = marks_.size();
+@@ -311,6 +320,7 @@ void SoundPipe::fade(std::int16_t *lr, std::size_t frames, bool in) {
+ }
+ 
+ void SoundPipe::render(std::int16_t *out, std::size_t frames, double now, void (*overlay)(std::int16_t *, std::size_t)) {
++    device_block_ms_.store(frames * 1000.0 / kRate, std::memory_order_relaxed);
+     if (flush_.exchange(false, std::memory_order_relaxed)) {
+         stretcher_.flush();
+         if (config_.stretch && playing_) {
+@@ -336,7 +346,15 @@ void SoundPipe::render(std::int16_t *out, std::size_t frames, double now, void (
+         if (!starved_) {
+             const double before = tempo_.load(std::memory_order_relaxed);
+             tempo = choose_tempo(now, waiting_ms);
+-            if (tempo > before && stretcher_.stretching()) tempo = before + (tempo - before) * (1.0 - std::exp(-dt / kSmoothUp));  // up slowly, down at once
++            if (tempo > before && stretcher_.stretching()) {
++                // After an isolated pause, the producer can already be healthy
++                // and the queue refilled while the old slow tempo still paces
++                // the emulation. Recover faster only when the gap guard permits
++                // normal playback; sustained slow production keeps its smoothing.
++                const bool recovered = tempo == 1.0 && rate_.load(std::memory_order_relaxed) >= kHealthy && waiting_ms >= config_.target_ms;
++                const double tau = recovered ? kRecoveredUp : kSmoothUp;
++                tempo = before + (tempo - before) * (1.0 - std::exp(-dt / tau));
++            }
+             if (tempo > kEnter) tempo = 1.0;
+             capped = tempo <= 1.0 / config_.max_ratio + 1e-9;
+             made = stretcher_.pull(out, frames, tempo);
+diff --git a/host/stretch.hpp b/host/stretch.hpp
+index dbe7719..8c10451 100644
+--- a/host/stretch.hpp
++++ b/host/stretch.hpp
+@@ -70,7 +70,7 @@ struct PipeConfig {
+     double max_ratio = 5.0;       // slowest tempo is 1 / max_ratio; below it the queue runs dry like without stretching
+     double target_ms = 60.0;      // the amount of waiting sound (game time) the controller steers to
+     double pace_ms = 80.0;        // the emulation waits while more than this is waiting
+-    double pace_stretch_ms = 120.0;  // the same while the sound is stretched (it swings more then, and a wait would slow the game down)
++    double pace_stretch_ms = 120.0;  // minimum recovery headroom; a long recent gap may require more
+     double restart_ms = 50.0;     // after running dry: play again once this much is waiting
+ };
+ 
+@@ -138,6 +138,7 @@ private:
+     Stretcher stretcher_;
+     std::atomic<bool> flush_{false};
+     std::atomic<double> position_{0.0}, tempo_{1.0}, last_push_{-1.0};
++    std::atomic<double> device_block_ms_{0.0};  // callback granularity, for recovery headroom
+     std::atomic<double> rate_{1.0}, frame_gap_{0.0};  // from the emulation thread: speed of the game, longest recent frame (seconds)
+ 
+     // emulation thread only
+diff --git a/tests/stretch_test.cpp b/tests/stretch_test.cpp
+index 2402df0..5a3f390 100644
+--- a/tests/stretch_test.cpp
++++ b/tests/stretch_test.cpp
+@@ -472,6 +472,69 @@ int simulation_main() {
+         check(longest_wait < 40.0, "no large pacing drain after one long frame", fmt("longest wait %.1f ms", longest_wait).c_str());
+         check(sim.pipe.stats().dry == 0, "single-frame recovery keeps audio supplied");
+     }
++    // A single pause can empty part of the queue without making the producer
++    // persistently slow. Once it has refilled, a slow tempo ramp must not make
++    // the emulation wait through several extra device blocks per frame.
++    for (const std::size_t block : {512u, 1024u}) {
++        for (const unsigned sound_frames : {800u, 960u}) {
++            for (const double pause : {0.048, 0.079, 0.160}) {
++                for (const bool silent_pause : {false, true}) {
++                    Sim sim(on, block);
++                    for (int i = 0; i < 300; ++i) sim.run_frame(0.011, sound_frames);
++                    const double begin = sim.t;
++                    if (silent_pause) {
++                        sim.t += pause;
++                        sim.device_until(sim.t);
++                    } else sim.run_frame(pause, sound_frames);
++                    const auto dry_at_resume = sim.pipe.stats().dry;
++                    double recovery = -1.0, longest_wait = 0.0;
++                    for (int i = 0; i < 120; ++i) {
++                        const double start = sim.t;
++                        sim.run_frame(0.011, sound_frames);
++                        longest_wait = std::max(longest_wait, (sim.t - start) * 1000.0 - 11.0);
++                        if (recovery < 0.0 && sim.t - begin > 0.1 && sim.pipe.tempo() == 1.0) recovery = sim.t - begin;
++                    }
++                    std::printf("  [isolated pause] block %zu, sound %u, pause %.0f ms, silent %d: recovery %.3f s, longest wait %.1f ms\n",
++                                block, sound_frames, pause * 1000.0, silent_pause, recovery, longest_wait);
++                    check(recovery >= 0.0 && recovery < 0.5, "refilled queue recovers normal tempo within half a second");
++                    check(longest_wait < (block + sound_frames) * 1000.0 / kRate + 3.0, "recovery wait stays within one video period plus one device block");
++                    check(sim.pipe.stats().dry == dry_at_resume, "recovery adds no starvation after the pause ends");
++                    check(sim.pipe.queued_ms() < on.pace_ms + sound_frames * 1000.0 / kRate + 5.0,
++                          "temporary recovery headroom returns to the normal queue limit");
++                    const SimResult result = sim.finish();
++                    check(steepest(result) < 1300, "prompt recovery does not introduce a click");
++                }
++            }
++        }
++    }
++    for (const std::size_t block : {512u, 1024u}) {
++        Sim sim(on, block);
++        for (int i = 0; i < 300; ++i) sim.run_frame(0.011, 960);
++        for (int pause = 0; pause < 8; ++pause) {
++            sim.t += 0.079;
++            sim.device_until(sim.t);
++            for (int i = 0; i < 40; ++i) sim.run_frame(0.011, 960);
++        }
++        const SimResult result = sim.finish();
++        check(result.stats.dry == 0, "repeated isolated pauses keep audio supplied");
++        check(extreme_queued(result, 6, result.duration, true) < 200.0, "repeated pauses do not accumulate an unbounded queue");
++        check(steepest(result) < 1300, "repeated recoveries do not click");
++    }
++    {
++        // Extra headroom can expire before a slow producer returns to unity.
++        // Its removal must remain gradual, just like the normal recovery drain.
++        Sim sim(on, 512);
++        for (int i = 0; i < 300; ++i) sim.run_frame(0.011, 960);
++        sim.run_frame(0.160, 960);
++        for (int i = 0; i < 10; ++i) sim.run_frame(0.011, 960);
++        double longest = 0.0;
++        for (int i = 0; i < 180; ++i) {
++            const double start = sim.t;
++            sim.run_frame(0.030, 960);
++            longest = std::max(longest, (sim.t - start) * 1000.0);
++        }
++        check(longest < 65.0, "ageing out recovery headroom does not create a large drain hitch", fmt("longest %.1f ms", longest).c_str());
++    }
+     for (const double fps : {45.0, 33.0, 20.0}) {
+         std::printf("steady %.0f frames a second:\n", fps);
+         Sim sim(on);

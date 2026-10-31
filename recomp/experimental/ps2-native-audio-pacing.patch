@@ -1,0 +1,86 @@
+diff --git a/docs/audio-pacing.md b/docs/audio-pacing.md
+new file mode 100644
+index 0000000..966805d
+--- /dev/null
++++ b/docs/audio-pacing.md
+@@ -0,0 +1,11 @@
++# Audio pacing during recovery
++
++Previously the queue allowance changed from 120 ms at any stretched tempo to 80 ms at exactly normal tempo. A recovering game could therefore spend another 40 ms draining audio even when it had CPU headroom. The allowance now approaches the normal limit continuously as tempo recovers.
++
++The virtual-time regression first runs a slow producer and then gives it ample CPU headroom. Near normal tempo, the original code inserts a 42 ms frame with 1024-frame device blocks and a 53 ms frame with 512-frame blocks. The continuous allowance keeps that maximum at 22 ms for both block sizes, without starving the device. Early recovery still legitimately follows the slower audio clock; this change does not force audio/video out of sync.
++
++The macOS host also requests 512-frame callbacks (10.67 ms at 48 kHz) to reduce pacing granularity. Other platforms retain 1024. The host logs the obtained buffer size because the driver may adjust it. [SDL documents buffer sizing and its latency tradeoff](https://wiki.libsdl.org/SDL2/SDL_OpenAudioDevice).
++
++Considered alternatives were smaller device blocks, a continuous queue allowance, pacing to a wall clock, and asynchronous unstretched output. The first two preserve the existing audio-clock synchronization and pitch-preserving stretcher; the latter two change synchronization behavior and were not selected.
++
++Validation: the added recovery checks fail against the original header (40/42 virtual-time checks pass) and pass with the fix. The full stretcher/pipe suite passes 99/99 checks, including pitch, continuity, sustained slow production, a long stall, flushing on load and the stretch limit. Alternating 700-frame saved-state SC3 runs obtained 512-frame callbacks and had no dry queue or dropped samples. Aggregate run-time differences were within run-to-run variation; the isolated recovery test establishes the specific pacing fix, not a general FPS increase.
+diff --git a/host/stretch.hpp b/host/stretch.hpp
+index f8d0ad2..abd65ce 100644
+--- a/host/stretch.hpp
++++ b/host/stretch.hpp
+@@ -111,7 +111,12 @@ public:
+     // Sound waiting, in milliseconds of game time (what the title bar shows).
+     double queued_ms() const { return (static_cast<double>(stretcher_.head()) - position_.load(std::memory_order_relaxed)) / (kRate / 1000.0); }
+     // The emulation waits while this is true.
+-    bool full() const { return queued_ms() > (tempo() < 1.0 ? config_.pace_stretch_ms : config_.pace_ms); }
++    bool full() const {
++        // Recovering from a slowdown must not abruptly remove 40 ms of queue
++        // allowance when tempo reaches 1: that turns recovery into another hitch.
++        const double limit = config_.pace_ms + (config_.pace_stretch_ms - config_.pace_ms) * (1.0 - tempo());
++        return queued_ms() > limit;
++    }
+     // The tempo now: 1 plays as made, 0.5 twice as slow.
+     double tempo() const { return tempo_.load(std::memory_order_relaxed); }
+     // Drop what is waiting (a state was loaded); the device thread does it before its next block.
+diff --git a/host/window.cpp b/host/window.cpp
+index a6cab8b..1159ccc 100644
+--- a/host/window.cpp
++++ b/host/window.cpp
+@@ -1270,7 +1270,11 @@ bool open_window(bool fullscreen) {
+     want.freq = 48000;
+     want.format = AUDIO_S16SYS;
+     want.channels = 2;
++#ifdef __APPLE__
++    want.samples = 512;  // 10.7 ms at 48 kHz, reducing audio-clock pacing quantization
++#else
+     want.samples = 1024;
++#endif
+     // PS2_AUDIO_STRETCH=0 plays the sound as it comes (silence where it runs short); PS2_AUDIO_STRETCH_MAX=<ratio> changes the limit
+     static ps2sound::PipeConfig config;
+     const std::string stretch = ps2::os::env("PS2_AUDIO_STRETCH"), stretch_max = ps2::os::env("PS2_AUDIO_STRETCH_MAX");
+@@ -1281,6 +1285,7 @@ bool open_window(bool fullscreen) {
+     want.callback = audio_callback;
+     g_audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+     if (g_audio) {
++        std::fprintf(stderr, "[audio] callback buffer: %u frames (%.2f ms)\n", have.samples, have.samples * 1000.0 / have.freq);
+         // SDL converts the 48000 Hz stereo queue to whatever the device itself runs at
+         SDL_AudioSpec device{};
+         char *name = nullptr;
+diff --git a/tests/stretch_test.cpp b/tests/stretch_test.cpp
+index f53d606..c3d0b66 100644
+--- a/tests/stretch_test.cpp
++++ b/tests/stretch_test.cpp
+@@ -438,6 +438,22 @@ int simulation_main() {
+         check(extreme_queued(r, 2, 20, false) > 50 && extreme_queued(r, 2, 20, true) <= 90, "the waiting sound stays between 50 and 90 ms",
+               fmt("%.0f to %.0f ms", extreme_queued(r, 2, 20, false), extreme_queued(r, 2, 20, true)).c_str());
+     }
++    for (const std::size_t block : {1024u, 512u}) {
++        std::printf("recovery to full speed, %zu-frame audio blocks:\n", block);
++        Sim sim(on, block);
++        sim.run({{3, 32}});
++        double longest = 0;
++        for (int frame = 0; frame < 600; ++frame) {
++            const double start = sim.t, tempo = sim.pipe.tempo();
++            sim.run_frame(0.008);  // ample CPU headroom after the slow scene
++            // Early recovery legitimately paces to the still-slow audio tempo.
++            // Near unity the controller must not inject a new 40 ms queue drain.
++            if (tempo >= 0.95) longest = std::max(longest, (sim.t - start) * 1000.0);
++        }
++        check(longest < 30.0, "no pacing hitch near normal tempo after recovery", fmt("longest %.1f ms", longest).c_str());
++        check(sim.pipe.stats().dry == 0, "recovery keeps audio supplied");
++        check(sim.pipe.tempo() == 1.0, "recovery reaches normal tempo");
++    }
+     for (const double fps : {45.0, 33.0, 20.0}) {
+         std::printf("steady %.0f frames a second:\n", fps);
+         Sim sim(on);
