@@ -1,6 +1,6 @@
 # ps2-native-recomp port notes
 
-`main` uses [exoteric33/ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp). The old PS2Recomp port, its patch series, Ghidra/TOML setup and investigation history are preserved at branch **`ps2recomp`**, snapshot `4b880ad`. Its original main tip was `56713f1`. Historical performance and platform claims from that implementation do not apply to the current one.
+`main` uses [exoteric33/ps2-native-recomp](https://github.com/exoteric33/ps2-native-recomp). The old PS2Recomp port, its patch series, Ghidra/TOML setup and investigation history are preserved at branch **`ps2recomp`**. Commit IDs differ from the original local history because personal author email addresses were replaced with GitHub noreply addresses before publication. Historical performance and platform claims from that implementation do not apply to the current one.
 
 ## Reproducible source set
 
@@ -21,10 +21,10 @@ Upstream pin: **`b98334b2c9b5cac112661dc5a94afb1afafb1321`**, stored in `ps2-nat
 | `03-pr37-audio-recovery.patch` | Fast recovery after isolated producer pauses, [#37](https://github.com/exoteric33/ps2-native-recomp/pull/37); follows merged #33. |
 | `04-window-poll-diagnostics.patch` | SDL event details and a bounded macOS stall sampler; local diagnostic commit `32c8fd7`. |
 | `05-host-input-and-audio.patch` | Stop unused IME text input, request 512-frame audio blocks on macOS, log the obtained block size. |
-| `06-window-title-and-macos-ram.patch` | Optional `PS2_WINDOW_TITLE` prefix (launcher default: `Soulcalibur III`), and current resident process memory via Mach on macOS. |
-| `07-compact-raster-setup.patch` | Load GS setup fields on demand and keep only three words live; preserves shading arithmetic and texture quality. |
+| `06-window-title-and-macos-ram.patch` | Optional `PS2_WINDOW_TITLE` prefix (launcher default: `Soulcalibur III`), and current resident process memory via Mach on macOS; [#38](https://github.com/exoteric33/ps2-native-recomp/pull/38). |
+| `07-compact-raster-setup.patch` | Load GS setup fields on demand and keep only three words live; preserves shading arithmetic and texture quality; [#39](https://github.com/exoteric33/ps2-native-recomp/pull/39). |
 | `08-upscaled-metal-latency.patch` | Prefer one presentation frame in flight on Metal when `PS2_SCALE>1`; an explicit `PS2_FRAME_LATENCY=1..8` overrides this. |
-| `09-readback-diagnostics.patch` | Opt-in `PS2_READBACK_LOG=1` separates readback encoding, map wait and CPU copy time, and logs waits for asynchronous transfers. |
+| `09-readback-diagnostics.patch` | Opt-in `PS2_READBACK_LOG=1` separates readback encoding, map wait and CPU copy time, and logs waits for asynchronous transfers. [#40](https://github.com/exoteric33/ps2-native-recomp/pull/40) adds bounded logging for upstream. |
 
 The PR labels above describe what is absent from the pinned commit, not a live merge-status check. When updating the pin, remove a patch if its change is now upstream; never apply both copies. The build fingerprint includes the pin, ordered patch names and contents.
 

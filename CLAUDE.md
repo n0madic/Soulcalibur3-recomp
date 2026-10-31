@@ -1,6 +1,6 @@
 # Working on this port
 
-`main` uses **exoteric33/ps2-native-recomp**, not ran-j/PS2Recomp. The former implementation and its technical history are preserved in branch `ps2recomp` (snapshot `4b880ad`). Read `README.md` for user commands and `recomp/README.md` for the current source pin, patches and validation.
+`main` uses **exoteric33/ps2-native-recomp**, not ran-j/PS2Recomp. The former implementation and its technical history are preserved in branch `ps2recomp`. Read `README.md` for user commands and `recomp/README.md` for the current source pin, patches and validation.
 
 ## Source ownership
 
