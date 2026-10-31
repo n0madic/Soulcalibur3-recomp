@@ -10,8 +10,6 @@
 !/recomp/
 /recomp/*
 !/recomp/README.md
-!/recomp/build.sh
-!/recomp/run.sh
 !/recomp/port.py
 !/recomp/keys.ini
 !/recomp/ps2-native-recomp.commit

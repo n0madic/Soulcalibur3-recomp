@@ -7,7 +7,7 @@
 - `recomp/ps2-native-recomp.commit` pins the upstream commit.
 - `recomp/series` names the remaining patches in order. Accepted upstream changes are not duplicated: #32 (SIF/Start), #33 (initial audio pacing) and #34 (CPU clock) are already in the current base.
 - `recomp/patches/` contains pending upstream contributions and local host/diagnostic changes. Keep each independent area in one patch; do not revive the obsolete PS2Recomp/paraLLEl-GS/TOML/Ghidra series.
-- `recomp/port.py` manages source preparation, disc validation, build and launch. `build.sh`, `run.sh`, `Makefile` and `launch.command` are entry points.
+- `recomp/port.py` manages source preparation, disc validation, build and launch. `Makefile` and `launch.command` call it directly.
 - `recomp/tests/` tests the wrapper without a disc. `make test-runtime` runs synthetic audio, VU0 and watchdog tests in the prepared runtime.
 - `recomp/work/` is entirely private: upstream checkouts, ISO/ELF, generated code, entry lists, VU recordings, memory cards, states, measurements and build caches must never be committed or included in patches. The root `.gitignore` is a source allowlist.
 

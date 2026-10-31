@@ -26,7 +26,7 @@ The PR labels above describe what is absent from the pinned commit, not a live m
 
 ## Build and local data
 
-`build.sh` delegates to `port.py`. The wrapper finds an explicit `ISO`, an already linked disc, or the only `.iso` in the repository root. It checks `SYSTEM.CNF` and the extracted ELF's PCSX2 CRC: `SCES_533.12`, `3BA95B70`. Upstream `setup.sh --native-only` builds tools and fetches WebGPU; `port.sh sc3 ... --native-only` translates the game, explores for missing entries and compiles recorded VU programs. `EXPLORE=0` skips exploration on a rebuild. No PNACH patches, forced display mode or startup skips are supplied.
+`make build` calls `python3 recomp/port.py build --work "$(WORK)"` directly. The Python tool finds an explicit `ISO`, an already linked disc, or the only `.iso` in the repository root. It checks `SYSTEM.CNF` and the extracted ELF's PCSX2 CRC: `SCES_533.12`, `3BA95B70`. Upstream `setup.sh --native-only` builds tools and fetches WebGPU; `port.sh sc3 ... --native-only` translates the game, explores for missing entries and compiles recorded VU programs. `EXPLORE=0` skips exploration on a rebuild. No PNACH patches, forced display mode or startup skips are supplied.
 
 Default paths under `work/ps2-native-recomp/`:
 

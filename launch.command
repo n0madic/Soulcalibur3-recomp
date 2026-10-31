@@ -1,4 +1,4 @@
 #!/bin/bash
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-exec "$here/recomp/run.sh" "$here/recomp/work" "$@"
+exec python3 "$here/recomp/port.py" run --work "$here/recomp/work" -- "$@"

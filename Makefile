@@ -9,9 +9,9 @@ help:
 	@echo 'make test          - test build/launch tooling without a disc'
 	@echo 'make test-runtime  - run synthetic audio, VU0 and window-watchdog tests'
 build:
-	./recomp/build.sh "$(WORK)"
+	python3 recomp/port.py build --work "$(WORK)"
 run:
-	./recomp/run.sh "$(WORK)" $(ARGS)
+	python3 recomp/port.py run --work "$(WORK)" -- $(ARGS)
 test:
 	python3 -m unittest discover -s recomp/tests -v
 test-runtime:
