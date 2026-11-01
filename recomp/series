@@ -1,10 +1,6 @@
 # Patches absent from the pinned upstream commit; apply in order.
-patches/01-pr35-metal.patch
 patches/02-pr36-vu0-aot.patch
-patches/03-pr37-audio-recovery.patch
 patches/04-window-poll-diagnostics.patch
 patches/05-host-input-and-audio.patch
-patches/06-window-title-and-macos-ram.patch
 patches/07-compact-raster-setup.patch
 patches/08-upscaled-metal-latency.patch
-patches/09-readback-diagnostics.patch

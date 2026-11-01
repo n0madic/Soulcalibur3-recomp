@@ -1,7 +1,6 @@
 # Track only port sources and tooling. Game-derived material stays local.
 /*
 !/.gitignore
-!/AGENTS.md
 !/CLAUDE.md
 !/LICENSE
 !/Makefile
