@@ -115,9 +115,9 @@ index 1159ccc..4dfe100 100644
  
  #include "keymap.hpp"
 +#include "poll_watchdog.hpp"
+ #include "quickmenu.hpp"
  #include "ps2/hitch.hpp"
  #include "ps2/os.hpp"
- #include "ps2/video.hpp"
 @@ -74,6 +75,7 @@ constexpr PadBinding kPadButtons[] = {
  SDL_Window *g_window = nullptr;
  #ifdef __APPLE__

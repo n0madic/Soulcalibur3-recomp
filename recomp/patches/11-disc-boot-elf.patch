@@ -1,0 +1,944 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 41f5f18..91ac0f3 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -93,6 +93,7 @@ jobs:
+           for t in analysis_tailcall elf_bss codegen_fallthrough; do
+             python3 tests/$t.py --recompiler build/tools/eerecomp
+           done
++          python3 tests/disc_boot.py --recompiler build/tools/eerecomp --runtime build/ci/libps2runtime.a --cxx "$CXX_BIN"
+           python3 tests/fpu_half_damage.py "$CXX_BIN"
+           python3 scripts/test_vu_codegen.py "$CXX_BIN"
+           CXX="$CXX_BIN" python3 scripts/test_vu0_codegen.py
+diff --git a/docs/disc-boot.md b/docs/disc-boot.md
+new file mode 100644
+index 0000000..5c7a536
+--- /dev/null
++++ b/docs/disc-boot.md
+@@ -0,0 +1,37 @@
++# Start the native runner from the ISO
++
++A runner already built for a game can read its boot ELF directly from that game's ISO:
++
++```sh
++build/native-mygame/ps2run --disc '/path/to/game.iso' --game-dir games/mygame --window --memcard '/path/to/play.ps2'
++```
++
++No extracted boot executable is needed at launch. The runner reads `SYSTEM.CNF`, finds its `BOOT2` entry through the existing ISO9660 index and reads that ELF into memory. Nothing is extracted to the host filesystem or embedded in the runner. The ISO remains open for the game's CD/DVD reads.
++
++This does not turn a game-specific recompiled runner into a general emulator: the native game code still comes from the existing `port.sh` build. The build continues to extract its input ELF for translation. Its printed launch command uses ISO boot when the translated ELF is the original boot program.
++
++An explicit ELF argument keeps the previous behavior:
++
++```sh
++build/native-mygame/ps2run '/path/to/program.elf' --disc '/path/to/game.iso' --window
++```
++
++Use this form when translation used an executable patched before translation, a special extracted core or a disc-free test program. `port.sh` continues to print that form for patched/special executables. Disc boot uses the original ELF on the ISO; it does not apply build-time executable patches to it.
++
++`--game-dir DIR` selects an existing game folder independently of the image and runner locations. `port.sh` always includes it in the printed command, including when a Windows image on another drive cannot be hard-linked to `games/<name>/disc.iso`. The runner uses this folder for `vu1` recording, `vu1-live` and `ee-live` caches, and existing `entries.txt`/`overlays` build inputs. It also supplies the default location of states, reports, logs and `keys.ini`. `--quick-dir` and an explicit memory-card location keep their precedence for those user files; `PS2_VU_RECORD`, `PS2_VU_LIVE` and `PS2_EE_LIVE` can still select individual recording/cache folders. A missing game directory is an error, rather than a silent fallback to the ISO folder.
++
++Without `--game-dir`, the runner looks for `vu1` or `entries.txt` beside the ELF (or its virtual ISO-boot path), one folder above it, then beside the ISO. When none is found, caches and user files default beside the program or ISO. This preserves standalone ISO-only launches; pass `--game-dir` when the image lives separately from the game's existing work folder.
++
++Live EE translation uses the same in-memory ELF bytes as boot, including deferred analysis of the original program. Exact file lengths are preserved so the cache stamp matches external-file boot. Input recordings include `disc-program 1` and the selected `game-dir`; `scripts/replay.py` then boots from the ISO and reuses that folder if it still exists. Replay `--game-dir` overrides it after a move, while an explicit `--program` selects external-file boot.
++
++Missing `SYSTEM.CNF`/`BOOT2`, missing executables, invalid ELF headers, oversized entries and short reads fail with a readable error. Host allocation limits are 64 KiB for the configuration and 128 MiB for the complete ELF, including sections that do not load into EE RAM. `BOOT2` lookup uses disc paths, never host paths, and supports ISO subdirectories and `;1` version suffixes. A relative BOOT2 path is normalized to `cdrom0:` before it is passed to the game.
++
++## Disc-free checks
++
++```sh
++ninja -C build/ci ps2discinputtest
++build/ci/ps2discinputtest
++python3 tests/disc_boot.py --recompiler build/tools/eerecomp --runtime build/ci/libps2runtime.a --cxx clang++
++```
++
++The first test covers valid and malformed synthetic discs. The second builds a tiny recompiled program and ISO, removes the original ELF, forces live translation of a code window, checks warm-cache reuse across file/ISO boot, and replays a fresh recording. It also checks a separate game folder with spaces and Unicode, both live-cache locations, persistent entries/overlays, recording/replay and invalid directories. It uses no game data or GPU and is included in the Linux/macOS CI job.
+diff --git a/host/main.cpp b/host/main.cpp
+index 692b2a8..cd536e0 100644
+--- a/host/main.cpp
++++ b/host/main.cpp
+@@ -1,3 +1,4 @@
++#include "ps2/disc.hpp"
+ #include "ps2/os.hpp"
+ #include "ps2/system.hpp"
+ #include "ps2/ee_live.hpp"
+@@ -59,12 +60,12 @@ namespace {
+ 
+ int usage() {
+     std::fprintf(stderr,
+-                 "usage: ps2run <elf> [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
++                 "usage: ps2run [elf] [--arg text]... [--frames n] [--ntsc] [--misses file]\n"
+                  "              [--disc image.iso] [--memcard card.ps2] [--pal | --ntsc] [--trace-syscalls] [--trace-io] [--trace-threads]\n"
+                  "              [--trace-iop] [--trace-iop-hle] [--frames-dir dir] [--frame-every n] [--frame-at n]...\n"
+                  "              [--press frame:button[+button][:frames]]... [--window] [--fullscreen]\n"
+                  "              [--save-state frame:file] [--load-state file|newest] [--quick-dir dir] [--widescreen] [--patches file]\n"
+-                 "              [--record file] [--no-record] [--replay file [--replay-continue]] [--rtc seconds]\n");
++                 "              [--record file] [--no-record] [--replay file [--replay-continue]] [--rtc seconds] [--game-dir dir]\n");
+     return 2;
+ }
+ 
+@@ -552,6 +553,9 @@ int main(int argc, char **argv) {
+     }
+ #endif
+     if (argc < 2) return usage();
++    const bool from_disc = argv[1][0] == '-';
++    std::string program = from_disc ? std::string() : argv[1];
++    std::vector<std::uint8_t> disc_elf;
+ #ifdef _WIN32
+     SetConsoleCtrlHandler(on_console_event, TRUE);
+     SetUnhandledExceptionFilter(on_crash);
+@@ -567,12 +571,12 @@ int main(int argc, char **argv) {
+     [[maybe_unused]] bool window = false, fullscreen = false;
+     std::string load_path;
+     bool no_record = false;
+-    ps2::g_options.program_path = argv[1];
++    ps2::g_options.disc_program = from_disc;
+     for (int i = 0; i < argc; ++i) {
+         const std::string a = argv[i];
+         ps2::g_options.command_line += (i ? " " : "") + (a.find_first_of(" \t") == std::string::npos ? a : "\"" + a + "\"");
+     }
+-    for (int i = 2; i < argc; ++i) {
++    for (int i = from_disc ? 1 : 2; i < argc; ++i) {
+         const std::string a = argv[i];
+         if (a == "--arg" && i + 1 < argc) args.push_back(argv[++i]);
+         else if (a == "--frames" && i + 1 < argc) ps2::g_options.max_frames = std::strtoull(argv[++i], nullptr, 10);
+@@ -589,6 +593,7 @@ int main(int argc, char **argv) {
+         else if (a == "--trace-io") ps2::g_options.trace_io = true;
+         else if (a == "--trace-threads") ps2::g_options.trace_threads = true;
+         else if (a == "--disc" && i + 1 < argc) ps2::g_options.disc_path = argv[++i];
++        else if (a == "--game-dir" && i + 1 < argc) ps2::g_options.game_dir = argv[++i];
+         else if (a == "--memcard" && i + 1 < argc) ps2::g_options.memcard_path = argv[++i];
+         else if (a == "--trace-iop") ps2::g_options.trace_iop_modules = true;
+         else if (a == "--trace-iop-hle") ps2::g_options.trace_iop_hle = true;
+@@ -630,6 +635,56 @@ int main(int argc, char **argv) {
+         std::unique(ps2::g_options.frame_capture_frames.begin(), ps2::g_options.frame_capture_frames.end()),
+         ps2::g_options.frame_capture_frames.end());
+ 
++    std::string program_location = program;
++    if (from_disc) {
++        if (ps2::g_options.disc_path.empty()) return usage();
++        if (!ps2::disc::open(ps2::g_options.disc_path)) {
++            std::fprintf(stderr, "[elf] cannot open disc image %s\n", ps2::g_options.disc_path.c_str());
++            return 1;
++        }
++        std::string why;
++        if (!ps2::disc::read_boot_elf(program, disc_elf, why)) {
++            std::fprintf(stderr, "[elf] %s\n", why.c_str());
++            return 1;
++        }
++        args[0] = program;
++        // A location anchor for caches/reports; this path is never opened for disc boot.
++        std::string name = program;
++        std::replace(name.begin(), name.end(), '\\', '/');
++        name = name.substr(name.find_last_of("/:") + 1);
++        name = name.substr(0, name.find(';'));
++        program_location = ps2::os::utf8(ps2::os::path(ps2::g_options.disc_path).parent_path() / ps2::os::path(name));
++        std::fprintf(stderr, "[elf] read %s from disc (%zu bytes)\n", program.c_str(), disc_elf.size());
++    }
++    ps2::g_options.program_path = program_location;
++
++    // The image can be on another drive, and a portable runner need not be in the build tree. --game-dir names the folder
++    // port.sh made independently of both paths. Otherwise keep looking around the ELF, then beside the image, as before.
++    std::error_code error;
++    const std::filesystem::path program_file = std::filesystem::absolute(ps2::os::path(program_location), error);
++    std::filesystem::path game_dir;
++    if (!ps2::g_options.game_dir.empty()) {
++        game_dir = std::filesystem::absolute(ps2::os::path(ps2::g_options.game_dir), error);
++        if (error || !std::filesystem::is_directory(game_dir, error)) {
++            std::fprintf(stderr, "[game] not a directory: %s\n", ps2::g_options.game_dir.c_str());
++            return 1;
++        }
++    } else {
++        std::vector<std::filesystem::path> places{program_file.parent_path(), program_file.parent_path().parent_path()};
++        if (!ps2::g_options.disc_path.empty()) {
++            const std::filesystem::path disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
++            if (!error) places.push_back(disc.parent_path());
++        }
++        for (const auto &place : places)
++            if (std::filesystem::is_directory(place / "vu1", error) || std::filesystem::is_regular_file(place / "entries.txt", error)) {
++                game_dir = place;
++                break;
++            }
++    }
++    game_dir = game_dir.lexically_normal();
++    ps2::g_options.game_dir = ps2::os::utf8(game_dir);
++    const std::filesystem::path data_dir = game_dir.empty() ? program_file.parent_path() : game_dir;
++
+ #ifdef PS2_WINDOW
+     // PS2_NO_LOG_COPY=1 leaves the log alone (no memory copy, no file): the way back if the pipe is ever in the way
+     if (window && ps2::os::env("PS2_NO_LOG_COPY").empty() && g_log.start(ps2::os::path(ps2::quick_folder("logs")))) {
+@@ -641,29 +696,14 @@ int main(int argc, char **argv) {
+ #endif
+ 
+ #ifdef PS2_WINDOW
+-    // Record unknown microprograms beside the game that port.sh prepared.
+-    // Explicit per-unit recording directories take precedence. Find the game
+-    // folder from the executable (disc/, patched/ or a top-level core ELF),
+-    // then use the disc image's folder as a final fallback.
++    // Record unknown programs in the selected game folder; preserve explicit per-unit paths.
+     if (window) {
+-        std::error_code error;
+-        std::vector<std::filesystem::path> places;
+-        const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
+-        if (!error) places = {program.parent_path(), program.parent_path().parent_path()};
+-        if (!ps2::g_options.disc_path.empty()) {
+-            const auto disc = std::filesystem::absolute(ps2::os::path(ps2::g_options.disc_path), error);
+-            if (!error) places.push_back(disc.parent_path());
+-        }
+         for (int unit : {1, 0}) {
+             const char *setting = unit ? "PS2_VU_RECORD" : "PS2_VU0_RECORD";
+             if (!ps2::os::env(setting).empty()) continue;
+-            for (const auto &place : places) {
+-                const auto directory = (place / (unit ? "vu1" : "vu0")).lexically_normal();
+-                if (std::filesystem::is_directory(directory, error) && ps2::os::set_env(setting, ps2::os::utf8(directory))) {
+-                    std::fprintf(stderr, "[vu%d] recording unknown vector programs into %s\n", unit, ps2::os::env(setting).c_str());
+-                    break;
+-                }
+-            }
++            const auto directory = data_dir / (unit ? "vu1" : "vu0");
++            if (std::filesystem::is_directory(directory, error) && ps2::os::set_env(setting, ps2::os::utf8(directory)))
++                std::fprintf(stderr, "[vu%d] recording unknown vector programs into %s\n", unit, ps2::os::env(setting).c_str());
+         }
+     }
+     if (window && !open_window(fullscreen)) return 1;
+@@ -676,17 +716,7 @@ int main(int argc, char **argv) {
+         const std::string setting = ps2::os::env("PS2_VU_LIVE");
+         if (setting != "0" && setting != "off" && (window || !setting.empty())) {
+             std::string cache = setting == "1" || setting == "on" ? std::string() : setting;
+-            if (cache.empty()) {
+-                std::error_code error;
+-                const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
+-                std::filesystem::path place = program.parent_path();
+-                for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
+-                    if (std::filesystem::is_directory(candidate / "vu1", error)) {
+-                        place = candidate;
+-                        break;
+-                    }
+-                cache = ps2::os::utf8((place / "vu1-live").lexically_normal());
+-            }
++            if (cache.empty()) cache = ps2::os::utf8(data_dir / "vu1-live");
+             ps2::vu::live::start(cache);
+         }
+     }
+@@ -699,30 +729,21 @@ int main(int argc, char **argv) {
+     {
+         const std::string setting = ps2::os::env("PS2_EE_LIVE");
+         if (setting != "0" && setting != "off" && (window || !setting.empty())) {
+-            std::error_code error;
+-            const std::filesystem::path program = std::filesystem::absolute(ps2::os::path(argv[1]), error);
+-            std::filesystem::path place = program.parent_path(), game_dir;
+-            for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
+-                if (std::filesystem::is_directory(candidate / "vu1", error) || std::filesystem::is_regular_file(candidate / "entries.txt", error)) {
+-                    place = candidate;
+-                    break;
+-                }
+-            for (const std::filesystem::path &candidate : {program.parent_path(), program.parent_path().parent_path()})
+-                if (std::filesystem::is_regular_file(candidate / "entries.txt", error)) {
+-                    game_dir = candidate;
+-                    break;
+-                }
+-            const std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8((place / "ee-live").lexically_normal()) : setting;
+-            ps2::ee::live::start(argv[1], cache, ps2::os::utf8(game_dir));
++            const std::string cache = setting.empty() || setting == "1" || setting == "on" ? ps2::os::utf8(data_dir / "ee-live") : setting;
++            if (from_disc) ps2::ee::live::start(disc_elf, cache, ps2::os::utf8(game_dir));
++            else ps2::ee::live::start(program_location, cache, ps2::os::utf8(game_dir));
+         }
+     }
+     const auto emulate = [&]() -> int {
+         name_thread(L"ps2 emulation");
+         std::uint32_t entry = 0;
+-        if (!ps2::load_elf(argv[1], entry)) {
+-            std::fprintf(stderr, "cannot load %s\n", argv[1]);
++        const bool loaded = from_disc ? ps2::load_elf(disc_elf, entry) : ps2::load_elf(program, entry);
++        if (!loaded) {
++            std::fprintf(stderr, "cannot load %s\n", program.c_str());
+             return 1;
+         }
++        // Segments are in EE RAM and live analysis owns its ELF bytes; release the host boot buffer.
++        std::vector<std::uint8_t>().swap(disc_elf);
+         ps2::boot(entry, args);
+         if (load_path == "newest") {  // the newest quick save (F5) of this game
+             load_path = ps2::quick_newest_state();
+diff --git a/recomp/eerecomp_gen.cpp b/recomp/eerecomp_gen.cpp
+index 45a1e44..7fd0e7b 100644
+--- a/recomp/eerecomp_gen.cpp
++++ b/recomp/eerecomp_gen.cpp
+@@ -215,7 +215,10 @@ std::string window_name(std::uint32_t base, const std::uint8_t *image, std::size
+ 
+ // ---------------------------------------------------------------------------------------------------------------- live
+ 
+-StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries) : image_(Image::load(elf_path)) {
++StaticProgram::StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries)
++    : StaticProgram(Image::load(elf_path), entries) {}
++
++StaticProgram::StaticProgram(Image image, const std::vector<std::uint32_t> &entries) : image_(std::move(image)) {
+     const Links imports = snr2_imports(image_);
+     program_ = analyse(image_, entries, dynamic_sites(imports));
+ }
+diff --git a/recomp/eerecomp_gen.hpp b/recomp/eerecomp_gen.hpp
+index 5ea2b4a..b3f2472 100644
+--- a/recomp/eerecomp_gen.hpp
++++ b/recomp/eerecomp_gen.hpp
+@@ -79,6 +79,7 @@ std::string window_name(std::uint32_t base, const std::uint8_t *image, std::size
+ class StaticProgram {
+ public:
+     StaticProgram(const std::string &elf_path, const std::vector<std::uint32_t> &entries);
++    StaticProgram(Image image, const std::vector<std::uint32_t> &entries);
+     std::vector<std::uint32_t> calls_into(std::uint32_t base, std::uint32_t size) const;
+     // The stretch of the program that holds its code: from the first to the last instruction the analysis reached (and the `.text` section
+     // when the file has one). The rest of an executable segment is data; {0, 0} when nothing was reached.
+diff --git a/recomp/elf.cpp b/recomp/elf.cpp
+index ffa234b..1897930 100644
+--- a/recomp/elf.cpp
++++ b/recomp/elf.cpp
+@@ -12,7 +12,7 @@ namespace recomp {
+ namespace {
+ 
+ template <typename T>
+-T read(const std::vector<std::uint8_t> &data, std::size_t offset) {
++T read(std::span<const std::uint8_t> data, std::size_t offset) {
+     if (offset + sizeof(T) > data.size()) throw std::runtime_error("truncated ELF file");
+     T value;
+     std::memcpy(&value, data.data() + offset, sizeof(T));
+@@ -25,8 +25,12 @@ Image Image::load(const std::string &path) {
+     std::ifstream file(ps2::os::path(path), std::ios::binary);
+     if (!file) throw std::runtime_error("cannot open " + path);
+     const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(file), {}};
++    return load(data);
++}
++
++Image Image::load(std::span<const std::uint8_t> data) {
+     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF\x01\x01", 6) != 0)
+-        throw std::runtime_error(path + " is not a little endian ELF32 file");
++        throw std::runtime_error("not a little endian ELF32 file");
+ 
+     Image image;
+     image.entry_ = read<std::uint32_t>(data, 24);
+diff --git a/recomp/elf.hpp b/recomp/elf.hpp
+index c18e342..97bd00c 100644
+--- a/recomp/elf.hpp
++++ b/recomp/elf.hpp
+@@ -4,6 +4,7 @@
+ #include <map>
+ #include <optional>
+ #include <string>
++#include <span>
+ #include <utility>
+ #include <vector>
+ 
+@@ -19,6 +20,7 @@ struct Segment {
+ class Image {
+ public:
+     static Image load(const std::string &path);
++    static Image load(std::span<const std::uint8_t> data);
+     static Image raw(std::uint32_t address, std::vector<std::uint8_t> bytes, std::pair<std::uint32_t, std::uint32_t> text);
+ 
+     std::uint32_t entry() const { return entry_; }
+diff --git a/runtime/include/ps2/disc.hpp b/runtime/include/ps2/disc.hpp
+index 0f1af64..e0d577f 100644
+--- a/runtime/include/ps2/disc.hpp
++++ b/runtime/include/ps2/disc.hpp
+@@ -29,4 +29,9 @@ std::optional<Entry> find(const std::string &path);
+ std::uint32_t layer1_start();
+ std::uint64_t sector_count();
+ 
++// Read SYSTEM.CNF's BOOT2 file from the open ISO without extracting it. Returns its guest path and exact ELF bytes.
++// Host allocation limits: 64 KiB for SYSTEM.CNF and 128 MiB for the ELF (including non-loadable/debug data).
++// On failure outputs are cleared and why explains the problem.
++bool read_boot_elf(std::string &program, std::vector<std::uint8_t> &elf, std::string &why);
++
+ }
+diff --git a/runtime/include/ps2/ee_live.hpp b/runtime/include/ps2/ee_live.hpp
+index 2580d8e..c8628ea 100644
+--- a/runtime/include/ps2/ee_live.hpp
++++ b/runtime/include/ps2/ee_live.hpp
+@@ -10,6 +10,7 @@
+ 
+ #include <cstdint>
+ #include <string>
++#include <span>
+ 
+ namespace ps2::ee::live {
+ 
+@@ -18,6 +19,8 @@ namespace ps2::ee::live {
+ // (entries.txt and overlays\ in it get what was found), or empty. Loads what earlier runs left in the cache. With no C++ compiler
+ // found it logs one line and only the loaded libraries are used.
+ void start(const std::string &program, const std::string &cache, const std::string &game_dir);
++// Copies the ELF bytes; the caller need not keep them alive. Uses the same cache stamp and analysis as file boot.
++void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir);
+ 
+ bool active();
+ 
+diff --git a/runtime/include/ps2/system.hpp b/runtime/include/ps2/system.hpp
+index caf4151..b68dafc 100644
+--- a/runtime/include/ps2/system.hpp
++++ b/runtime/include/ps2/system.hpp
+@@ -5,6 +5,7 @@
+ #include <cstdint>
+ #include <functional>
+ #include <string>
++#include <span>
+ #include <vector>
+ 
+ namespace ps2 {
+@@ -62,9 +63,11 @@ struct Options {
+     std::string save_state_path;
+     std::uint64_t save_state_frame = 0;
+     // for the keys of a window run (F5, F8, F9; docs/play-keys.md)
++    bool disc_program = false;                            // boots from SYSTEM.CNF in --disc; also written to input recordings
+     std::string program_path;                                  // the game's program, set by the host
++    std::string game_dir;                                      // --game-dir or the game folder found by the host; caches and build inputs
+     std::string command_line;                                  // what the runner was started with, for reports
+-    std::string quick_dir;                                     // --quick-dir; default: the folder of the memory card, else of the program
++    std::string quick_dir;                                     // --quick-dir; default: memory card folder, game folder, then program folder
+     std::function<std::string(std::size_t lines)> recent_log;  // the host's copy of the log: its last lines ...
+     std::function<std::string(std::size_t lines)> first_log;   // ... and its first lines
+     std::function<void()> on_exit;                             // the window run is about to end the process
+@@ -108,6 +111,7 @@ void request_iop_sync();
+ void sync_iop();
+ 
+ bool load_elf(const std::string &path, std::uint32_t &entry);
++bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry);
+ void boot(std::uint32_t entry, const std::vector<std::string> &args);
+ int run();
+ void halt(const std::string &reason);
+diff --git a/runtime/src/disc.cpp b/runtime/src/disc.cpp
+index 6ef2e06..92e13d0 100644
+--- a/runtime/src/disc.cpp
++++ b/runtime/src/disc.cpp
+@@ -9,6 +9,7 @@
+ #include <cstring>
+ #include <map>
+ #include <set>
++#include <string_view>
+ 
+ namespace ps2::disc {
+ 
+@@ -221,6 +222,79 @@ std::optional<Entry> find(const std::string &raw) {
+     return it->second;
+ }
+ 
++namespace {
++
++bool read_boot_file(const std::string &path, std::size_t limit, std::vector<std::uint8_t> &out, std::string &why) {
++    const auto entry = find(path);
++    if (!entry || entry->directory) {
++        why = path + ": file not found in the disc image";
++        return false;
++    }
++    const std::uint64_t offset = std::uint64_t{entry->sector} * kSector;
++    if (!entry->size || entry->size > limit || offset > g_size || entry->size > g_size - offset) {
++        why = path + ": empty, too large or outside the disc image";
++        return false;
++    }
++    out.resize(entry->size);
++    // Boot is host I/O. Guest read() pads short sector reads with zeroes; here every file byte must be present.
++    if (g_reader(offset, out.data(), out.size()) != out.size()) {
++        out.clear();
++        why = path + ": short read from the disc image";
++        return false;
++    }
++    return true;
++}
++
++std::string_view trim_boot_value(std::string_view text) {
++    const auto begin = text.find_first_not_of(" \t\r\n");
++    return begin == std::string_view::npos ? std::string_view{} : text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1);
++}
++
++}
++
++bool read_boot_elf(std::string &program, std::vector<std::uint8_t> &elf, std::string &why) {
++    program.clear();
++    elf.clear();
++    why.clear();
++    if (!is_open()) {
++        why = "no disc image is open";
++        return false;
++    }
++    // These are host allocation limits for untrusted file metadata, not PS2 hardware limits.
++    std::vector<std::uint8_t> cnf;
++    if (!read_boot_file("SYSTEM.CNF", 64u << 10, cnf, why)) return false;
++    std::string_view text(reinterpret_cast<const char *>(cnf.data()), cnf.size());
++    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
++    text = text.substr(0, text.find('\0'));  // tolerate a padded configuration file
++    while (!text.empty()) {
++        const auto end = text.find('\n');
++        const auto line = text.substr(0, end);
++        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
++        const auto equal = line.find('=');
++        if (equal == std::string_view::npos || upper(std::string(trim_boot_value(line.substr(0, equal)))) != "BOOT2") continue;
++        const auto value = trim_boot_value(line.substr(equal + 1));
++        const auto colon = value.find(':');
++        if (value.empty() || (colon != std::string_view::npos && upper(std::string(value.substr(0, colon))) != "CDROM0")) {
++            why = "SYSTEM.CNF: BOOT2 must name a file on cdrom0";
++            return false;
++        }
++        const std::string path(value);
++        std::vector<std::uint8_t> bytes;
++        if (!read_boot_file(path, 128u << 20, bytes, why)) return false;
++        if (bytes.size() < 52 || std::memcmp(bytes.data(), "\x7F" "ELF\x01\x01", 6) != 0) {
++            why = path + ": not a little endian ELF32 file";
++            return false;
++        }
++        program = path;
++        if (colon == std::string_view::npos)
++            program = std::string("cdrom0:") + ((path.front() == '\\' || path.front() == '/') ? "" : "\\") + path;
++        elf = std::move(bytes);
++        return true;
++    }
++    why = "SYSTEM.CNF does not name a BOOT2 program";
++    return false;
++}
++
+ std::uint32_t layer1_start() { return g_layer1; }
+ std::uint64_t sector_count() { return g_size / kSector; }
+ 
+diff --git a/runtime/src/ee_live.cpp b/runtime/src/ee_live.cpp
+index 6195985..b356b5a 100644
+--- a/runtime/src/ee_live.cpp
++++ b/runtime/src/ee_live.cpp
+@@ -5,6 +5,7 @@
+ // The browser build has no compiler to call: code the build does not know still stops the game there.
+ namespace ps2::ee::live {
+ void start(const std::string &, const std::string &, const std::string &) {}
++void start(std::span<const std::uint8_t>, const std::string &, const std::string &) {}
+ bool active() { return false; }
+ bool translate_missing(std::uint32_t) { return false; }
+ void frame_tick() {}
+@@ -93,7 +94,7 @@ struct Watch {
+ };
+ 
+ struct State {
+-    fs::path program;       // the game's executable
++    std::vector<std::uint8_t> program;  // ELF bytes, also available without an external boot file
+     fs::path cache;         // ee-live: the libraries
+     fs::path game_dir;      // the folder port.sh made, or empty (entries.txt, overlays\)
+     fs::path compiler;
+@@ -406,7 +407,7 @@ void ensure_analysis() {
+     if (!g->game_dir.empty() && fs::is_regular_file(g->game_dir / "entries.txt", error))
+         g->main_entries = recomp::read_entries(ps2::os::utf8(g->game_dir / "entries.txt")).main;
+     try {
+-        g->program_analysis = std::make_unique<recomp::StaticProgram>(ps2::os::utf8(g->program), g->main_entries);
++        g->program_analysis = std::make_unique<recomp::StaticProgram>(recomp::Image::load(g->program), g->main_entries);
+     } catch (const std::exception &e) {
+         say("cannot read the program for its calls into the window: %s", e.what());
+     }
+@@ -871,12 +872,17 @@ void frame_tick() {
+ }
+ 
+ void start(const std::string &program, const std::string &cache, const std::string &game_dir) {
++    const auto elf = read_file(ps2::os::path(program));
++    start(elf, cache, game_dir);
++}
++
++void start(std::span<const std::uint8_t> program, const std::string &cache, const std::string &game_dir) {
+     if (g || cache.empty()) return;
+     g = new State;
+-    g->program = ps2::os::path(program);
++    g->program.assign(program.begin(), program.end());
+     g->cache = ps2::os::path(cache);
+     g->game_dir = ps2::os::path(game_dir);
+-    const std::vector<std::uint8_t> elf = read_file(g->program);
++    const auto &elf = g->program;
+     g->windows = recomp::code_windows(elf);
+     g->segments = recomp::code_segments(elf);
+     g->file_segments = recomp::file_segments(elf);
+diff --git a/runtime/src/quick_keys.inc b/runtime/src/quick_keys.inc
+index 7a25456..dec8d99 100644
+--- a/runtime/src/quick_keys.inc
++++ b/runtime/src/quick_keys.inc
+@@ -72,11 +72,12 @@ double recent_fps(double seconds, double &last_frame_ago) {
+ 
+ // One folder holds the three kinds of files: states\, reports\ and logs\. Next to the memory card file, since every way of
+ // starting a game passes --memcard (the app's Play button, the desktop shortcut, play.py), so a card and its saves stay together
+-// and each game has its own. Without a card: next to the program. --quick-dir names it explicitly.
++// and each game has its own. Without a card: in the game folder, else next to the program. --quick-dir names it explicitly.
+ fs::path base_dir() {
+     fs::path base;
+     if (!g_options.quick_dir.empty()) base = os::path(g_options.quick_dir);
+     else if (!g_options.memcard_path.empty()) base = os::path(g_options.memcard_path).parent_path();
++    else if (!g_options.game_dir.empty()) base = os::path(g_options.game_dir);
+     else if (!g_options.program_path.empty()) base = os::path(g_options.program_path).parent_path();
+     if (base.empty()) base = ".";
+     std::error_code error;
+@@ -328,6 +329,8 @@ void record_start(const fs::path &file, const fs::path &state, CardAt card_at) {
+     g_rec.buffer = "ps2-inputs 1\ncheck-every " + std::to_string(kCheckEvery) + " slices " + std::to_string(kSlices) + "\n";
+     g_rec.buffer += std::string("pal ") + (g_options.pal ? "1" : "0") + "\n";
+     if (!g_options.program_path.empty()) g_rec.buffer += "program " + g_options.program_path + "\n";
++    if (g_options.disc_program) g_rec.buffer += "disc-program 1\n";
++    if (!g_options.game_dir.empty()) g_rec.buffer += "game-dir " + g_options.game_dir + "\n";
+     if (!g_options.disc_path.empty()) g_rec.buffer += "disc " + g_options.disc_path + "\n";
+     if (state.empty()) g_rec.buffer += "start power-on frame 0\n";
+     else g_rec.buffer += "start state " + os::utf8(state.filename()) + " frame " + std::to_string(g_frames) + "\n";
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index 94659b6..6c47b8f 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -626,6 +626,10 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
+     std::ifstream file(os::path(path), std::ios::binary);
+     if (!file) return false;
+     const std::vector<std::uint8_t> data{std::istreambuf_iterator<char>(file), {}};
++    return load_elf(data, entry);
++}
++
++bool load_elf(std::span<const std::uint8_t> data, std::uint32_t &entry) {
+     if (data.size() < 52 || std::memcmp(data.data(), "\x7f" "ELF", 4) != 0) return false;
+     const auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, data.data() + o, 4); return v; };
+     const auto u16 = [&](std::size_t o) { std::uint16_t v; std::memcpy(&v, data.data() + o, 2); return v; };
+@@ -641,7 +645,7 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
+             // would read past the file or write past the 32 MiB of memory. ELF spec: p_offset + p_filesz lies inside the file and
+             // the segment (p_vaddr up to p_memsz, and the p_filesz bytes copied) inside memory.
+             if (ph > data.size() || data.size() - ph < 24) {
+-                std::fprintf(stderr, "[elf] %s is damaged: program header %u lies past the end of the file\n", path.c_str(), i);
++                std::fprintf(stderr, "[elf] damaged ELF: program header %u lies past the end of the file\n", i);
+                 return false;
+             }
+             if (u32(ph) != 1) continue;
+@@ -651,7 +655,7 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
+                 const std::uint32_t offset = u32(ph + 4), filesz = u32(ph + 16), memsz = u32(ph + 20);
+                 const std::uint32_t start = at & (kScratchpadSize - 1);
+                 if (std::uint64_t{start} + std::max(memsz, filesz) > kScratchpadSize || std::uint64_t{offset} + filesz > data.size()) {
+-                    std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in the scratchpad\n", path.c_str(), i);
++                    std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in the scratchpad\n", i);
+                     return false;
+                 }
+                 if (copy) std::memcpy(g_spr + start, data.data() + offset, filesz);
+@@ -660,7 +664,7 @@ bool load_elf(const std::string &path, std::uint32_t &entry) {
+             }
+             const std::uint32_t offset = u32(ph + 4), vaddr = physical(u32(ph + 8)), filesz = u32(ph + 16), memsz = u32(ph + 20);
+             if (std::uint64_t{vaddr} + std::max(memsz, filesz) > kRamSize || std::uint64_t{offset} + filesz > data.size()) {
+-                std::fprintf(stderr, "[elf] %s is damaged: segment %u does not fit in the file or in memory\n", path.c_str(), i);
++                std::fprintf(stderr, "[elf] damaged ELF: segment %u does not fit in the file or in memory\n", i);
+                 return false;
+             }
+             if (copy) {
+@@ -693,7 +697,7 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
+     init_watch();
+     hw::reset();
+     kernel::reset();
+-    if (!g_options.disc_path.empty() && !disc::open(g_options.disc_path))
++    if (!g_options.disc_path.empty() && (!g_options.disc_program || !disc::is_open()) && !disc::open(g_options.disc_path))
+         std::fprintf(stderr, "[ee] cannot open disc image %s\n", g_options.disc_path.c_str());
+     iop::set_trace(g_options.trace_iop_modules, g_options.trace_iop_hle);
+     iop::reset();
+diff --git a/scripts/port.sh b/scripts/port.sh
+index 338601b..64700d7 100755
+--- a/scripts/port.sh
++++ b/scripts/port.sh
+@@ -260,7 +260,12 @@ if [ "$web" = 1 ]; then
+   printf 'Done. Serve it with:  %s scripts/serve.py %q %q\n' "$pyname" "build/web-$name" "games/$name/disc.iso"
+   echo "and open http://localhost:8620/"
+ fi
+-play=$(printf '%q %q --disc %q --window' "build/native-$name/ps2run" "${elf#$ROOT/}" "${iso#$ROOT/}")
++if [ "$elf" = "$game/disc/$program" ]; then
++  play=$(printf '%q --disc %q --window' "build/native-$name/ps2run" "${iso#$ROOT/}")
++else
++  play=$(printf '%q %q --disc %q --window' "build/native-$name/ps2run" "${elf#$ROOT/}" "${iso#$ROOT/}")
++fi
++play="$play --game-dir $(printf '%q' "games/$name")"
+ [ ${#wide[@]} -eq 0 ] || play="$play --widescreen"
+ [ ${#patches[@]} -eq 0 ] || play="$play --patches $(printf '%q' "games/$name/patches.txt")"
+ echo "Play it natively:  $play"
+diff --git a/scripts/replay.py b/scripts/replay.py
+index 918120d..f23b9ee 100644
+--- a/scripts/replay.py
++++ b/scripts/replay.py
+@@ -100,6 +100,7 @@ def main():
+     ap.add_argument("recording", help="a quick save (.state) or a recording (.inputs)")
+     ap.add_argument("--state", help="the state to start from, when it is not next to the recording")
+     ap.add_argument("--game", help="game folder name under games/ (default: guessed from the program path)")
++    ap.add_argument("--game-dir", type=Path, help="game folder for caches and build inputs (default: from the recording)")
+     ap.add_argument("--program", help="the game's program (default: from the recording)")
+     ap.add_argument("--disc", help="the disc image (default: from the recording)")
+     ap.add_argument("--exe", help="ps2run (default: build/native-<game>/ps2run)")
+@@ -115,10 +116,24 @@ def main():
+     inputs, state, head = find_inputs_and_state(args.recording, args.state)
+     program_text = args.program or head.get("program", "")
+     game = args.game
++    game_dir = args.game_dir
++    if game_dir is None:
++        recorded_dir = head.get("game-dir", "")
++        candidates = [ROOT / "games" / game] if game else []
++        if recorded_dir:
++            candidates += [Path(recorded_dir), ROOT / recorded_dir]
++        game_dir = next((p.resolve() for p in candidates if p.is_dir()), None)
++    elif not game_dir.is_dir():
++        sys.exit(f"replay: game folder is not a directory: {game_dir}")
++    else:
++        game_dir = game_dir.resolve()
+     if not game:
+         m = re.search(r"(?:games|program)[/\\]([^/\\]+)[/\\]", program_text)  # games\gow2\disc\... (the repo) or program\gow2\... (a game folder made for a player)
+         game = m.group(1) if m else None
+-    program = Path(args.program) if args.program else resolve(program_text, game, "program")
++        if not game and game_dir and game_dir.parent.name == "games":
++            game = game_dir.name
++    disc_boot = not args.program and head.get("disc-program") == "1"
++    program = None if disc_boot else (Path(args.program) if args.program else resolve(program_text, game, "program"))
+     disc = Path(args.disc) if args.disc else resolve(head.get("disc", ""), game, "disc")
+     exe = Path(args.exe) if args.exe else None
+     if exe is None:
+@@ -134,7 +149,9 @@ def main():
+ 
+     work = Path(tempfile.mkdtemp(prefix="replay_"))
+     try:
+-        cmd = [str(exe), str(program), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
++        cmd = [str(exe), *([] if disc_boot else [str(program)]), "--disc", str(disc), "--replay", str(inputs), "--quick-dir", str(work)]
++        if game_dir:
++            cmd += ["--game-dir", str(game_dir)]
+         if args.go_on:
+             cmd += ["--replay-continue"]
+         if args.rtc:
+diff --git a/tests/disc_boot.py b/tests/disc_boot.py
+new file mode 100644
+index 0000000..ad8b7a7
+--- /dev/null
++++ b/tests/disc_boot.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""Boot and live-translate a synthetic game from ISO after removing its ELF.
++
++Build eerecomp and ps2runtime, then run:
++  python3 tests/disc_boot.py --recompiler build/tools/eerecomp --runtime build/ci/libps2runtime.a
++No game data or GPU is needed. All generated files live in a temporary directory.
++"""
++import argparse
++import os
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def run(command, expected=0, **kwargs):
++    result = subprocess.run([str(arg) for arg in command], text=True, stdout=subprocess.PIPE,
++                            stderr=subprocess.STDOUT, timeout=180, **kwargs)
++    if result.returncode != expected:
++        raise RuntimeError(f"{command[0]} exited {result.returncode}, wanted {expected}:\n{result.stdout[-8000:]}")
++    return result.stdout
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--recompiler', type=Path, required=True)
++    parser.add_argument('--runtime', type=Path, required=True)
++    parser.add_argument('--cxx', default='clang++')
++    args = parser.parse_args()
++    with tempfile.TemporaryDirectory(prefix='disc boot test ') as temporary:
++        work = Path(temporary)
++        elf = work / 'BOOT.ELF'
++        # Store a waiting loop in a zero-file-size code window, then jump into it.
++        # Only live EE compilation can serve that window; analysis must also work without a host ELF path.
++        code = [0x3c080020, 0x3c091000, 0x3529ffff, 0xad090000, 0x24090000, 0xad090004, 0x01000008, 0]
++        data = bytearray(0x100 + 4 * len(code))
++        data[:7] = b'\x7fELF\x01\x01\x01'
++        struct.pack_into('<HHIIIIIHHHHHH', data, 16, 2, 8, 1, 0x100000, 52, 0, 0, 52, 32, 2, 40, 0, 0)
++        struct.pack_into('<8I', data, 52, 1, 0x100, 0x100000, 0, 4 * len(code), 4 * len(code), 5, 4)
++        struct.pack_into('<8I', data, 84, 1, 0, 0x200000, 0, 0, 0x1000, 7, 4)
++        struct.pack_into('<' + 'I' * len(code), data, 0x100, *code)
++        elf.write_bytes(data)
++        iso = work / 'disc image.iso'
++        run([sys.executable, ROOT / 'scripts/mkiso.py', iso, elf])
++        generated = work / 'generated'
++        run([args.recompiler.resolve(), elf, '--out', generated])
++        build = work / 'build'
++        run(['cmake', '-S', ROOT, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
++             f'-DCMAKE_CXX_COMPILER={args.cxx}', f'-DPS2_GENERATED={generated}',
++             f'-DPS2_RUNTIME_LIB={args.runtime.resolve()}'])
++        run(['ninja', '-C', build, '-j2', 'ps2run'])
++        exe = build / ('ps2run.exe' if os.name == 'nt' else 'ps2run')
++        cwd = work / 'empty run folder'
++        cwd.mkdir()
++        env = os.environ.copy()
++        env.update(PS2_GS='cpu', PS2_VU_LIVE='0', PS2_EE_LIVE_BG='0', PS2_EE_LIVE_QUICK='off')
++        env['PS2_EE_LIVE'] = str(work / 'external-cache')
++        external = run([exe, elf, '--disc', iso, '--frames', '30'], cwd=cwd, env=env)
++        assert 'stopped after 30 frames' in external, external
++        # The linked runner contains translated code, but no copy of the ELF and no remaining host file.
++        elf.unlink()
++        env['PS2_EE_LIVE'] = str(work / 'disc-cache')
++        recording = work / 'run.inputs'
++        disc = run([exe, '--disc', iso, '--frames', '30', '--record', recording], cwd=cwd, env=env)
++        assert '[elf] read cdrom0:\\BOOT.ELF;1 from disc (288 bytes)' in disc, disc
++        assert 'stopped after 30 frames' in disc and 'switched in after' in disc, disc
++        assert 'disc-program 1\n' in recording.read_text(), recording.read_text()
++        assert not elf.exists() and not list(cwd.glob('*.ELF')), 'runner extracted a boot ELF'
++        cached = run([exe, '--disc', iso, '--frames', '30'], cwd=cwd, env=env)
++        assert 'stopped after 30 frames' in cached and 'loaded 1 translated code windows' in cached, cached
++        assert 'switched in after' not in cached, cached
++        env['PS2_EE_LIVE'] = str(work / 'external-cache')
++        shared = run([exe, '--disc', iso, '--frames', '30'], cwd=cwd, env=env)
++        assert 'loaded 1 translated code windows' in shared and 'switched in after' not in shared, shared
++        replay = run([sys.executable, ROOT / 'scripts/replay.py', recording, '--exe', exe, '--disc', iso], cwd=cwd, env=env)
++        assert 'RESULT: same to the end' in replay, replay
++        # A portable runner and an image outside the game folder must still use the game's caches and build inputs.
++        game = work / 'game folder ü'
++        portable = work / 'portable' / exe.name
++        portable.parent.mkdir()
++        shutil.copy2(exe, portable)
++        (game / 'vu1').mkdir(parents=True)
++        (game / 'overlays').mkdir()
++        (game / 'entries.txt').write_text('')
++        env.update(PS2_EE_LIVE='1', PS2_VU_LIVE='1')
++        game_recording = work / 'game-dir.inputs'
++        selected = run([portable, '--disc', iso, '--game-dir', game, '--frames', '30', '--record', game_recording], cwd=cwd, env=env)
++        assert 'stopped after 30 frames' in selected and 'switched in after' in selected, selected
++        assert str(game / 'ee-live') in selected and str(game / 'vu1-live') in selected, selected
++        assert list((game / 'ee-live').glob('*.*')), 'EE cache was not written in the game folder'
++        assert (game / 'entries.txt').read_text().strip(), 'live entries were not added to the game folder'
++        assert list((game / 'overlays').glob('*.bin')), 'live overlay was not captured in the game folder'
++        assert f'game-dir {game}\n' in game_recording.read_text(), game_recording.read_text()
++        selected_replay = run([sys.executable, ROOT / 'scripts/replay.py', game_recording, '--exe', portable,
++                              '--disc', iso, '--log', work / 'game-replay.log'], cwd=cwd, env=env)
++        assert 'RESULT: same to the end' in selected_replay, selected_replay
++        assert 'loaded 1 translated code windows' in (work / 'game-replay.log').read_text(), selected_replay
++        legacy = cwd / 'separate program.elf'
++        legacy.write_bytes(data)
++        legacy_run = run([portable, legacy, '--disc', iso, '--game-dir', game, '--frames', '30'], cwd=cwd, env=env)
++        assert 'loaded 1 translated code windows' in legacy_run and 'switched in after' not in legacy_run, legacy_run
++        legacy.unlink()
++        env.update(PS2_EE_LIVE=str(work / 'external-cache'), PS2_VU_LIVE=str(work / 'override-vu-cache'))
++        overrides = run([portable, '--disc', iso, '--game-dir', game, '--frames', '30'], cwd=cwd, env=env)
++        assert str(work / 'external-cache') in overrides and str(work / 'override-vu-cache') in overrides, overrides
++        assert not (work / 'ee-live').exists() and not (work / 'vu1-live').exists(), 'cache leaked into the ISO folder'
++        assert not (cwd / 'ee-live').exists() and not (cwd / 'vu1-live').exists(), 'cache leaked into the working folder'
++        invalid = run([exe, '--disc', iso, '--game-dir', work / 'missing', '--frames', '30'], expected=1, cwd=cwd, env=env)
++        assert 'not a directory' in invalid, invalid
++        run([exe, '--disc', iso, '--game-dir', iso, '--frames', '30'], expected=1, cwd=cwd, env=env)
++        run([exe, '--frames', '30'], expected=2, cwd=cwd, env=env)
++    print('ISO boot: legacy ELF, absent-ELF boot, live analysis, warm/shared cache, game directory and replay passed')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/disc_input.cpp b/tests/disc_input.cpp
+index 0019c80..d367b69 100644
+--- a/tests/disc_input.cpp
++++ b/tests/disc_input.cpp
+@@ -198,6 +198,80 @@ void irx_tests() {
+     check(iop::load_module_buffer(irx({}), "valid-again.irx", "") >= 0, "valid module after the refused ones: loads");
+ }
+ 
++// ---- booting directly from SYSTEM.CNF in an ISO ----
++
++struct BootDisc {
++    std::vector<std::uint8_t> bytes;
++    std::size_t cnf_record, elf_record;
++};
++
++BootDisc boot_disc(const std::string &cnf) {
++    BootDisc out{image(20, disc::kSector), 0, 0};
++    auto at = dots(out.bytes, 20 * disc::kSector, 20, 20);
++    out.cnf_record = at;
++    at = record(out.bytes, at, 30, static_cast<std::uint32_t>(cnf.size()), false, "SYSTEM.CNF;1");
++    out.elf_record = at;
++    record(out.bytes, at, 31, 53, false, "BOOT.ELF;1");
++    std::memcpy(out.bytes.data() + 30 * disc::kSector, cnf.data(), cnf.size());
++    std::memcpy(out.bytes.data() + 31 * disc::kSector, "\177ELF\1\1\1", 7);
++    return out;
++}
++
++void boot_disc_tests() {
++    const std::string cnf = "BOOT2 = cdrom0:\\BOOT.ELF;1\r\nVER = 1.00\r\n";
++    auto valid = boot_disc(cnf);
++    open_image(valid.bytes, "boot.iso");
++    std::string program, why;
++    std::vector<std::uint8_t> elf;
++    check(disc::read_boot_elf(program, elf, why) && program == "cdrom0:\\BOOT.ELF;1" && elf.size() == 53 && why.empty(),
++          "ISO boot: BOOT2 path and exact ELF bytes, excluding sector padding");
++    auto padded = boot_disc(std::string("\xEF\xBB\xBF\tboot2\t=\tcdrom0:\\BOOT.ELF;1 \n") + '\0' + "trailing padding");
++    open_image(padded.bytes, "padded-cnf.iso");
++    check(disc::read_boot_elf(program, elf, why) && elf.size() == 53, "ISO boot: BOM, mixed case, tabs, LF and NUL padding");
++    auto relative = boot_disc("BOOT2 = BOOT.ELF;1\n");
++    open_image(relative.bytes, "relative-boot.iso");
++    check(disc::read_boot_elf(program, elf, why) && program == "cdrom0:\\BOOT.ELF;1",
++          "ISO boot: relative BOOT2 becomes a guest disc path without duplicating ;1");
++    const auto refuse = [&](BootDisc &bad, const char *what) {
++        open_image(bad.bytes, "bad-boot.iso");
++        program = "stale";
++        elf.assign(4, 0xFF);
++        check(!disc::read_boot_elf(program, elf, why) && program.empty() && elf.empty() && !why.empty(), what);
++    };
++    { auto bad = valid; bad.bytes[bad.cnf_record + 33] = 'X'; refuse(bad, "ISO boot: missing SYSTEM.CNF"); }
++    { auto bad = valid; bad.bytes[bad.cnf_record + 25] = 2; refuse(bad, "ISO boot: SYSTEM.CNF is a directory"); }
++    { auto bad = boot_disc("BOOT = cdrom0:\\BOOT.ELF;1\n"); refuse(bad, "ISO boot: missing BOOT2"); }
++    { auto bad = boot_disc("BOOT2 = \t\r\n"); refuse(bad, "ISO boot: empty BOOT2"); }
++    { auto bad = boot_disc("BOOT2 = host:BOOT.ELF\n"); refuse(bad, "ISO boot: host path is not opened"); }
++    { auto bad = valid; bad.bytes[bad.elf_record + 33] = 'X'; refuse(bad, "ISO boot: missing boot program"); }
++    { auto bad = valid; bad.bytes[bad.elf_record + 25] = 2; refuse(bad, "ISO boot: boot program is a directory"); }
++    { auto bad = valid; bad.bytes[31 * disc::kSector] = 0; refuse(bad, "ISO boot: invalid ELF magic"); }
++    { auto bad = valid; put(bad.bytes, bad.elf_record + 10, 51u); refuse(bad, "ISO boot: truncated ELF header"); }
++    { auto bad = valid; put(bad.bytes, bad.cnf_record + 10, 65537u); refuse(bad, "ISO boot: configuration allocation is bounded"); }
++    { auto bad = valid; put(bad.bytes, bad.elf_record + 10, 0xFFFFFFFFu); refuse(bad, "ISO boot: ELF allocation is bounded"); }
++    { auto bad = valid; put(bad.bytes, bad.elf_record + 2, 0xFFFFFFFFu); refuse(bad, "ISO boot: ELF extent outside the image"); }
++    disc::open("short-boot.iso", valid.bytes.size(), [&valid](std::uint64_t offset, void *out, std::size_t bytes) -> std::size_t {
++        if (offset >= valid.bytes.size()) return 0;
++        auto count = std::min<std::size_t>(bytes, valid.bytes.size() - offset);
++        if (offset == 31 * disc::kSector && count) --count;
++        std::memcpy(out, valid.bytes.data() + offset, count);
++        return count;
++    });
++    check(!disc::read_boot_elf(program, elf, why) && why.find("short read") != std::string::npos,
++          "ISO boot: a positive but short reader result is refused");
++    auto nested = image(20, disc::kSector);
++    const std::string nested_cnf = "BOOT2=cdrom0:\\DIR\\BOOT.ELF;1\n";
++    auto at = dots(nested, 20 * disc::kSector, 20, 20);
++    at = record(nested, at, 30, static_cast<std::uint32_t>(nested_cnf.size()), false, "SYSTEM.CNF;1");
++    record(nested, at, 21, disc::kSector, true, "DIR");
++    at = dots(nested, 21 * disc::kSector, 21, 20);
++    record(nested, at, 31, 53, false, "BOOT.ELF;1");
++    std::memcpy(nested.data() + 30 * disc::kSector, nested_cnf.data(), nested_cnf.size());
++    std::memcpy(nested.data() + 31 * disc::kSector, "\177ELF\1\1\1", 7);
++    open_image(nested, "nested-boot.iso");
++    check(disc::read_boot_elf(program, elf, why) && program == "cdrom0:\\DIR\\BOOT.ELF;1", "ISO boot: program in a sub-directory");
++}
++
+ // ---- the boot ELF: PT_LOAD segments copied into the 32 MiB of EE memory ----
+ 
+ struct Segment { std::uint32_t offset = 0x100, vaddr = 0x00100000, filesz = 0x10, memsz = 0x40; };
+@@ -234,6 +308,7 @@ int main() {
+     disc_tests();
+     irx_tests();
+     elf_tests();
++    boot_disc_tests();
+     std::printf("disc input: %d failed of %d checks\n", failed, checks);
+     return failed ? 1 : 0;
+ }
+diff --git a/tests/save_files.cpp b/tests/save_files.cpp
+index 505ebec..86e9311 100644
+--- a/tests/save_files.cpp
++++ b/tests/save_files.cpp
+@@ -241,6 +241,21 @@ void file_cases() {
+     check(!fs::exists(dir / "state.p2s.tmp"), "normal write: no temporary file is left");
+ }
+ 
++void game_folders() {
++    auto &options = ps2::g_options;
++    const fs::path base = fs::absolute(g_work).lexically_normal();
++    const auto folder = [] { return ps2::os::path(ps2::quick_folder("states")); };
++    options.program_path = ps2::os::utf8(base / "disc" / "BOOT.ELF");
++    check(folder() == base / "disc" / "states", "without a game folder: states stay beside the program");
++    options.game_dir = ps2::os::utf8(base / "game");
++    check(folder() == base / "game" / "states", "game folder: states go there instead of beside the program");
++    options.memcard_path = ps2::os::utf8(base / "card" / "play.ps2");
++    check(folder() == base / "card" / "states", "memory card folder overrides the game folder for user files");
++    options.quick_dir = ps2::os::utf8(base / "quick");
++    check(folder() == base / "quick" / "states", "quick directory overrides both memory card and game folder");
++    options = {};
++}
++
+ }
+ 
+ int main(int argc, char **argv) {
+@@ -254,6 +269,7 @@ int main(int argc, char **argv) {
+     std::error_code error;
+     fs::remove_all(g_work, error);
+     fs::create_directories(g_work);
++    game_folders();
+     card_cases();
+     file_cases();
+     std::printf("save files: %d of %d checks passed, %d failed\n", checks - failed, checks, failed);

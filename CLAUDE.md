@@ -5,7 +5,7 @@
 ## Source ownership
 
 - `recomp/ps2-native-recomp.commit` pins the upstream commit.
-- `recomp/series` names the five remaining patches in order. The pinned upstream base includes #32 (SIF/Start), #33 (initial audio pacing), #34 (CPU clock), #35 (Metal presentation), #37 (audio pause recovery), #38 (window title/macOS RAM) and #40 (bounded readback diagnostics); do not reapply them.
+- `recomp/series` names the five remaining patches in order. The pinned upstream base includes #32 (SIF/Start), #33 (initial audio pacing), #34 (CPU clock), #35 (Metal presentation), #36 (VU0 AOT with the TOP/ITOP fix), #37 (audio pause recovery), #38 (window title/macOS RAM), #40 (bounded readback diagnostics) and #45 (GPU backend log); do not reapply them. Draft #39 (`07`) and PR #46 (`11`) are still open.
 - `recomp/patches/` contains pending upstream contributions and local host/diagnostic changes. Keep each independent area in one patch; do not revive the obsolete PS2Recomp/paraLLEl-GS/TOML/Ghidra series.
 - `recomp/port.py` manages source preparation, disc validation, build and launch. `Makefile` and `launch.command` call it directly.
 - `recomp/tests/` tests the wrapper without a disc. `make test-runtime` runs synthetic audio, VU0 and watchdog tests in the prepared runtime.
@@ -24,7 +24,7 @@ make test-runtime
 
 The tested disc is PAL `SCES_533.12`, CRC `3BA95B70`. The wrapper uses original instructions, retains the display-mode dialog, and supplies no movie-skip or PNACH overrides. Escape is Start; help is F1. Defaults come from upstream `host/keymap.cpp` and are remappable through the private `games/sc3/keys.ini`.
 
-The default runner is `recomp/work/ps2-native-recomp/build/native-sc3/ps2run`. The launcher uses its checkout as cwd and supplies the original ELF, ISO and `games/sc3/play.ps2`. Do not use the former `work/game` cwd, `ps2EntryRunner`, raylib controls or Vulkan/paraLLEl-GS options.
+The default runner is `recomp/work/ps2-native-recomp/build/native-sc3/ps2run`. The launcher uses its checkout as cwd and supplies the ISO (the runner reads its boot ELF directly), `--game-dir games/sc3` and `games/sc3/play.ps2`. Do not use the former `work/game` cwd, `ps2EntryRunner`, raylib controls or Vulkan/paraLLEl-GS options.
 
 ## Changing patches
 

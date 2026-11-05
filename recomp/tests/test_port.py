@@ -116,16 +116,18 @@ class PortTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Invalid patch"):
             port.configuration(self.config)
 
-    def test_runner_uses_original_elf_and_separate_arguments(self):
+    def test_runner_needs_only_binary_and_iso_and_preserves_arguments(self):
         with self.assertRaisesRegex(RuntimeError, "make build"):
             port.runner_command(self.engine)
-        for name in ["build/native-sc3/ps2run", "games/sc3/disc/SCES_533.12", "games/sc3/disc.iso"]:
+        for name in ["build/native-sc3/ps2run", "games/sc3/disc.iso"]:
             p = self.engine / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.touch()
         extra = ["--load-state", str(self.root / "State [a] with spaces.state")]
         args = port.runner_command(self.engine, extra)
-        self.assertEqual(args[1], str(self.engine / "games/sc3/disc/SCES_533.12"))
+        self.assertEqual(args[1:3], ["--disc", str(self.engine / "games/sc3/disc.iso")])
+        self.assertEqual(args[3:5], ["--game-dir", str(self.engine / "games/sc3")])
+        self.assertFalse((self.engine / "games/sc3/disc").exists())
         self.assertEqual(args[-2:], extra)
         self.assertNotIn("--patches", args)
         self.assertIn(str(self.engine / "games/sc3/play.ps2"), args)
@@ -187,6 +189,7 @@ class PortTests(unittest.TestCase):
             port.build(work, no_explore=True)
         build_call = next(c for c in calls if str(engine / "scripts/port.sh") in c)
         self.assertIn("--native-only", build_call)
+        self.assertNotIn("--embed-elf", build_call)
         self.assertIn("--no-explore", build_call)
         self.assertNotIn("--pnach", build_call)
         self.assertEqual(json.loads((engine / "build/sc3-port-build.json").read_text())["elf_crc"], port.CRC)

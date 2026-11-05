@@ -41,7 +41,7 @@ make build ISO='/path/to/Soulcalibur III.iso'
 
 The wrapper checks out the exact commit in `recomp/ps2-native-recomp.commit`, applies `recomp/series`, validates the boot ELF and calls upstream's native port pipeline. Initial exploration runs discover additional code and record VU entries. They use a separate exploration card. The first build can take several minutes; keep several GB free for builds and caches in addition to the ISO.
 
-The upstream pin was refreshed on 2026-11-01. Metal presentation, audio pause recovery, game window titles/macOS memory reporting and bounded readback diagnostics now come from upstream; five local patches remain. See the [patch list](recomp/README.md#reproducible-source-set) for details.
+The upstream pin was refreshed on 2026-11-05. Metal presentation, audio pause recovery, game window titles/macOS memory reporting, bounded readback diagnostics and the VU0 AOT (with its TOP/ITOP fix) now come from upstream; five local patches remain. See the [patch list](recomp/README.md#reproducible-source-set) for details.
 
 To rebuild using entries and recordings already captured, without automatic exploration:
 
@@ -64,7 +64,15 @@ Or double-click `launch.command`. The default executable is:
 recomp/work/ps2-native-recomp/build/native-sc3/ps2run
 ```
 
-The launcher uses the original extracted ELF and ISO. Saves go to `games/sc3/play.ps2` inside that checkout. Logs, quick states and VU recordings stay in the same game's local directories. `make run` rejects a build whose source pin/patch fingerprint is out of date; rebuild after changing the series.
+The launcher reads the boot ELF directly from the ISO. The extracted ELF is needed only while building; it is not required when playing. Saves go to `games/sc3/play.ps2` inside that checkout. Logs, quick states and VU recordings stay in the same game's local directories. `make run` rejects a build whose source pin/patch fingerprint is out of date; rebuild after changing the series.
+
+You can also launch the built runner directly with just the ISO as game input:
+
+```sh
+recomp/work/ps2-native-recomp/build/native-sc3/ps2run --disc '/path/to/Soulcalibur III.iso' --game-dir recomp/work/ps2-native-recomp/games/sc3 --window --memcard '/path/to/play.ps2'
+```
+
+The memory card is optional user save data. `--game-dir` keeps VU/EE caches and captured build inputs in the game's work folder even if the ISO lives elsewhere. The build still extracts the ELF from the ISO for translation. At launch the runner reads it back from the ISO into memory; live EE compilation uses those same bytes. The native executable contains no additional copy of the ELF.
 
 ### Controls
 

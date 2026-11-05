@@ -169,11 +169,10 @@ def build(work, no_explore=False, frames=3600, rounds=8):
 
 def runner_command(engine, extra=()):
     binary = engine / "build/native-sc3/ps2run"
-    elf = engine / "games/sc3/disc" / BOOT
     iso = engine / "games/sc3/disc.iso"
-    if not binary.is_file() or not elf.is_file() or not iso.is_file():
+    if not binary.is_file() or not iso.is_file():
         raise RuntimeError("Runner or disc missing: run make build first")
-    return [str(binary), str(elf), "--disc", str(iso), "--window", "--memcard",
+    return [str(binary), "--disc", str(iso), "--game-dir", str(engine / "games/sc3"), "--window", "--memcard",
             str(engine / "games/sc3/play.ps2"), *extra]
 
 

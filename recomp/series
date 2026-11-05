@@ -1,6 +1,6 @@
 # Patches absent from the pinned upstream commit; apply in order.
-patches/02-pr36-vu0-aot.patch
 patches/04-window-poll-diagnostics.patch
 patches/05-host-input-and-audio.patch
 patches/07-compact-raster-setup.patch
 patches/08-upscaled-metal-latency.patch
+patches/11-disc-boot-elf.patch
