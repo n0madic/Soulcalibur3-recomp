@@ -4,7 +4,7 @@
 
 ## Reproducible source set
 
-Upstream pin: **`c683565b7d70a739e8c6a61fec7480ceafe8b5d9`**, the upstream `main` tip checked on 2026-11-05, stored in `ps2-native-recomp.commit`. It contains these accepted contributions; none is reapplied locally:
+Upstream pin: **`280e85588dc1b2cd986d375f2b3116dc0d115304`**, the upstream `main` tip checked on 2026-11-06, stored in `ps2-native-recomp.commit`. It contains these accepted contributions; none is reapplied locally:
 
 | Contribution | Included upstream |
 | --- | --- |
@@ -16,9 +16,10 @@ Upstream pin: **`c683565b7d70a739e8c6a61fec7480ceafe8b5d9`**, the upstream `main
 | Optional game window title and macOS resident memory | [#38](https://github.com/exoteric33/ps2-native-recomp/pull/38), merge `8c6f712` |
 | Opt-in, bounded GPU readback diagnostics | [#40](https://github.com/exoteric33/ps2-native-recomp/pull/40), merge `6f84ba1` |
 | Generic recorded VU0 AOT, with the TOP/ITOP unit-selection fix | [#36](https://github.com/exoteric33/ps2-native-recomp/pull/36), merge `874d506` (merged 2026-11-05) |
+| Boot directly from the disc image, with `--game-dir` | [#46](https://github.com/exoteric33/ps2-native-recomp/pull/46), merge `6a2308e` (merged 2026-11-06) |
 | Accurate GPU backend start-up diagnostics | [#45](https://github.com/exoteric33/ps2-native-recomp/pull/45), merge `2635083` |
 
-The earlier update removed the former local patches `01`, `03`, `06` and `09`; the 2026-11-05 update removes `02` and `10` (both Draft #36, now merged). In particular, `PS2_READBACK_LOG=1` now uses upstream's bounded logging (the first 20 slow reads, then every 100th slow read). The new base also includes upstream's disc/input bounds checks, safer card/state writes and build/test tooling changes.
+The earlier update removed the former local patches `01`, `03`, `06` and `09`; the 2026-11-05 update removed `02` and `10` (both Draft #36, now merged); the 2026-11-06 update removes `11` (PR #46, now merged). In particular, `PS2_READBACK_LOG=1` now uses upstream's bounded logging (the first 20 slow reads, then every 100th slow read). The new base also includes upstream's disc/input bounds checks, safer card/state writes and build/test tooling changes.
 
 `series` applies only the following remaining changes, in order:
 
@@ -28,9 +29,8 @@ The earlier update removed the former local patches `01`, `03`, `06` and `09`; t
 | `05-host-input-and-audio.patch` | Stop unused IME text input, request 512-frame audio blocks on macOS, log the obtained block size. |
 | `07-compact-raster-setup.patch` | Load GS setup fields on demand and keep only three words live; [Draft #39](https://github.com/exoteric33/ps2-native-recomp/pull/39). Retained for the tested M1 Pro/Metal port; upstream's Intel iGPU tests found a performance regression. |
 | `08-upscaled-metal-latency.patch` | Prefer one presentation frame in flight on Metal when `PS2_SCALE>1`; an explicit `PS2_FRAME_LATENCY=1..8` overrides this. |
-| `11-disc-boot-elf.patch` | Universal native boot from SYSTEM.CNF in the ISO, memory-based loader/live analysis and input replay; [PR #46](https://github.com/exoteric33/ps2-native-recomp/pull/46) (open). Rebased onto the 2026-11-05 pin: `--help` text, the ELF error messages of the span-based loader and the `main.cpp` placement were merged by hand. |
 
-PR states above were checked on 2026-11-05: #36 merged, #39 is still a draft, #46 is open. Patches `05`, `07` and `08` apply unchanged to the new pin; `04` needed one context line (`quickmenu.hpp` now sits between its `#include` anchors); `11` needed the hand merge described above. Patches `02` and `10` were verified to be fully contained in upstream: applying both to the old pin and diffing the touched files against the new pin leaves only unrelated upstream changes, with no VU0 AOT or TOP/ITOP line missing.
+PR states above were checked on 2026-11-06: #36 and #46 are merged, #39 is still a draft. Patches `04`, `05`, `07` and `08` apply unchanged to the new pin. Patch `11` no longer applies because upstream merged the same change (the PR branch commits `0085a4e` and `418a3b1`, with maintainer follow-ups for log placement and Windows). The files of `11` that still differ from the old patched tree differ only by those follow-ups and unrelated upstream changes; `main.cpp` keeps `--game-dir`, the disc-only start, in-memory ELF loading and live analysis. Our former `02`/`10` check (2026-11-05) is unchanged.
 
 Patch numbers are retained so they still identify the same changes. When updating the pin, remove a patch if its change is now upstream; never apply both copies. The build fingerprint includes the pin, ordered patch names and contents.
 
@@ -87,6 +87,10 @@ The initial refresh at pin `783b4b1` plus its then-five remaining patches built 
 
 The existing player card, keyboard settings, entry list and 33 VU recordings retain their pre-update hashes. Local evidence is in `work/upstream-update-20261101/`, with autotest results under the runtime's `games/_autotests/`. Linux, Windows, other games, and manual input/resize/fullscreen checks were not repeated for this refresh.
 
+## Validation of the 2026-11-06 upstream refresh
+
+Pin `280e855` plus the four remaining patches built through `make build EXPLORE=0` (218 EE units, 36 VU programs). All 12 wrapper tests and `make test-runtime` pass (232/232 audio checks, the poll watchdog test and the VU0 TOP/ITOP, exact-state, fallback, verifier and CLI checks). A 300-frame headless run starting from the ISO alone (`--disc` plus `--game-dir`, upstream's own implementation) exits 0 on Metal and writes non-black frames, using a scratch memory card. Not repeated: upstream's synthetic suites and ps2autotests, framebuffer/audio comparisons against saved states, manual window/input checks and non-macOS builds.
+
 ## Validation of the 2026-11-05 upstream refresh
 
 Pin `c683565` plus the five remaining patches built through `make build EXPLORE=0` (218 EE units, 36 VU programs; the runtime reports 36 statically registered compiled vector programs). All 12 wrapper tests and `make test-runtime` pass (232/232 audio checks, the poll watchdog test, the TOP/ITOP, exact-state and fallback VU0 checks, the verifier negative control and the CLI checks). A 300-frame headless smoke run boots from the ISO alone (`--disc` plus `--game-dir`, no ELF argument) on Metal and writes non-black frames, using a scratch memory card.
@@ -116,6 +120,8 @@ At that pin, `make run` completed all 8723 frames of the private input playback 
 The compact GS setup patch reduced the sampled scene's raster benchmark from 19.2 to 16.1 ms at 2× (6.8 to 6.5 ms at 1×), with unchanged framebuffer checks in the test scene. These are measurements of one captured scene on Metal, not a guarantee for every scene or GPU. In [upstream testing](https://github.com/exoteric33/ps2-native-recomp/pull/39#issuecomment-6549698000), 840 images across five games matched, but raster time increased by about 2% on D3D12 and 6–9% on Vulkan on an Intel laptop iGPU. The patch remains a draft and is retained here for the tested Mac configuration. The shorter upscaled Metal presentation queue reduces work ahead of synchronous VRAM reads; it does not make those reads free. Set `PS2_FRAME_LATENCY=2` to compare the previous presentation queue setting.
 
 ## Boot directly from ISO (2026-11-02)
+
+Historical: this was local patch `11-disc-boot-elf.patch`, now upstream as #46. Upstream's merged version is the pin's behavior; the local validation below was done with the patch.
 
 The universal ISO-boot change is developed against upstream `8cd87cd`; `11-disc-boot-elf.patch` backports it onto the pinned runtime plus the six existing patches, preserving local VU0 recording. `ps2run --disc /path/to/disc.iso --window` reads SYSTEM.CNF and its BOOT2 ELF into memory through the existing ISO9660 reader, with no extraction or extra embedded payload. Explicit ELF arguments preserve the existing path for patched/special executables and disc-free programs. The build still extracts its translation inputs; the wrapper no longer requires those files when launching the game.
 

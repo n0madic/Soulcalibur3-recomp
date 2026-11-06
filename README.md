@@ -41,7 +41,7 @@ make build ISO='/path/to/Soulcalibur III.iso'
 
 The wrapper checks out the exact commit in `recomp/ps2-native-recomp.commit`, applies `recomp/series`, validates the boot ELF and calls upstream's native port pipeline. Initial exploration runs discover additional code and record VU entries. They use a separate exploration card. The first build can take several minutes; keep several GB free for builds and caches in addition to the ISO.
 
-The upstream pin was refreshed on 2026-11-05. Metal presentation, audio pause recovery, game window titles/macOS memory reporting, bounded readback diagnostics and the VU0 AOT (with its TOP/ITOP fix) now come from upstream; five local patches remain. See the [patch list](recomp/README.md#reproducible-source-set) for details.
+The upstream pin was refreshed on 2026-11-06. Metal presentation, audio pause recovery, game window titles/macOS memory reporting, bounded readback diagnostics, the VU0 AOT (with its TOP/ITOP fix) and booting from the ISO now come from upstream; four local patches remain. See the [patch list](recomp/README.md#reproducible-source-set) for details.
 
 To rebuild using entries and recordings already captured, without automatic exploration:
 

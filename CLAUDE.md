@@ -5,7 +5,7 @@
 ## Source ownership
 
 - `recomp/ps2-native-recomp.commit` pins the upstream commit.
-- `recomp/series` names the five remaining patches in order. The pinned upstream base includes #32 (SIF/Start), #33 (initial audio pacing), #34 (CPU clock), #35 (Metal presentation), #36 (VU0 AOT with the TOP/ITOP fix), #37 (audio pause recovery), #38 (window title/macOS RAM), #40 (bounded readback diagnostics) and #45 (GPU backend log); do not reapply them. Draft #39 (`07`) and PR #46 (`11`) are still open.
+- `recomp/series` names the four remaining patches in order. The pinned upstream base includes #32 (SIF/Start), #33 (initial audio pacing), #34 (CPU clock), #35 (Metal presentation), #36 (VU0 AOT with the TOP/ITOP fix), #37 (audio pause recovery), #38 (window title/macOS RAM), #40 (bounded readback diagnostics) and #45 (GPU backend log) and #46 (boot from ISO, `--game-dir`); do not reapply them. Draft #39 (`07`) is still open.
 - `recomp/patches/` contains pending upstream contributions and local host/diagnostic changes. Keep each independent area in one patch; do not revive the obsolete PS2Recomp/paraLLEl-GS/TOML/Ghidra series.
 - `recomp/port.py` manages source preparation, disc validation, build and launch. `Makefile` and `launch.command` call it directly.
 - `recomp/tests/` tests the wrapper without a disc. `make test-runtime` runs synthetic audio, VU0 and watchdog tests in the prepared runtime.
