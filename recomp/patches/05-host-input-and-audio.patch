@@ -1,8 +1,8 @@
 diff --git a/host/window.cpp b/host/window.cpp
-index f977d13..4313a31 100644
+index 2b9cae2..7dadefa 100644
 --- a/host/window.cpp
 +++ b/host/window.cpp
-@@ -1258,6 +1258,7 @@ bool open_window(bool fullscreen) {
+@@ -1843,6 +1843,7 @@ bool open_window(bool fullscreen) {
          std::fprintf(stderr, "SDL: %s\n", SDL_GetError());
          return false;
      }
@@ -10,7 +10,7 @@ index f977d13..4313a31 100644
      // button layouts for pads SDL does not know by itself: a gamecontrollerdb.txt next to ps2run (SDL_GAMECONTROLLERCONFIG_FILE
      // and SDL_GAMECONTROLLERCONFIG work too)
      if (char *base = SDL_GetBasePath()) {
-@@ -1288,7 +1289,11 @@ bool open_window(bool fullscreen) {
+@@ -1905,7 +1906,11 @@ bool open_window(bool fullscreen) {
      want.freq = 48000;
      want.format = AUDIO_S16SYS;
      want.channels = 2;
@@ -22,7 +22,7 @@ index f977d13..4313a31 100644
      // PS2_AUDIO_STRETCH=0 plays the sound as it comes (silence where it runs short); PS2_AUDIO_STRETCH_MAX=<ratio> changes the limit
      static ps2sound::PipeConfig config;
      const std::string stretch = ps2::os::env("PS2_AUDIO_STRETCH"), stretch_max = ps2::os::env("PS2_AUDIO_STRETCH_MAX");
-@@ -1299,6 +1304,7 @@ bool open_window(bool fullscreen) {
+@@ -1916,6 +1921,7 @@ bool open_window(bool fullscreen) {
      want.callback = audio_callback;
      g_audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
      if (g_audio) {

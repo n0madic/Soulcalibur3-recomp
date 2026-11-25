@@ -107,18 +107,18 @@ index 0000000..12917be
 +}  // namespace windowdiag
 +#endif
 diff --git a/host/window.cpp b/host/window.cpp
-index 1159ccc..4dfe100 100644
+index d984894..2b9cae2 100644
 --- a/host/window.cpp
 +++ b/host/window.cpp
-@@ -42,6 +42,7 @@
+@@ -46,6 +46,7 @@
  #include <vector>
  
  #include "keymap.hpp"
 +#include "poll_watchdog.hpp"
  #include "quickmenu.hpp"
+ #include "ps2/crash.hpp"
  #include "ps2/hitch.hpp"
- #include "ps2/os.hpp"
-@@ -74,6 +75,7 @@ constexpr PadBinding kPadButtons[] = {
+@@ -83,6 +84,7 @@ constexpr PadBinding kPadButtons[] = {
  SDL_Window *g_window = nullptr;
  #ifdef __APPLE__
  SDL_MetalView g_metal_view = nullptr;
@@ -126,7 +126,7 @@ index 1159ccc..4dfe100 100644
  #endif
  SDL_Renderer *g_renderer = nullptr;
  SDL_Texture *g_texture = nullptr;
-@@ -797,10 +799,22 @@ bool timed_poll_event(SDL_Event &e) {
+@@ -1284,10 +1286,22 @@ bool timed_poll_event(SDL_Event &e) {
      window_stage("asking the system for window events (SDL_PollEvent)");
      if (!ps2::hitch::on()) return SDL_PollEvent(&e) != 0;
      const auto t0 = ps2::hitch::Clock::now();
@@ -151,7 +151,7 @@ index 1159ccc..4dfe100 100644
      return got;
  }
  
-@@ -1419,6 +1433,9 @@ void watchdog() {
+@@ -2039,6 +2053,9 @@ void watchdog() {
  #endif
  
  int run_window(const std::function<int()> &emulate) {

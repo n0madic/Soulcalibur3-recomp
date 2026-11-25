@@ -4,7 +4,7 @@
 
 ## Reproducible source set
 
-Upstream pin: **`280e85588dc1b2cd986d375f2b3116dc0d115304`**, the upstream `main` tip checked on 2026-11-06, stored in `ps2-native-recomp.commit`. It contains these accepted contributions; none is reapplied locally:
+Upstream pin: **`4bae9a9159346b492dc7f90f94b7595a1be8b28d`**, the upstream `main` tip checked on 2026-11-25, stored in `ps2-native-recomp.commit`. It contains these accepted contributions; none is reapplied locally:
 
 | Contribution | Included upstream |
 | --- | --- |
@@ -25,12 +25,11 @@ The earlier update removed the former local patches `01`, `03`, `06` and `09`; t
 
 | Patch | Purpose and upstream relationship |
 | --- | --- |
-| `04-window-poll-diagnostics.patch` | SDL event details and a bounded macOS stall sampler; local diagnostic commit `32c8fd7`; rebased onto the 2026-11-05 pin (only the `#include` context changed). |
+| `04-window-poll-diagnostics.patch` | SDL event details and a bounded macOS stall sampler; local diagnostic commit `32c8fd7`; rebased onto the 2026-11-25 pin (only the `#include` context changed). |
 | `05-host-input-and-audio.patch` | Stop unused IME text input, request 512-frame audio blocks on macOS, log the obtained block size. |
-| `07-compact-raster-setup.patch` | Load GS setup fields on demand and keep only three words live; [Draft #39](https://github.com/exoteric33/ps2-native-recomp/pull/39). Retained for the tested M1 Pro/Metal port; upstream's Intel iGPU tests found a performance regression. |
 | `08-upscaled-metal-latency.patch` | Prefer one presentation frame in flight on Metal when `PS2_SCALE>1`; an explicit `PS2_FRAME_LATENCY=1..8` overrides this. |
 
-PR states above were checked on 2026-11-06: #36 and #46 are merged, #39 is still a draft. Patches `04`, `05`, `07` and `08` apply unchanged to the new pin. Patch `11` no longer applies because upstream merged the same change (the PR branch commits `0085a4e` and `418a3b1`, with maintainer follow-ups for log placement and Windows). The files of `11` that still differ from the old patched tree differ only by those follow-ups and unrelated upstream changes; `main.cpp` keeps `--game-dir`, the disc-only start, in-memory ELF loading and live analysis. Our former `02`/`10` check (2026-11-05) is unchanged.
+PR states were checked on 2026-11-25. Patches `04`, `05` and `08` apply to the new pin (`04` needed only a context fix; `05` and `08` moved by line numbers). Patch `07` (compact GS setup, Draft [#39](https://github.com/exoteric33/ps2-native-recomp/pull/39), still open) was removed: upstream's `gs.wgsl` grew by about 660 lines (mip levels, per-setup caching, strips), and its mipmap `level_setup` overrides `Setup` fields that the compact layout reads lazily from memory. A hand port (extra `lvl` field in `Setup`, level-aware accessors) validated and rendered, but on the captured 2× scene the raster benchmark was 31.7 ms against 32.0 ms for upstream's shader (two runs each; on battery with Low Power Mode, so only the ratio is meaningful) — within noise. The former 16% gain was measured against the old shader and no longer holds. The old patch remains in git history.
 
 Patch numbers are retained so they still identify the same changes. When updating the pin, remove a patch if its change is now upstream; never apply both copies. The build fingerprint includes the pin, ordered patch names and contents.
 
@@ -87,6 +86,10 @@ The initial refresh at pin `783b4b1` plus its then-five remaining patches built 
 
 The existing player card, keyboard settings, entry list and 33 VU recordings retain their pre-update hashes. Local evidence is in `work/upstream-update-20261101/`, with autotest results under the runtime's `games/_autotests/`. Linux, Windows, other games, and manual input/resize/fullscreen checks were not repeated for this refresh.
 
+## Validation of the 2026-11-25 upstream refresh
+
+Pin `4bae9a9` plus the three remaining patches built through `make build EXPLORE=0` (218 EE units, 36 VU programs). All 12 wrapper tests and `make test-runtime` pass (232/232 audio checks, the poll watchdog test and the VU0 checks). The embedded shader loads on Metal (`9 shaders compiled`), and a saved-state GPU bench replay (`PS2_GPU_BENCH`, 2×) exits 0. A shader that merely compiles into the runner is not validated: patch `07`'s first port built fine but failed WGSL validation at start-up (`invalid field accessor`), which is why shader changes are loaded with `PS2_GS_SHADER` first. Not repeated: upstream's synthetic suites and ps2autotests, framebuffer or audio comparisons, manual window/input checks, patch `08`'s effect against the new upstream presentation code, and non-macOS builds. The bench was run on battery with Low Power Mode on; absolute timings (about 32 ms raster at 2×) are not comparable with earlier mains-power measurements.
+
 ## Validation of the 2026-11-06 upstream refresh
 
 Pin `280e855` plus the four remaining patches built through `make build EXPLORE=0` (218 EE units, 36 VU programs). All 12 wrapper tests and `make test-runtime` pass (232/232 audio checks, the poll watchdog test and the VU0 TOP/ITOP, exact-state, fallback, verifier and CLI checks). A 300-frame headless run starting from the ISO alone (`--disc` plus `--game-dir`, upstream's own implementation) exits 0 on Metal and writes non-black frames, using a scratch memory card. Not repeated: upstream's synthetic suites and ps2autotests, framebuffer/audio comparisons against saved states, manual window/input checks and non-macOS builds.
@@ -117,7 +120,7 @@ At that pin, `make run` completed all 8723 frames of the private input playback 
 
 `PS2_SCALE=2 make run` renders at twice the native width and height. This increases pixel work fourfold; it can still exceed the PAL 20 ms frame budget on an M1 Pro. `PS2_LOOK=soft_edges` only softens the final image and does not replace texture minification filtering.
 
-The compact GS setup patch reduced the sampled scene's raster benchmark from 19.2 to 16.1 ms at 2× (6.8 to 6.5 ms at 1×), with unchanged framebuffer checks in the test scene. These are measurements of one captured scene on Metal, not a guarantee for every scene or GPU. In [upstream testing](https://github.com/exoteric33/ps2-native-recomp/pull/39#issuecomment-6549698000), 840 images across five games matched, but raster time increased by about 2% on D3D12 and 6–9% on Vulkan on an Intel laptop iGPU. The patch remains a draft and is retained here for the tested Mac configuration. The shorter upscaled Metal presentation queue reduces work ahead of synchronous VRAM reads; it does not make those reads free. Set `PS2_FRAME_LATENCY=2` to compare the previous presentation queue setting.
+The former compact GS setup patch reduced the sampled scene's raster benchmark from 19.2 to 16.1 ms at 2× on the 2026-11 pin, but no longer helps on upstream's current shader (see the patch list) and was removed. The shorter upscaled Metal presentation queue reduces work ahead of synchronous VRAM reads; it does not make those reads free. Set `PS2_FRAME_LATENCY=2` to compare the previous presentation queue setting.
 
 ## Boot directly from ISO (2026-11-02)
 

@@ -1,6 +1,8 @@
+diff --git a/runtime/src/gs/gpu/gpu.cpp b/runtime/src/gs/gpu/gpu.cpp
+index a841235..8eb904f 100644
 --- a/runtime/src/gs/gpu/gpu.cpp
 +++ b/runtime/src/gs/gpu/gpu.cpp
-@@ -2294,6 +2294,17 @@
+@@ -5781,6 +5781,17 @@ bool attach_surface(const SurfaceTarget &target) {
          else std::fprintf(stderr, "[gpu] PS2_PRESENT_MODE=%s is not fifo, relaxed, mailbox or immediate, or this surface does not offer it: ignored\n", want.c_str());
      }
      if (const int latency = std::atoi(os::env("PS2_FRAME_LATENCY").c_str()); latency >= 1 && latency <= 8) g_frame_latency = static_cast<std::uint32_t>(latency);
